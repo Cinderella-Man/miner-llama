@@ -87,7 +87,7 @@ static void test_eligible() {
     CHECK(!eligible(g.layer(1, false, true,  false, false)));
     CHECK(!eligible(g.layer(1, false, false, true,  false)));
     // a plain product never counts, whatever its rows: a prompt's weight product, MLA's absorbed queries of one token
-    // ([d, n_head, 1] is a 2-D [d, n_head] tensor), the output head of a prompt's last token
+    // ([d, n_head, 1] is a 2-D [d, n_head] tensor)
     CHECK(!eligible(g.layer(512, false, false, false, true)));
     {
         ggml_tensor * q_nope = g.t(16, 128, 1);
@@ -111,7 +111,8 @@ static void test_eligible() {
         CHECK(!eligible(nodes));
     }
     // one row (DeviceRadixSort, eager or captured) or up to 1,024 columns (bitonic, in shared memory) do not
-    for (const auto & shape : { std::pair<int64_t, int64_t>{ 151936, 1 }, { 1024, 512 }, { 8, 512 } }) {
+    const std::vector<std::pair<int64_t, int64_t>> shapes = { { 151936, 1 }, { 1024, 512 }, { 8, 512 } };
+    for (const auto & shape : shapes) {
         std::vector<ggml_tensor *> nodes = g.layer(512);
         nodes.push_back(ggml_argsort(g.ctx, g.t(shape.first, shape.second), GGML_SORT_ORDER_DESC));
         CHECK(eligible(nodes));
@@ -215,11 +216,12 @@ struct run_counts {
 };
 
 // a random run: a few keys sharing a context; each step picks a key and either repeats its last properties (a reused
-// graph, the next decode step) or takes others; now and then a graph CUDA cannot capture
+// graph, the next decode step) or takes others; now and then a graph CUDA cannot capture. Every key starts with a
+// decode graph (props 1), as a server's warm-up decode comes before its first prompt
 static run_counts random_run(std::mt19937 & rng, rule r, int n_keys, int n_props, int n_steps, int n_phases) {
     fake_context c;
     c.keys.resize(n_keys);
-    std::vector<int> last(n_keys, 0);
+    std::vector<int> last(n_keys, 1);
     run_counts k;
     for (int e = 0; e < n_steps; ++e) {
         const int key = (int) (rng() % n_keys);
