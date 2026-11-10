@@ -252,6 +252,10 @@ LLAMA_API void     llama_set_moe_route_once   (struct llama_context * ctx, uint3
 LLAMA_API uint64_t llama_moe_route_once_counts(const struct llama_context * ctx, uint64_t * read, uint64_t * indep,
         int32_t n_counts, uint64_t * n_outside);
 
+// The cells the recurrent memory's slot finder has moved to another row so far (Q1158): a moved sequence keeps its
+// final state but not its rollback snapshots. 0 for a context without a recurrent memory. For tests and diagnostics.
+LLAMA_API uint64_t llama_memory_recurrent_n_swaps(const struct llama_context * ctx);
+
 // Write the unmasked h_nextn rows (see llama_set_embeddings_nextn) of each decode to a device buffer
 // [n_embd_out, n_batch + n_seq_max] instead of host memory: row r < n_batch is the token at batch index r of the last decode,
 // row n_batch + s is free for the caller, e.g. for seq s (see llama_set_embeddings_nextn_rows()).

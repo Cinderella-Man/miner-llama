@@ -106,6 +106,9 @@ public:
     // first zero-ed state
     int32_t rs_z = -1;
 
+    // the cells find_slot moved to another row to make a batch's rows contiguous (llama_memory_recurrent_n_swaps)
+    uint64_t n_swaps = 0;
+
     // TODO: optimize for recurrent state needs
     struct mem_cell {
         llama_pos pos  = -1;

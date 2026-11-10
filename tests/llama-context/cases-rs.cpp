@@ -708,6 +708,87 @@ struct case_nan_clear : ctx_test {
     }
 };
 
+// the shape of a served agent slot with an MTP draft (Q1158): one sequence whose context keeps rollback snapshots for
+// the draft's verify batches, and which goes back to a checkpoint of its prompt prefix. With one sequence the slot
+// finder has no second cell to trade places with, so it must never move a cell: a moved sequence keeps its final
+// state but loses its rollback snapshots (llama.cpp #31656)
+struct case_one_slot_no_swap : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "one_slot"; }
+
+    const char * description() const override {
+        return "one sequence with rollback snapshots: verify batches, rollbacks and a prefix restore move no cell";
+    }
+
+    std::string skip_reason(model_run & mr) const override {
+        if (!llama_model_is_recurrent(mr.model) && !llama_model_is_hybrid(mr.model)) {
+            return "no recurrent state";
+        }
+
+        return ctx_test::skip_reason(mr);
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_pos n_prefix = 16;
+        constexpr uint32_t  n_draft  = 3; // drafted tokens per verify batch
+
+        ctx_opts opts;
+        opts.n_batch   = 64;
+        opts.n_ubatch  = 64;
+        opts.n_seq_max = 1;
+        opts.n_rs_seq  = n_draft;
+
+        llama_context_ptr ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::fail();
+        }
+        if (llama_n_rs_seq(ctx.get()) < n_draft) {
+            return case_result::skip("n_rs_seq is disabled");
+        }
+
+        llama_memory_t mem = llama_get_memory(ctx.get());
+
+        // the prompt prefix and its checkpoint, as the server takes it (the recurrent state only)
+        CTX_REQUIRE(decode_gen(ctx.get(), n_vocab, 0, 0, n_prefix), "the prefix decode failed");
+
+        std::vector<uint8_t> ckpt;
+        CTX_REQUIRE(get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, ckpt), "the checkpoint was not saved");
+
+        // verify batches of the sampled token and n_draft drafted ones, of which the last n_reject are rejected
+        const auto verify_steps = [&](llama_pos pos) -> std::string {
+            for (const uint32_t n_reject : { 0u, 1u, n_draft, 2u, 0u, n_draft }) {
+                const llama_pos pos_end = pos + 1 + (llama_pos) n_draft;
+                if (!decode_gen(ctx.get(), n_vocab, 0, pos, pos_end)) {
+                    return "a verify batch failed at position " + std::to_string(pos);
+                }
+                if (n_reject > 0 && !llama_memory_seq_rm(mem, 0, pos_end - (llama_pos) n_reject, -1)) {
+                    return "a rollback of " + std::to_string(n_reject) + " tokens was refused at position " + std::to_string(pos);
+                }
+                pos = pos_end - (llama_pos) n_reject;
+            }
+            return "";
+        };
+
+        std::string err = verify_steps(n_prefix);
+        CTX_REQUIRE(err.empty(), err);
+
+        // back to the prefix, as the server restores a checkpoint: its state, then the positions after it removed
+        CTX_REQUIRE(set_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, ckpt), "the checkpoint was not restored");
+        CTX_REQUIRE(llama_memory_seq_rm(mem, 0, n_prefix, -1), "the positions after the checkpoint were not removed");
+
+        err = verify_steps(n_prefix);
+        CTX_REQUIRE(err.empty(), err);
+
+        const uint64_t n_swaps = llama_memory_recurrent_n_swaps(ctx.get());
+        CTX_REQUIRE(n_swaps == 0, "the slot finder moved " + std::to_string(n_swaps) + " cells of a single sequence");
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -718,6 +799,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_nan_clear>());
     cases.push_back(std::make_unique<case_state_store>(false));
     cases.push_back(std::make_unique<case_state_store>(true));
+    cases.push_back(std::make_unique<case_one_slot_no_swap>());
 
     return cases;
 }

@@ -7024,6 +7024,13 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
 }
 
+uint64_t llama_memory_recurrent_n_swaps(const llama_context * ctx) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    auto * mem_recr   = mem_hybrid ? mem_hybrid->get_mem_recr() : dynamic_cast<llama_memory_recurrent *>(mem);
+    return mem_recr ? mem_recr->n_swaps : 0;
+}
+
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }
