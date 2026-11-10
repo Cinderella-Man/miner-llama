@@ -13841,6 +13841,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // Q5_K's products of 2 to 4 tokens that decode each weight once (mmvq-pascal-q5k.cu, GGML_CUDA_MMVQ_PASCAL_Q5K_MT=1,
+    // C690): Qwen3.8-Flash-Next's output layer (2560 -> 248,320, many row blocks per block of the persistent grid, the
+    // last one partial), each lane-group size (1 to 32 lanes per row at 768 to 8192 weights), a partial last row block,
+    // rows that are views of wider rows, and K = 12288, which fits the kernel's shared memory at 2 tokens but not at 3
+    // and 4 (left to the k-column kernel). The kcol cases above (4096 x 2560, 333 x 1280) and the large activations
+    // run it too.
+    {
+        struct q5k_case { int64_t m, k, k_v; };
+        for (const q5k_case & c : std::vector<q5k_case>{
+                { 248320, 2560, 0 }, { 4097, 2560, 0 }, { 200, 768, 0 }, { 1000, 1024, 0 }, { 129, 2048, 0 },
+                { 77, 4096, 0 }, { 64, 8192, 0 }, { 257, 2560, 2816 }, { 96, 12288, 0 } }) {
+            for (int64_t n = 1; n <= 4; ++n) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, c.m, n, c.k, { 1, 1 }, { 1, 1 },
+                                                         { 0, 1, 2, 3 }, c.k_v));
+            }
+        }
+    }
     // all 512 experts, as the file has them
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q2_0, GGML_GLU_OP_SWIGLU, 1, 640, 2560, true, 512, 10,
                                                         true));
