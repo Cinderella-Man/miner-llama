@@ -4239,6 +4239,13 @@ private:
         ckpt_incall.push_back({ ckpt, slot.id, i_batch });
     }
 
+    // whether create_checkpoint_incall will find a free device store: one is free now, or every checkpoint of the list
+    // can sit in a store (--ctx-checkpoints-vram covers --ctx-checkpoints), so that all being taken means a full list
+    // of them, of which making room drops one
+    bool ckpt_incall_store_ok(server_slot & slot) {
+        return ckpt_vram_n >= params_base.n_ctx_checkpoints || ckpt_store_free(slot) >= 0;
+    }
+
     server_slot * slot_by_id(int id) {
         for (auto & slot : slots) {
             if (slot.id == id) {
@@ -6855,9 +6862,9 @@ private:
                         }
 
                         // C217: on into the next part when this one stopped for a checkpoint at the next one's start and a
-                        // device store is free for it
+                        // device store will be free for it
                         if (!(incall_slot && ckpt_incall_on && ckpt_vram_n > 0 && part_ckpt_break && batch.size() < n_batch &&
-                              slot.prompt.n_tokens() < slot.task->n_tokens() && ckpt_store_free(slot) >= 0)) {
+                              slot.prompt.n_tokens() < slot.task->n_tokens() && ckpt_incall_store_ok(slot))) {
                             break;
                         }
                     }
