@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -334,6 +335,10 @@ static int test_spec_reject_stop(common_params & params, int n_trials) {
         int n_vis_off = 0;    // tokens up to the first EOG, the default's
         int n_vis_on = 0;     // ... the switch's
 
+        // the default's results in order, FNV-1a: the same from a build without the block's cut (sb carries the
+        // sampler's state from trial to trial, so the digest covers that too)
+        uint64_t digest = 1469598103934665603ull;
+
         auto visible = [&](const std::vector<llama_token> & r) {
             for (size_t k = 0; k < r.size(); ++k) {
                 if (llama_vocab_is_eog(vocab, r[k])) {
@@ -379,6 +384,11 @@ static int test_spec_reject_stop(common_params & params, int n_trials) {
                 check(false, "block trial " + std::to_string(trial) + ": draft " + str(draft) + ", off " + str(r_off) + ", on " + str(r_on) + ", want " + str(want));
             }
 
+            for (const llama_token t : r_off) {
+                digest = (digest ^ (uint64_t) (uint32_t) t) * 1099511628211ull;
+            }
+            digest = (digest ^ 0xffffffffull) * 1099511628211ull;
+
             n_behind  += (int) (r_off.size() - visible(r_off));
             n_vis_off += (int) visible(r_off);
             n_vis_on  += (int) visible(r_on);
@@ -387,6 +397,7 @@ static int test_spec_reject_stop(common_params & params, int n_trials) {
         LOG("block: %d trials, %d cut (%d accepted whole, %d ending in a residual draw before the EOG), %d with nothing to cut, "
                 "%d tokens behind an EOG in the default's results; tokens up to the first EOG: off %d, on %d\n",
                 n_trials, n_cut, n_cut_whole, n_cut_resid, n_same, n_behind, n_vis_off, n_vis_on);
+        LOG("block off digest %016llx over %d trials\n", (unsigned long long) digest, n_trials);
 
         check(n_cut  >= n_trials/20, "too few block trials drafted an EOG before the last drafted token: " + std::to_string(n_cut));
         check(n_same >= n_trials/20, "too few block trials with nothing to cut: " + std::to_string(n_same));
