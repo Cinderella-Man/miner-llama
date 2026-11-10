@@ -137,6 +137,27 @@ static inline bool fasp_rule_takes(const fasp_rule & r, const int64_t n_q, const
     return r.mode != 1 || !((double) n_kv < r.prompt_min_ratio*n_kv_max);
 }
 
+// The union kernel's warps: warp slot wy of block bz (grid z: lists of every sequence, tpb query tokens a list, nw warps
+// a token) takes query token iq of sequence i3 and reads union list `list`; a warp past the call's last token (valid
+// false) reads the list's first token and computes nothing.
+struct fasp_union_warp {
+    int  iq, i3, list;
+    bool valid;
+};
+
+static __host__ __device__ __forceinline__ fasp_union_warp fasp_union_map(const int bz, const int wy, const int nw,
+        const int tpb, const int n_q, const int m_ne3) {
+    const int n_lists = (n_q + tpb - 1)/tpb;
+    const int j       = bz % n_lists;
+    fasp_union_warp r;
+    r.i3    = bz / n_lists;
+    r.iq    = j*tpb + wy / nw;
+    r.valid = r.iq < n_q;
+    r.iq    = r.valid ? r.iq : j*tpb;
+    r.list  = (r.i3 % m_ne3)*n_lists + j;
+    return r;
+}
+
 // Splits per list: about 4 blocks per SM in all, at least 64 entries a split.
 static __host__ __device__ __forceinline__ int fasp_pick_splits(const int n_kv_max, const int n_cols, const int nsm) {
     const int target = 4*nsm;
@@ -292,14 +313,13 @@ static __global__ void flash_attn_ext_sparse_pascal(const fasp_args a) {
     bool valid = true;
     if constexpr (uni) {
         const int tpb = blockDim.y/(a.G/FASP_HPW); // query tokens per list
-        n_lists = (a.n_q + tpb - 1)/tpb;           // lists per sequence
-        const int j = blockIdx.z % n_lists;
-        i3      = blockIdx.z / n_lists;
-        iq      = j*tpb + wy / (a.G/FASP_HPW);
-        valid   = iq < a.n_q;
-        iq      = valid ? iq : j*tpb; // a warp past the last token reads the list's first one and computes nothing
+        const fasp_union_warp uw = fasp_union_map(blockIdx.z, wy, a.G/FASP_HPW, tpb, a.n_q, a.m_ne3);
+        n_lists = (a.n_q + tpb - 1)/tpb;
+        iq      = uw.iq;
+        i3      = uw.i3;
+        list    = uw.list;
+        valid   = uw.valid;
         z       = i3*a.n_q + iq;
-        list    = (i3 % a.m_ne3)*n_lists + j;
         iq_mask = a.fault == 4 && iq + 1 < a.n_q ? iq + 1 : iq;
     } else {
         z       = blockIdx.z;
