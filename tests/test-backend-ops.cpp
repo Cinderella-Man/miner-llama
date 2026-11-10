@@ -3378,6 +3378,15 @@ struct test_set_rows : public test_case {
             }
             if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
                 init_set_rows_row_ids(t, ne[1]);
+            } else if (type_dst == GGML_TYPE_I32) {
+                // an I32 table takes whole numbers held as F32, as the k-pool tables kept on the devices are staged
+                std::mt19937 rng(1234);
+                std::uniform_int_distribution<int32_t> dist(0, (1 << 24) - 1);
+                std::vector<float> data(ggml_nelements(t));
+                for (float & x : data) {
+                    x = (float) dist(rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -12293,6 +12302,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+    // the k-pool tables kept on the devices (LLAMA_QSA_KPOOL_DEV): an I32 pool_cells [1, n] and pool_idxs [4, n]
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I32, GGML_TYPE_I32, { 1, 64, 1, 1 }, { 1, 1 }, 7, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I32, GGML_TYPE_I32, { 4, 64, 1, 1 }, { 1, 1 }, 7, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I32, GGML_TYPE_I64, { 4, 64, 1, 1 }, { 1, 1 }, 7, true));
     for (ggml_type src_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (ggml_type type : all_types) {
             for (int b : {1, 7}) {

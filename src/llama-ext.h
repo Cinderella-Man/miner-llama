@@ -206,6 +206,12 @@ LLAMA_API bool llama_embd_cache_stats(const struct llama_context * ctx, uint64_t
 LLAMA_API bool llama_nextn_carry_init(struct llama_context * ctx);
 LLAMA_API void llama_set_nextn_carry (struct llama_context * ctx, bool in, bool out);
 
+// The QSA k-pool tables kept on the devices (LLAMA_QSA_KPOOL_DEV, C100): since the context was created, the ubatches
+// that updated them, those that rewrote every row the graph reads, the rows uploaded, and the ubatches that
+// LLAMA_QSA_KPOOL_DEV_CHECK compared with the tables built without the switch; false while the switch is off.
+LLAMA_API bool llama_kpool_dev_stats(const struct llama_context * ctx, uint64_t * n_ubatch, uint64_t * n_full, uint64_t * n_rows,
+                                     uint64_t * n_checked);
+
 // The main model's head over the context's shortlist (llama_head_shortlist_init) with an exact bound on every other
 // logit (Q619): while it is on, a decode with one output computes the shortlist's logits and gives every other token
 // -INFINITY; llama_head_bound_ith(i) is then at least every left-out logit the full head would have computed (Cauchy-

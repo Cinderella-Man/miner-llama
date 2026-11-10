@@ -2799,6 +2799,14 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * cur,
                             int   il);
 
+        // LLAMA_QSA_KPOOL_DEV (C100): pool_cells and pool_idxs on il's device, updated once per graph and device
+        void build_kpool_dev(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
+                            int   il,
+                    ggml_tensor ** pool_cells,
+                    ggml_tensor ** pool_idxs);
+
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
                     ggml_tensor * cur,
