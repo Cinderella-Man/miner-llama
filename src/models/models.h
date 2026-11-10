@@ -2720,6 +2720,16 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     class llm_graph_input_kpool;
 
+    // the small k-pool inputs a QSA layer reads: the host's tensors, or with LLAMA_QSA_KPOOL_STAGE (C720) their casts
+    // on the layer's device
+    struct kpool_small {
+        ggml_tensor * k_idxs        = nullptr; // I64 or I32 [n_tokens]
+        ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
+        ggml_tensor * new_pool_flat = nullptr; // I32 [kpool*n_new]
+        ggml_tensor * new_pool_rep  = nullptr; // I64 or I32 [n_new]
+        ggml_tensor * new_pool_pos  = nullptr; // I32 [4*n_new]
+    };
+
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
@@ -2806,6 +2816,13 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il,
                     ggml_tensor ** pool_cells,
                     ggml_tensor ** pool_idxs);
+
+        // LLAMA_QSA_KPOOL_STAGE (C720): the small k-pool inputs on il's device, cast once per graph and device from the
+        // stage build_kpool_dev made there; without the switch, the host's tensors
+        kpool_small build_kpool_small(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
+                            int   il);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

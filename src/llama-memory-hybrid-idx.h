@@ -226,6 +226,9 @@ public:
     // LLAMA_QSA_KPOOL_DEV (C100): the k-pool tables on the devices, see llama_memory_hybrid_idx::kpool_dev_get
     bool     kpool_dev_on() const;
     bool     kpool_dev_check_on() const;
+    // LLAMA_QSA_KPOOL_STAGE (C720): k_idxs, tail_idxs, new_pool_idxs, new_pool_rep and new_pool_pos go up after the
+    // update in its F32 input, and each device casts them back; only with the tables on the devices
+    bool     kpool_stage_on() const;
     uint32_t get_n_kpool_upd() const; // rows of this ubatch's update, padded to a stable bound
     // the copy on il's device (I32 [1, n_rows] and I32 [kpool, n_rows]) and its number, -1 if il has none
     int32_t  kpool_dev_table(int32_t il, ggml_tensor ** cells, ggml_tensor ** idxs) const;
