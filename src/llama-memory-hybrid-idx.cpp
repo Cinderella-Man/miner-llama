@@ -18,6 +18,52 @@
 #include <stdexcept>
 #include <type_traits>
 
+// LLAMA_QSA_KPOOL_DEV (C100): the k-pool tables kept on the devices
+struct llama_memory_hybrid_idx::kpool_dev_state {
+    struct table {
+        ggml_tensor * cells = nullptr; // I32 [1, cap + n_dump]
+        ggml_tensor * idxs  = nullptr; // I32 [kpool, cap + n_dump]
+        uint64_t      gen   = 0;       // the commit this copy holds: it holds what the host holds while gen == host_gen
+    };
+
+    // the padded entries of an update write their own rows past the end, which no graph reads
+    static constexpr uint32_t n_dump = 256;
+
+    std::vector<ggml_context_ptr>        ctxs;
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    std::vector<table>                   tables; // one per device
+    std::vector<int32_t>                 table_of_il; // per model layer, -1 without an indexer cache
+
+    uint32_t cap   = 0; // rows a graph reads at most: the padded count of every pool the cache can hold
+    uint32_t kpool = 0;
+
+    // what every copy in step holds in rows [0, n_valid)
+    std::vector<int32_t> cells;
+    std::vector<int32_t> idxs;
+    uint32_t n_valid  = 0;
+    uint64_t host_gen = 1;
+
+    // the update the last applied ubatch built (rows into cells and idxs), staged by its graph and committed by next()
+    std::vector<uint32_t> rows;
+    std::vector<int32_t>  sent; // the copies that ubatch's graph updates
+    uint32_t n_valid_next = 0;
+    bool     pending      = false;
+    bool     staged       = false;
+
+    // LLAMA_QSA_KPOOL_DEV_CHECK: what the copies held before the update
+    bool check = false;
+    std::vector<int32_t> prev_cells;
+    std::vector<int32_t> prev_idxs;
+    uint32_t prev_n_valid = 0;
+    bool     prev_in_step = false;
+
+    uint64_t n_ubatch  = 0;
+    uint64_t n_full    = 0; // updates that rewrote every row a graph reads
+    uint64_t n_rows    = 0; // rows uploaded
+    uint64_t n_read    = 0; // rows the graphs read (what the host used to upload)
+    uint64_t n_checked = 0;
+};
+
 //
 // llama_memory_hybrid_idx
 //
@@ -373,52 +419,6 @@ struct llama_memory_hybrid_idx_context::kpool_state {
     // LLAMA_QSA_KPOOL_DEV: rows of the tables' update (kpool_dev_build) and its graph size, stable across decode steps
     uint32_t n_upd       = 0;
     uint32_t n_upd_g     = 1;
-};
-
-// LLAMA_QSA_KPOOL_DEV (C100): the k-pool tables kept on the devices
-struct llama_memory_hybrid_idx::kpool_dev_state {
-    struct table {
-        ggml_tensor * cells = nullptr; // I32 [1, cap + n_dump]
-        ggml_tensor * idxs  = nullptr; // I32 [kpool, cap + n_dump]
-        uint64_t      gen   = 0;       // the commit this copy holds: it holds what the host holds while gen == host_gen
-    };
-
-    // the padded entries of an update write their own rows past the end, which no graph reads
-    static constexpr uint32_t n_dump = 256;
-
-    std::vector<ggml_context_ptr>        ctxs;
-    std::vector<ggml_backend_buffer_ptr> bufs;
-    std::vector<table>                   tables; // one per device
-    std::vector<int32_t>                 table_of_il; // per model layer, -1 without an indexer cache
-
-    uint32_t cap   = 0; // rows a graph reads at most: the padded count of every pool the cache can hold
-    uint32_t kpool = 0;
-
-    // what every copy in step holds in rows [0, n_valid)
-    std::vector<int32_t> cells;
-    std::vector<int32_t> idxs;
-    uint32_t n_valid  = 0;
-    uint64_t host_gen = 1;
-
-    // the update the last applied ubatch built (rows into cells and idxs), staged by its graph and committed by next()
-    std::vector<uint32_t> rows;
-    std::vector<int32_t>  sent; // the copies that ubatch's graph updates
-    uint32_t n_valid_next = 0;
-    bool     pending      = false;
-    bool     staged       = false;
-
-    // LLAMA_QSA_KPOOL_DEV_CHECK: what the copies held before the update
-    bool check = false;
-    std::vector<int32_t> prev_cells;
-    std::vector<int32_t> prev_idxs;
-    uint32_t prev_n_valid = 0;
-    bool     prev_in_step = false;
-
-    uint64_t n_ubatch  = 0;
-    uint64_t n_full    = 0; // updates that rewrote every row a graph reads
-    uint64_t n_rows    = 0; // rows uploaded
-    uint64_t n_read    = 0; // rows the graphs read (what the host used to upload)
-    uint64_t n_checked = 0;
 };
 
 namespace {

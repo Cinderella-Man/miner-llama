@@ -171,7 +171,7 @@ static void run(llama_model * model, const args_t & a) {
         CHECK(llama_kpool_dev_stats(ls.ctxs[k], &n, nullptr, nullptr, nullptr) == (k > 0));
     }
 
-    const int n_seq_ctx = a.unified ? 1024/2 : 1024/2; // keep each sequence in its half
+    const int n_seq_ctx = 1024/2; // keep each sequence in its half of the cache
     saved_t saved[2];
 
     auto prompt = [&](llama_seq_id s) {
