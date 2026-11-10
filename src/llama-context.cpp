@@ -8,6 +8,7 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -3068,7 +3069,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             const char * env = getenv("LLAMA_GPU_KQ_MASK_CHECK");
             return env != nullptr && atoi(env) != 0;
         }();
-        if (kq_mask_check) {
+        // so does LLAMA_QSA_KPOOL_DEV_CHECK=1 with the k-pool tables' copies
+        const auto * mem_idx = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get());
+        if (kq_mask_check || (mem_idx && mem_idx->kpool_dev_check_on())) {
             ggml_backend_sched_synchronize(sched.get());
         }
 
@@ -3148,6 +3151,11 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
 
     synchronize();
     pipe_drain();
+
+    // the slots' graphs are in flight together, so each uploads the k-pool tables whole (LLAMA_QSA_KPOOL_DEV)
+    if (auto * mem_idx = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) {
+        mem_idx->kpool_dev_disable();
+    }
 
     // one state group per slot and the stash, before the reserve, which drops every graph that still points at the old
     // state tensors
@@ -5292,7 +5300,8 @@ llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_graph) const
         // - a layer's attention mask built on the device (LLAMA_GPU_KQ_MASK) belongs on that layer's device, or the scheduler
         //   computes it once and copies it between devices, which is the transfer it exists to avoid; so does the staged
         //   input it is built from ("kq_stage"), or the scheduler uploads each part of the input separately
-        const bool kq_dev = strcmp(name, "kq_mask") == 0 || strcmp(name, "kq_stage") == 0;
+        //   (and so does the update of the k-pool tables kept on the devices, "kpool_stage", LLAMA_QSA_KPOOL_DEV)
+        const bool kq_dev = strcmp(name, "kq_mask") == 0 || strcmp(name, "kq_stage") == 0 || strcmp(name, "kpool_stage") == 0;
         // - a card hop's casts (LLAMA_HOP_CAST, build_hop_cast): the narrow cast on the card before the boundary (il is
         //   that card's last layer), the cast back on the card after it, so the scheduler copies the narrow tensor
         const bool hop = strcmp(name, "hop_narrow") == 0 || strcmp(name, "hop_wide") == 0;
@@ -7120,6 +7129,11 @@ bool llama_embd_cache_stats(const llama_context * ctx, uint64_t * n_hit, uint64_
 
 bool llama_nextn_carry_init(llama_context * ctx) {
     return ctx->nextn_carry_init();
+}
+
+bool llama_kpool_dev_stats(const llama_context * ctx, uint64_t * n_ubatch, uint64_t * n_full, uint64_t * n_rows, uint64_t * n_checked) {
+    const auto * mem_idx = dynamic_cast<const llama_memory_hybrid_idx *>(llama_get_memory(ctx));
+    return mem_idx != nullptr && mem_idx->kpool_dev_stats(n_ubatch, n_full, n_rows, n_checked);
 }
 
 void llama_set_nextn_carry(llama_context * ctx, bool in, bool out) {

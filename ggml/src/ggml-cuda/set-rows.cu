@@ -247,6 +247,17 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_I32) {
+        // whole numbers held as F32, as the k-pool tables kept on the devices (LLAMA_QSA_KPOOL_DEV) are staged
+        set_rows_cuda(
+            src0_d, src1_d, (int32_t*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
     } else if (dst->type == GGML_TYPE_BF16) {
         set_rows_cuda(
             src0_d, src1_d, (nv_bfloat16*)dst->data,

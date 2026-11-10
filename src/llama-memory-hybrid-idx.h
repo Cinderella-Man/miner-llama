@@ -107,6 +107,24 @@ public:
     const stale_pos_t & mem_idx_stale_get() const { return mem_idx_stale; }
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
 
+    // LLAMA_QSA_KPOOL_DEV (C100, off by default): the k-pool tables (pool_cells, pool_idxs) kept on the devices, one
+    // copy per device that holds a QSA layer's indexer cache, which each ubatch updates with the rows that changed
+    // instead of an upload of the whole tables; the host keeps what the copies hold. 1: every qwen4exp context, 2: the
+    // MTP draft's only. LLAMA_QSA_KPOOL_DEV_CHECK=1 compares, every ubatch, the copies and the update with the tables
+    // the host builds without the switch. Null when off
+    struct kpool_dev_state;
+    kpool_dev_state * kpool_dev_get() const { return kpool_dev_on ? kpool_dev.get() : nullptr; }
+    bool kpool_dev_check_on() const;
+
+    // pipelined decoding (llama_pipe_init) keeps the uploaded tables: its slots' graphs are in flight together
+    void kpool_dev_disable();
+
+    // the update of the ubatch before succeeded: the copies its graph updated now hold what the host holds
+    void kpool_dev_commit();
+
+    // counts since the memory was created; false when the switch is off
+    bool kpool_dev_stats(uint64_t * n_ubatch, uint64_t * n_full, uint64_t * n_rows, uint64_t * n_checked) const;
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -128,6 +146,12 @@ private:
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
 
     stale_pos_t mem_idx_stale = stale_pos_clean();
+
+    // unique_ptr because kpool_dev_state is incomplete here
+    std::unique_ptr<kpool_dev_state> kpool_dev;
+    bool kpool_dev_on = false;
+
+    void kpool_dev_init(const llama_model & model, bool no_alloc, bool offload);
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -194,9 +218,24 @@ public:
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
     // sel_mask (F32 [n_sel, 1, 1, n_tokens], can be null): 0 for the live selection slots, -inf for the dead ones
     // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
+    // pool_cells and pool_idxs null: the tables are on the devices (kpool_dev_on), apply() built them
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
+
+    // LLAMA_QSA_KPOOL_DEV (C100): the k-pool tables on the devices, see llama_memory_hybrid_idx::kpool_dev_get
+    bool     kpool_dev_on() const;
+    bool     kpool_dev_check_on() const;
+    uint32_t get_n_kpool_upd() const; // rows of this ubatch's update, padded to a stable bound
+    // the copy on il's device (I32 [1, n_rows] and I32 [kpool, n_rows]) and its number, -1 if il has none
+    int32_t  kpool_dev_table(int32_t il, ggml_tensor ** cells, ggml_tensor ** idxs) const;
+    // upd (F32 [(2 + kpool)*n_upd]): the rows, then their pool_cells, then their pool_idxs, whole numbers as F32; the
+    // padded entries write rows past the tables' end. tables: the copies this graph updates
+    void     set_input_kpool_upd(ggml_tensor * upd, const std::vector<int32_t> & tables) const;
+    // LLAMA_QSA_KPOOL_DEV_CHECK: the host's tables without the switch, the copies (synchronized) and the update agree
+    void     kpool_dev_check(const ggml_tensor * pool_mask, const ggml_tensor * tail_idxs, const ggml_tensor * new_pool_idxs,
+                             const ggml_tensor * new_pool_rep, const ggml_tensor * new_pool_pos, const ggml_tensor * upd,
+                             const std::vector<int32_t> & tables, const llama_ubatch * ubatch) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;
@@ -220,6 +259,9 @@ private:
     kpool_state kpool_build_sizes() const;
     void kpool_build_state(const llama_ubatch & ubatch);
     const kpool_state & kpool_cur() const;
+
+    // LLAMA_QSA_KPOOL_DEV: this ubatch's tables into the host's copy, and the rows that changed
+    void kpool_dev_build(const llama_ubatch & ubatch);
 
     // unique_ptr because kpool_state is incomplete here.
     std::unique_ptr<kpool_state> kpool_st;
