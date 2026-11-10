@@ -1553,6 +1553,9 @@ struct ggml_backend_cuda_context {
     int64_t next_graph_eviction_time = 0;
     int64_t last_graph_use_time = 0;
 
+    // GGML_CUDA_GRAPHS_FORCE: a batched graph has run eagerly on this context, so later ones may be captured at once
+    bool graphs_force_warm = false;
+
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr, int64_t time_now = ggml_time_us()) {
         // Give all cached graphs 10s to be reused after an idle period, without updating each graph.
         if (!cuda_graphs.empty() && time_now - last_graph_use_time >= 10'000'000) {
