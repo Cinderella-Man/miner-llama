@@ -13858,6 +13858,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // IQ4_XS's and Q4_K's products of 2 to 4 tokens the same way (mmvq-pascal-dmt.cu, GGML_CUDA_MMVQ_PASCAL_DMT=1, C722):
+    // Qwen3.8-Flash-Next's attention and recurrent projections (attn_qkv, attn_gate and attn_q 2560 -> 10240, 6144 and
+    // 12288; ssm_out 6144 -> 2560), each lane-group size (1 to 32 lanes per row at 512 to 8192 weights; IQ4_XS's 768-wide
+    // rows, one lane per row, left to the k-column kernel), a partial last row block, rows that are views of wider rows,
+    // and K = 12288 (Q4_K taken at 2 tokens, IQ4_XS at 2 and 3), and 5 tokens, left to the k-column kernel. The kcol cases
+    // above hold the other Flash-Next shapes (IQ4_XS 10240 x 2560, both types 2560 x 6144) and 333 x 768, 333 x 2560
+    // and 128 x 8192; the large activations run the kernel too.
+    {
+        struct dmt_case { ggml_type type; int64_t m, k, k_v; };
+        std::vector<dmt_case> dmt_cases = {
+            { GGML_TYPE_Q4_K, 10240, 2560, 0 }, { GGML_TYPE_Q4_K, 333, 768, 0 },
+        };
+        for (ggml_type type : { GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K }) {
+            for (const dmt_case & c : std::vector<dmt_case>{
+                    { type, 6144, 2560, 0 }, { type, 12288, 2560, 0 }, { type, 4097, 2560, 0 }, { type, 200, 512, 0 },
+                    { type, 1000, 1024, 0 }, { type, 129, 2048, 0 }, { type, 77, 4096, 0 }, { type, 64, 8192, 0 },
+                    { type, 257, 2560, 2816 }, { type, 96, 12288, 0 } }) {
+                dmt_cases.push_back(c);
+            }
+        }
+        for (const dmt_case & c : dmt_cases) {
+            for (int64_t n = 1; n <= 5; ++n) {
+                test_cases.emplace_back(new test_mul_mat(c.type, GGML_TYPE_F32, c.m, n, c.k, { 1, 1 }, { 1, 1 },
+                                                         { 0, 1, 2, 3 }, c.k_v));
+            }
+        }
+    }
     // all 512 experts, as the file has them
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q2_0, GGML_GLU_OP_SWIGLU, 1, 640, 2560, true, 512, 10,
                                                         true));
@@ -15682,12 +15709,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Qwen3.8-Flash-Next's dense quantized products at 1 to 8 tokens (a speculative-decoding verify): the retyped
     // hyper-connection projections (Q8_0), attn_qkv, attn_gate and attn_q (Q3_K, IQ4_XS), ssm_out (IQ4_XS, Q4_K), the
     // shared expert's down projection (Q2_0, Q4_0, Q5_0, IQ4_NL) and the output layer (Q5_K, the draft's Q6_K); compare
-    // the k-column kernels (mmvq-pascal-kcol.cu) on and off with GGML_CUDA_MMVQ_PASCAL_KCOL
+    // the k-column kernels (mmvq-pascal-kcol.cu) on and off with GGML_CUDA_MMVQ_PASCAL_KCOL, and with
+    // GGML_CUDA_MMVQ_PASCAL_DMT (C722) IQ4_XS's and Q4_K's kernel of 2 to 4 tokens, whose shapes the IQ4_XS attn_gate and
+    // the Q4_K attn_qkv and attn_gate (2560 -> 10240 and 6144) complete
     for (int64_t n = 1; n <= 8; ++n) {
         for (auto [type, m, k] : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{
                 { GGML_TYPE_Q8_0, 10240, 320 }, { GGML_TYPE_Q8_0, 320, 10240 },
                 { GGML_TYPE_Q3_K, 10240, 2560 }, { GGML_TYPE_Q3_K, 6144, 2560 }, { GGML_TYPE_Q3_K, 12288, 2560 },
                 { GGML_TYPE_IQ4_XS, 10240, 2560 }, { GGML_TYPE_IQ4_XS, 12288, 2560 }, { GGML_TYPE_IQ4_XS, 2560, 6144 },
+                { GGML_TYPE_IQ4_XS, 6144, 2560 }, { GGML_TYPE_Q4_K, 10240, 2560 }, { GGML_TYPE_Q4_K, 6144, 2560 },
                 { GGML_TYPE_Q4_K, 2560, 6144 }, { GGML_TYPE_Q2_0, 2560, 640 },
                 { GGML_TYPE_Q4_0, 2560, 640 }, { GGML_TYPE_Q5_0, 2560, 640 }, { GGML_TYPE_IQ4_NL, 2560, 640 },
                 { GGML_TYPE_Q5_K, 248320, 2560 }, { GGML_TYPE_Q6_K, 248320, 2560 } }) {
