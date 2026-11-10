@@ -100,7 +100,7 @@ struct lockstep {
 
         bool ok = true;
         for (llama_context * c : ctxs) {
-            const int rc = llama_process(c, LLAMA_PROCESS_TYPE_DECODE, b);
+            const int rc = llama_decode(c, b);
             CHECK(rc == 0);
             ok = ok && rc == 0;
         }
