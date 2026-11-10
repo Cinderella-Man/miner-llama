@@ -11268,6 +11268,12 @@ struct test_lightning_indexer_rows : public test_case {
         return 1e-6;
     }
 
+    // with same, the output is a concat of the two: the op's name keeps the case under -o LIGHTNING_INDEXER
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "LIGHTNING_INDEXER";
+    }
+
     // with same, only the output's two parts are compared
     bool run_whole_graph() override {
         return same;
