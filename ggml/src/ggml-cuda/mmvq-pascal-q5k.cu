@@ -10,15 +10,14 @@
 #include "mmvq-pascal-impl.cuh"
 
 // How the kernel works (2 to 4 tokens of a plain Q5_K product):
-//   - The lanes, rows and summation order are mul_mat_vec_q_pascal's for Q5_K (mmvqp_choose: R = 1, C = 1, staged):
-//     L = 2^lpr_log2 lanes per row (the largest power of two, at most 32, dividing the row's super-blocks), lane sl of a
-//     row's group taking super-blocks sl, sl + L, ... in that order, its 176-byte segment staged by the lane group into
-//     the warp's shared memory with 128-bit loads, and the lanes' sums added with the same xor shuffles. So every
-//     token's result is the one-token kernel's, bit for bit.
+//   - The lanes and summation order are mul_mat_vec_q_pascal's for Q5_K (mmvqp_choose: C = 1, staged): L = 2^lpr_log2
+//     lanes per row (the largest power of two, at most 32, dividing the row's super-blocks), lane sl of a row's group
+//     taking super-blocks sl, sl + L, ... in that order, its 176-byte segment staged by the lane group into the warp's
+//     shared memory with 128-bit loads, and the lanes' sums added with the same xor shuffles. So every token's result is
+//     the one-token kernel's, bit for bit. A lane group owns R = 1 (default) or 2 consecutive rows, which share every
+//     load of the activations; R changes no row's sum.
 //   - Each 32-weight sub-block of a row is decoded once into eight words of 5-bit codes and multiplied with dp4a by
-//     every token's activations. The one-token kernel decodes it once per token (mul_mat_vec_q_pascal_mc) and the
-//     k-column kernel stages every row's activation records per row (mul_mat_kcol, 3 shared loads per sub-block, token
-//     and row).
+//     every token's activations. The earlier multi-token kernel decodes it once per token (mul_mat_vec_q_pascal_mc).
 //   - The floating-point steps are mmvqp_dot_q5_K's: per sub-block s and token, sumd = fmaf(d8, (float) (isum * sc), sumd)
 //     and summ = fmaf((float) m, S, summ), with S = d8 * (float) sum(int8); per super-block acc + d * sumd - dmin * summ.
 //     The integer-to-float conversions are made without the quarter-rate I2F and the integer multiply, exactly: the dp4a
@@ -29,15 +28,16 @@
 //   - Each block stages all tokens' activations once into shared memory (the int8 words and (d8, S) per sub-block and
 //     token, padded so that the L lanes of a group read distinct banks; every lane group of a warp reads the same L
 //     records, a broadcast) and loops over row blocks (a persistent grid of about 2 blocks per SM), so the staging and
-//     its block sums serve many rows: K = 2560 at 4 tokens is 13 KB, 6 warps' weight staging 33 KB.
-//   - By default each warp loads its next segment into registers before it computes the current one (11 128-bit loads
-//     per lane in flight during the 64 x 4 dp4a of a super-block).
+//     its block sums serve many rows: K = 2560 at 4 tokens is 13 KB beside 33 KB of weight staging (6 warps at R = 1,
+//     3 at R = 2). The k-column kernel stages each block's activation records again for every 64 rows, in tiles.
+//   - By default each warp loads its next segments into registers before it computes the current ones (11 128-bit loads
+//     per lane and row in flight during the 64 x 4 dp4a of a super-block).
 
-#define Q5KMT_NW_MAX   6                    // warps per block, at most
+#define Q5KMT_NW_MAX   6                    // warps per block at R = 1, at most (3 at R = 2)
 #define Q5KMT_MAX_COLS 4
 #define Q5KMT_SB       176                  // bytes of a super-block (block_q5_K)
 #define Q5KMT_NU       (Q5KMT_SB / 16)      // its 16-byte units
-#define Q5KMT_STAGE    (WARP_SIZE * Q5KMT_SB) // a warp's staging buffer: one super-block per lane
+#define Q5KMT_STAGE    (WARP_SIZE * Q5KMT_SB) // a warp's staging buffer per row of its lane groups
 #define Q5KMT_SMEM_MAX (48 * 1024)
 
 static_assert(sizeof(block_q5_K) == Q5KMT_SB, "block_q5_K is 176 bytes");
@@ -53,7 +53,7 @@ struct q5kmt_args {
     int          nsb;           // super-blocks per row
     int          lpr_log2;      // lanes per row L = 1 << lpr_log2
     int          niter;         // super-blocks per lane and row (nsb / L)
-    int          nwrb;          // warp row blocks: rows / (32 >> lpr_log2), rounded up
+    int          nwrb;          // warp row blocks: rows / ((32 >> lpr_log2) * R), rounded up
     int          col_bytes_y;
     int          stride_col_dst;
     int          ds_off;        // words from the start of shared memory to the (d8, S) region
@@ -71,75 +71,98 @@ static int q5kmt_act_bytes(const int nt, const int nsb) {
     return q + ds;
 }
 
-// One super-block of a row (sw: its 176 bytes in shared memory) times every token's activations at its position (aq:
-// the int8 words, ads: (d8, S)), added to acc[j] exactly as mmvqp_dot_q5_K adds it for token j alone.
-template <int NT>
-static __device__ __forceinline__ void q5kmt_superblock(const char * sw, const uint32_t * aq, const float * ads,
-                                                        float (&acc)[NT]) {
-    uint32_t h[12]; // dm, 3 words of scales, 8 words qh
-    mmvqp_lds_words<48, 16>(h, sw);
-    const uint32_t sc_lo = h[1] & 0x3f3f3f3f;                                   // scales of sub-blocks 0..3
-    const uint32_t m_lo  = h[2] & 0x3f3f3f3f;                                   // mins of sub-blocks 0..3
-    const uint32_t sc_hi = (h[3] & 0x0f0f0f0f) | ((h[1] >> 2) & 0x30303030);   // scales of 4..7
-    const uint32_t m_hi  = ((h[3] >> 4) & 0x0f0f0f0f) | ((h[2] >> 2) & 0x30303030);
-    float sumd[NT];
-    float summ[NT];
+// The super-blocks of R rows at one position (sw[i]: row i's 176 bytes in shared memory) times every token's
+// activations at that position (aq: the int8 words, ads: (d8, S)), added to acc[i][j] exactly as mmvqp_dot_q5_K adds
+// row i's super-block for token j alone.
+template <int NT, int R>
+static __device__ __forceinline__ void q5kmt_superblock(const char * const (&sw)[R], const uint32_t * aq, const float * ads,
+                                                        float (&acc)[R][NT]) {
+    uint32_t h[R][12]; // dm, 3 words of scales, 8 words qh
+    uint32_t sc_lo[R], m_lo[R], sc_hi[R], m_hi[R];
 #pragma unroll
-    for (int j = 0; j < NT; ++j) {
-        sumd[j] = 0.0f;
-        summ[j] = 0.0f;
+    for (int i = 0; i < R; ++i) {
+        mmvqp_lds_words<48, 16>(h[i], sw[i]);
+        sc_lo[i] = h[i][1] & 0x3f3f3f3f;                                         // scales of sub-blocks 0..3
+        m_lo[i]  = h[i][2] & 0x3f3f3f3f;                                         // mins of sub-blocks 0..3
+        sc_hi[i] = (h[i][3] & 0x0f0f0f0f) | ((h[i][1] >> 2) & 0x30303030);      // scales of 4..7
+        m_hi[i]  = ((h[i][3] >> 4) & 0x0f0f0f0f) | ((h[i][2] >> 2) & 0x30303030);
+    }
+    float sumd[R][NT];
+    float summ[R][NT];
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            sumd[i][j] = 0.0f;
+            summ[i][j] = 0.0f;
+        }
     }
 #pragma unroll
     for (int p = 0; p < 4; ++p) {
-        uint32_t qs[8];
-        mmvqp_lds_words<32, 16>(qs, sw + 48 + 32*p);
+        uint32_t qs[R][8];
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            mmvqp_lds_words<32, 16>(qs[i], sw[i] + 48 + 32*p);
+        }
 #pragma unroll
         for (int hh = 0; hh < 2; ++hh) {
             const int s = 2*p + hh;
-            int q[8];
+            int   q[R][8];
+            float scf[R];
+            float mf[R];
+            float cneg[R];
 #pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                const uint32_t nib = hh ? (qs[k] >> 4) & 0x0F0F0F0F : qs[k] & 0x0F0F0F0F;
-                const uint32_t hb  = s <= 4 ? (h[4 + k] << (4 - s)) & 0x10101010 : (h[4 + k] >> (s - 4)) & 0x10101010;
-                q[k] = (int) (nib | hb);
+            for (int i = 0; i < R; ++i) {
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const uint32_t nib = hh ? (qs[i][k] >> 4) & 0x0F0F0F0F : qs[i][k] & 0x0F0F0F0F;
+                    const uint32_t hb  = s <= 4 ? (h[i][4 + k] << (4 - s)) & 0x10101010 : (h[i][4 + k] >> (s - 4)) & 0x10101010;
+                    q[i][k] = (int) (nib | hb);
+                }
+                // (float) sc and (float) m exactly: the 6-bit byte as the low mantissa bits of 12582912 = 2^23 + 2^22
+                const uint32_t sel = 0x7650 | (s & 3);
+                scf[i]  = __int_as_float((int) __byte_perm(s < 4 ? sc_lo[i] : sc_hi[i], 0x4B400000u, sel)) - 12582912.0f;
+                mf[i]   = __int_as_float((int) __byte_perm(s < 4 ? m_lo[i]  : m_hi[i],  0x4B400000u, sel)) - 12582912.0f;
+                cneg[i] = -12582912.0f * scf[i];
             }
-            // (float) sc and (float) m exactly: the 6-bit byte as the low mantissa bits of 12582912 = 2^23 + 2^22
-            const uint32_t sel  = 0x7650 | (s & 3);
-            const float    scf  = __int_as_float((int) __byte_perm(s < 4 ? sc_lo : sc_hi, 0x4B400000u, sel)) - 12582912.0f;
-            const float    mf   = __int_as_float((int) __byte_perm(s < 4 ? m_lo  : m_hi,  0x4B400000u, sel)) - 12582912.0f;
-            const float    cneg = -12582912.0f * scf;
 #pragma unroll
             for (int j = 0; j < NT; ++j) {
                 const uint4  u0 = *(const uint4  *) (aq + (s*NT + j)*8);
                 const uint4  u1 = *(const uint4  *) (aq + (s*NT + j)*8 + 4);
                 const float2 ds = *(const float2 *) (ads + (s*NT + j)*2);
-                int ia = 0x4B400000; // 12582912 as a float: the result reads as 12582912 + isum
-                ia = ggml_cuda_dp4a(q[0], (int) u0.x, ia);
-                ia = ggml_cuda_dp4a(q[1], (int) u0.y, ia);
-                ia = ggml_cuda_dp4a(q[2], (int) u0.z, ia);
-                ia = ggml_cuda_dp4a(q[3], (int) u0.w, ia);
-                ia = ggml_cuda_dp4a(q[4], (int) u1.x, ia);
-                ia = ggml_cuda_dp4a(q[5], (int) u1.y, ia);
-                ia = ggml_cuda_dp4a(q[6], (int) u1.z, ia);
-                ia = ggml_cuda_dp4a(q[7], (int) u1.w, ia);
-                const float x = fmaf(__int_as_float(ia), scf, cneg); // (float) (isum * sc), exactly
-                sumd[j] = fmaf(ds.x, x, sumd[j]);
-                summ[j] = fmaf(mf, ds.y, summ[j]);
+#pragma unroll
+                for (int i = 0; i < R; ++i) {
+                    int ia = 0x4B400000; // 12582912 as a float: the result reads as 12582912 + isum
+                    ia = ggml_cuda_dp4a(q[i][0], (int) u0.x, ia);
+                    ia = ggml_cuda_dp4a(q[i][1], (int) u0.y, ia);
+                    ia = ggml_cuda_dp4a(q[i][2], (int) u0.z, ia);
+                    ia = ggml_cuda_dp4a(q[i][3], (int) u0.w, ia);
+                    ia = ggml_cuda_dp4a(q[i][4], (int) u1.x, ia);
+                    ia = ggml_cuda_dp4a(q[i][5], (int) u1.y, ia);
+                    ia = ggml_cuda_dp4a(q[i][6], (int) u1.z, ia);
+                    ia = ggml_cuda_dp4a(q[i][7], (int) u1.w, ia);
+                    const float x = fmaf(__int_as_float(ia), scf[i], cneg[i]); // (float) (isum * sc), exactly
+                    sumd[i][j] = fmaf(ds.x, x, sumd[i][j]);
+                    summ[i][j] = fmaf(mf[i], ds.y, summ[i][j]);
+                }
             }
         }
     }
-    const float d    = mmvqp_h2f_lo(h[0]);
-    const float dmin = mmvqp_h2f_hi(h[0]);
 #pragma unroll
-    for (int j = 0; j < NT; ++j) {
-        acc[j] = acc[j] + d * sumd[j] - dmin * summ[j];
+    for (int i = 0; i < R; ++i) {
+        const float d    = mmvqp_h2f_lo(h[i][0]);
+        const float dmin = mmvqp_h2f_hi(h[i][0]);
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            acc[i][j] = acc[i][j] + d * sumd[i][j] - dmin * summ[i][j];
+        }
     }
 }
 
 // Grid: (blocks, 1, 1), each looping over warp row blocks; block (32, NW). Dynamic shared memory: the staged activations
-// (int8 words, then (d8, S)), then the NW warps' staging buffers.
-template <int NT, bool PF>
-__launch_bounds__(Q5KMT_NW_MAX*WARP_SIZE, 2)
+// (int8 words, then (d8, S)), then the NW warps' staging buffers (R rows per lane group).
+template <int NT, int R, bool PF>
+__launch_bounds__(Q5KMT_NW_MAX*WARP_SIZE/R, 2)
 static __global__ void mul_mat_vec_q5_K_pascal_mt(const q5kmt_args p) {
     constexpr int QW = q5kmt_q_words<NT>();
     constexpr int DW = q5kmt_ds_words<NT>();
@@ -187,48 +210,64 @@ static __global__ void mul_mat_vec_q5_K_pascal_mt(const q5kmt_args p) {
     const int lpr      = 1 << lpr_log2;
     const int sl       = lane & (lpr - 1);
     const int grp      = lane >> lpr_log2;
-    const int gpw      = WARP_SIZE >> lpr_log2;      // rows per warp row block
+    const int gpw      = WARP_SIZE >> lpr_log2;      // lane groups per warp
     const int seg      = Q5KMT_SB << lpr_log2;       // bytes of a row's segment per iteration
-    char *       smw = (char *) q5kmt_sm + p.stage_off + wid * Q5KMT_STAGE + grp * seg;
-    const char * sws = smw + sl * Q5KMT_SB;          // this lane's super-block in the staging buffer
-    const int    wstride = gridDim.x * nw;
+    // the lane group's R row segments in the warp's staging buffer, and this lane's super-block in each
+    char * smw = (char *) q5kmt_sm + p.stage_off + wid * R * Q5KMT_STAGE + grp * R * seg;
+    const char * sws[R];
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+        sws[i] = smw + i * seg + sl * Q5KMT_SB;
+    }
+    const int wstride = gridDim.x * nw;
 
     int wrb = blockIdx.x * nw + wid;
     if (wrb >= p.nwrb) {
         return;
     }
-    // the lane group's row (clamped, so that the staging reads a valid row; its results are not written)
-    const auto row_ptr = [&](const int w) {
-        return p.vx + (int64_t) min(w * gpw + grp, p.nrows - 1) * p.row_bytes;
+    // the lane group's rows (clamped, so that the staging reads valid rows; their results are not written)
+    const char * rw[R];
+    const auto set_rows = [&](const char * (&r)[R], const int w) {
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            r[i] = p.vx + (int64_t) min((w * gpw + grp) * R + i, p.nrows - 1) * p.row_bytes;
+        }
     };
-    const char * rw = row_ptr(wrb);
+    set_rows(rw, wrb);
     int it = 0;
 
-    [[maybe_unused]] uint4 v[Q5KMT_NU];
+    [[maybe_unused]] uint4 v[R][Q5KMT_NU];
     if constexpr (PF) {
 #pragma unroll
-        for (int k = 0; k < Q5KMT_NU; ++k) {
-            v[k] = __ldg((const uint4 *) rw + sl + (k << lpr_log2));
+        for (int i = 0; i < R; ++i) {
+#pragma unroll
+            for (int k = 0; k < Q5KMT_NU; ++k) {
+                v[i][k] = __ldg((const uint4 *) rw[i] + sl + (k << lpr_log2));
+            }
         }
     }
 
-    float acc[NT];
+    float acc[R][NT];
 #pragma unroll
-    for (int j = 0; j < NT; ++j) {
-        acc[j] = 0.0f;
+    for (int i = 0; i < R; ++i) {
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            acc[i][j] = 0.0f;
+        }
     }
 
     while (true) {
-        // the current segment into the warp's staging buffer
-        {
-            uint4 * dsm = (uint4 *) smw;
+        // the current segments into the warp's staging buffer
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            uint4 * dsm = (uint4 *) (smw + i * seg);
             if constexpr (PF) {
 #pragma unroll
                 for (int k = 0; k < Q5KMT_NU; ++k) {
-                    dsm[sl + (k << lpr_log2)] = v[k];
+                    dsm[sl + (k << lpr_log2)] = v[i][k];
                 }
             } else {
-                const uint4 * src = (const uint4 *) (rw + it * seg);
+                const uint4 * src = (const uint4 *) (rw[i] + it * seg);
 #pragma unroll
                 for (int k = 0; k < Q5KMT_NU; ++k) {
                     dsm[sl + (k << lpr_log2)] = __ldg(src + sl + (k << lpr_log2));
@@ -238,48 +277,63 @@ static __global__ void mul_mat_vec_q5_K_pascal_mt(const q5kmt_args p) {
         __syncwarp();
 
         // the next step: the next iteration of this row block, or the warp's next row block
-        int          nit  = it + 1;
-        int          nwrb = wrb;
-        const char * nrw  = rw;
+        int nit  = it + 1;
+        int nwrb = wrb;
+        const char * nrw[R];
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            nrw[i] = rw[i];
+        }
         if (nit == p.niter) {
             nit  = 0;
             nwrb = wrb + wstride;
-            nrw  = nwrb < p.nwrb ? row_ptr(nwrb) : rw;
+            if (nwrb < p.nwrb) {
+                set_rows(nrw, nwrb);
+            }
         }
         const bool more = nwrb < p.nwrb;
         if constexpr (PF) {
             if (more) {
-                const uint4 * src = (const uint4 *) (nrw + nit * seg);
 #pragma unroll
-                for (int k = 0; k < Q5KMT_NU; ++k) {
-                    v[k] = __ldg(src + sl + (k << lpr_log2));
+                for (int i = 0; i < R; ++i) {
+                    const uint4 * src = (const uint4 *) (nrw[i] + nit * seg);
+#pragma unroll
+                    for (int k = 0; k < Q5KMT_NU; ++k) {
+                        v[i][k] = __ldg(src + sl + (k << lpr_log2));
+                    }
                 }
             }
         }
 
         const int sb = (it << lpr_log2) + sl;
-        q5kmt_superblock<NT>(sws, aq + sb * QW, ads + sb * DW, acc);
+        q5kmt_superblock<NT, R>(sws, aq + sb * QW, ads + sb * DW, acc);
 
         if (it == p.niter - 1) {
 #pragma unroll
-            for (int j = 0; j < NT; ++j) {
+            for (int i = 0; i < R; ++i) {
 #pragma unroll
-                for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
-                    if (off < lpr) {
-                        acc[j] += __shfl_xor_sync(0xFFFFFFFF, acc[j], off, WARP_SIZE);
+                for (int j = 0; j < NT; ++j) {
+#pragma unroll
+                    for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+                        if (off < lpr) {
+                            acc[i][j] += __shfl_xor_sync(0xFFFFFFFF, acc[i][j], off, WARP_SIZE);
+                        }
                     }
                 }
             }
-            const int row = wrb * gpw + grp;
-            if (sl == 0 && row < p.nrows) {
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                const int row = (wrb * gpw + grp) * R + i;
+                if ((i & (lpr - 1)) == sl && row < p.nrows) {
+#pragma unroll
+                    for (int j = 0; j < NT; ++j) {
+                        p.dst[j * p.stride_col_dst + row] = acc[i][j];
+                    }
+                }
 #pragma unroll
                 for (int j = 0; j < NT; ++j) {
-                    p.dst[j * p.stride_col_dst + row] = acc[j];
+                    acc[i][j] = 0.0f;
                 }
-            }
-#pragma unroll
-            for (int j = 0; j < NT; ++j) {
-                acc[j] = 0.0f;
             }
         }
         __syncwarp();
@@ -288,7 +342,10 @@ static __global__ void mul_mat_vec_q5_K_pascal_mt(const q5kmt_args p) {
         }
         it  = nit;
         wrb = nwrb;
-        rw  = nrw;
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            rw[i] = nrw[i];
+        }
     }
 }
 
@@ -302,24 +359,41 @@ static int q5kmt_mode() {
     return mode;
 }
 
-// The warps per block for nt tokens and nsb super-blocks per row: GGML_CUDA_MMVQ_PASCAL_Q5K_MT_NW (default 6), fewer
-// where the shared memory would pass 48 KB; 0 if not even one warp fits.
+// GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R: rows per lane group, 1 (default) or 2
+static int q5kmt_r() {
+    static const int r = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R", 1) == 2 ? 2 : 1;
+    return r;
+}
+
+// The warps per block for nt tokens and nsb super-blocks per row: GGML_CUDA_MMVQ_PASCAL_Q5K_MT_NW (default and at most
+// 6 at R = 1, 3 at R = 2), fewer where the shared memory would pass 48 KB; 0 if not even one warp fits.
 static int q5kmt_nw(const int nt, const int nsb) {
     static const int nw_env = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_MT_NW", Q5KMT_NW_MAX);
-    int nw = std::min(std::max(nw_env, 1), Q5KMT_NW_MAX);
+    const int r   = q5kmt_r();
+    int       nw  = std::min(std::max(nw_env, 1), Q5KMT_NW_MAX / r);
     const int act = q5kmt_act_bytes(nt, nsb);
-    while (nw > 0 && act + nw * Q5KMT_STAGE > Q5KMT_SMEM_MAX) {
+    while (nw > 0 && act + nw * r * Q5KMT_STAGE > Q5KMT_SMEM_MAX) {
         nw--;
     }
     return nw;
 }
 
-static int q5kmt_lpr_log2(const int64_t nsb) {
+static int q5kmt_lpr_log2(const int nsb) {
     int lpr_log2 = 0;
     while (lpr_log2 < 5 && nsb % (2 << lpr_log2) == 0) {
         lpr_log2++;
     }
     return lpr_log2;
+}
+
+template <int NT, int R>
+static void q5kmt_launch(const q5kmt_args & p, const dim3 grid, const dim3 block, const int smem, const bool pf,
+                         cudaStream_t stream) {
+    if (pf) {
+        mul_mat_vec_q5_K_pascal_mt<NT, R, true><<<grid, block, smem, stream>>>(p);
+    } else {
+        mul_mat_vec_q5_K_pascal_mt<NT, R, false><<<grid, block, smem, stream>>>(p);
+    }
 }
 
 } // namespace
@@ -354,6 +428,7 @@ bool ggml_cuda_mmvq_pascal_q5k_mt(const void * vx, const void * vy, float * dst,
 
     const int nt  = (int) ncols;
     const int nsb = (int) (K / QK_K);
+    const int r   = q5kmt_r();
     const int nw  = q5kmt_nw(nt, nsb);
 
     q5kmt_args p;
@@ -365,17 +440,17 @@ bool ggml_cuda_mmvq_pascal_q5k_mt(const void * vx, const void * vy, float * dst,
     p.nsb            = nsb;
     p.lpr_log2       = q5kmt_lpr_log2(nsb);
     p.niter          = nsb >> p.lpr_log2;
-    const int gpw    = WARP_SIZE >> p.lpr_log2;
-    p.nwrb           = (int) ((nrows + gpw - 1) / gpw);
+    const int rpw    = (WARP_SIZE >> p.lpr_log2) * r; // rows per warp row block
+    p.nwrb           = (int) ((nrows + rpw - 1) / rpw);
     p.col_bytes_y    = (int) col_bytes_y;
     p.stride_col_dst = (int) stride_col_dst;
     p.ds_off         = nsb * (64 * nt + 4);
     const int act    = q5kmt_act_bytes(nt, nsb);
     p.stage_off      = act;
-    const int smem   = act + nw * Q5KMT_STAGE;
+    const int smem   = act + nw * r * Q5KMT_STAGE;
 
-    // a persistent grid: as many blocks as the SMs hold at once (by shared memory and threads; the launch bounds keep
-    // the registers for 2 blocks of 6 warps), at most one per nw warp row blocks
+    // a persistent grid: as many blocks as the SMs hold at once by shared memory and threads (the launch bounds keep the
+    // registers for 2 blocks of the most warps), at most one per nw warp row blocks
     const int nsm  = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
     const int bps  = std::max(1, std::min(96 * 1024 / smem, 2048 / (nw * WARP_SIZE)));
     const int nblk = (int) std::min<int64_t>((p.nwrb + nw - 1) / nw, (int64_t) nsm * bps);
@@ -383,15 +458,14 @@ bool ggml_cuda_mmvq_pascal_q5k_mt(const void * vx, const void * vy, float * dst,
     const dim3 block(WARP_SIZE, nw, 1);
     const bool pf = q5kmt_mode() != 2;
 
-#define Q5KMT_LAUNCH(NT) \
-    if (pf) { mul_mat_vec_q5_K_pascal_mt<NT, true ><<<grid, block, smem, stream>>>(p); } \
-    else    { mul_mat_vec_q5_K_pascal_mt<NT, false><<<grid, block, smem, stream>>>(p); }
-    switch (nt) {
-        case 2:  Q5KMT_LAUNCH(2); break;
-        case 3:  Q5KMT_LAUNCH(3); break;
-        default: Q5KMT_LAUNCH(4); break;
+    switch (nt * 4 + r) {
+        case 2*4 + 1: q5kmt_launch<2, 1>(p, grid, block, smem, pf, stream); break;
+        case 3*4 + 1: q5kmt_launch<3, 1>(p, grid, block, smem, pf, stream); break;
+        case 4*4 + 1: q5kmt_launch<4, 1>(p, grid, block, smem, pf, stream); break;
+        case 2*4 + 2: q5kmt_launch<2, 2>(p, grid, block, smem, pf, stream); break;
+        case 3*4 + 2: q5kmt_launch<3, 2>(p, grid, block, smem, pf, stream); break;
+        default:      q5kmt_launch<4, 2>(p, grid, block, smem, pf, stream); break;
     }
-#undef Q5KMT_LAUNCH
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

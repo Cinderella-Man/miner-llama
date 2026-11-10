@@ -9,9 +9,11 @@
 // design is at the top of mmvq-pascal-q5k.cu.
 //
 // GGML_CUDA_MMVQ_PASCAL_Q5K_MT: 0 (default) off, the k-column and the earlier multi-token kernels as before; 1 on; 2 on
-// without the register prefetch of each warp's next weight segment (for measuring it). GGML_CUDA_MMVQ_PASCAL_Q5K_MT_NW=n:
-// warps per block (1 to 6, default 6; fewer where the block's shared memory would pass 48 KB). The kernels follow
-// GGML_CUDA_MMVQ_PASCAL (0 off, 2 any NVIDIA GPU) and GGML_CUDA_MMVQ_PASCAL_SKIP=q5_K, as the one-token kernel does.
+// without the register prefetch of each warp's next weight segment (for measuring it).
+// GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R=2: two rows per lane group, which share the activation loads (default 1, as the one-token
+// kernel). GGML_CUDA_MMVQ_PASCAL_Q5K_MT_NW=n: warps per block (1 to 6 at R = 1, 1 to 3 at R = 2, default the most;
+// fewer where the block's shared memory would pass 48 KB). The kernels follow GGML_CUDA_MMVQ_PASCAL (0 off, 2 any NVIDIA
+// GPU) and GGML_CUDA_MMVQ_PASCAL_SKIP=q5_K, as the one-token kernel does.
 
 // Whether ggml_cuda_mmvq_pascal_q5k_mt takes a product of ncols columns of a Q5_K matrix with K weights per row,
 // nrows rows row_bytes apart from x, on the current device (the k-column kernels leave such products to it).
