@@ -86,8 +86,6 @@ struct fasp_args {
     int             fault;                // GGML_CUDA_FATTN_SPARSE_PASCAL_FAULT (testing the tests): 1 output x 1.01,
                                           // 2 mask values ignored, 3 every split's last list entry dropped, 4 (union
                                           // kernel) each token scored with the next token's mask row
-    int             tpb     = 1;          // union kernel: query tokens per block and list
-    int             n_lists = 0;          // union kernel: lists per sequence, ceil(n_q / tpb)
 };
 
 // The entries [begin, end) of a list of count entries that split s of S reads: equal shares in whole tiles.
@@ -274,8 +272,8 @@ static __device__ __forceinline__ float fasp_transpose_reduce(float v[32]) {
 }
 
 // grid (splits, KV heads, query rows z), block (32, G/4): warp y takes query heads 4y .. 4y + 3 of KV head blockIdx.y.
-// uni (the union kernel): grid (splits, KV heads, lists: a.n_lists per sequence), block (32, G/4 x a.tpb): warp y takes
-// query heads 4(y % (G/4)) .. + 3 of the list's token y / (G/4); warps past the call's last token only wait.
+// uni (the union kernel): grid (splits, KV heads, lists: ceil(n_q/tpb) per sequence), block (32, G/4 x tpb): warp y
+// takes query heads 4(y % (G/4)) .. + 3 of the list's token y / (G/4); warps past the call's last token only wait.
 template <int D, int type, bool uni>
 __launch_bounds__(FASP_WARP*(uni ? FASP_UNION_WARPS : 4), 1)
 static __global__ void flash_attn_ext_sparse_pascal(const fasp_args a) {
@@ -290,15 +288,18 @@ static __global__ void flash_attn_ext_sparse_pascal(const fasp_args a) {
     const int s    = blockIdx.x;
     const int g    = blockIdx.y;
     int z, iq, i3, list, iq_mask;
+    int n_lists = 0;
     bool valid = true;
     if constexpr (uni) {
-        const int j = blockIdx.z % a.n_lists;
-        i3      = blockIdx.z / a.n_lists;
-        iq      = j*a.tpb + wy / (a.G/FASP_HPW);
+        const int tpb = blockDim.y/(a.G/FASP_HPW); // query tokens per list
+        n_lists = (a.n_q + tpb - 1)/tpb;           // lists per sequence
+        const int j = blockIdx.z % n_lists;
+        i3      = blockIdx.z / n_lists;
+        iq      = j*tpb + wy / (a.G/FASP_HPW);
         valid   = iq < a.n_q;
-        iq      = valid ? iq : j*a.tpb; // a warp past the last token reads the list's first one and computes nothing
+        iq      = valid ? iq : j*tpb; // a warp past the last token reads the list's first one and computes nothing
         z       = i3*a.n_q + iq;
-        list    = (i3 % a.m_ne3)*a.n_lists + j;
+        list    = (i3 % a.m_ne3)*n_lists + j;
         iq_mask = a.fault == 4 && iq + 1 < a.n_q ? iq + 1 : iq;
     } else {
         z       = blockIdx.z;
@@ -457,7 +458,7 @@ static __global__ void flash_attn_ext_sparse_pascal(const fasp_args a) {
     }
 
     // this warp's partial outputs, maxima and sums; the union kernel counts its blocks per list column (list, KV head)
-    const int     n_cols       = uni ? gridDim.y*a.n_q*(gridDim.z/a.n_lists) : gridDim.y*gridDim.z;
+    const int     n_cols       = uni ? gridDim.y*a.n_q*(gridDim.z/n_lists) : gridDim.y*gridDim.z;
     const int     col          = z*gridDim.y + g;
     const int     ctr          = uni ? blockIdx.z*gridDim.y + g : col;
     const int64_t split_stride = (int64_t) n_cols*a.G*PART;
@@ -523,12 +524,13 @@ static void fasp_launch(const fasp_args & a, const int S, const int n_head_kv, c
     flash_attn_ext_sparse_pascal<D, type, false><<<grid, block, 0, stream>>>(a);
 }
 
-// Launches the union kernel (block (32, G/4 x a.tpb), grid (S, n_head_kv, a.n_lists*ne3)); a.idx and a.counts hold the
-// union lists of a.n_kv_max entries, a.n_lists per mask sequence.
+// Launches the union kernel for tpb query tokens a list (block (32, G/4 x tpb), grid (S, n_head_kv, ceil(n_q/tpb)*ne3));
+// a.idx and a.counts hold the union lists of a.n_kv_max entries, ceil(n_q/tpb) per mask sequence.
 template <int D, int type>
-static void fasp_launch_union(const fasp_args & a, const int S, const int n_head_kv, const int ne3, cudaStream_t stream) {
-    const dim3 grid(S, n_head_kv, a.n_lists*ne3);
-    const dim3 block(FASP_WARP, a.G/FASP_HPW*a.tpb, 1);
+static void fasp_launch_union(const fasp_args & a, const int tpb, const int S, const int n_head_kv, const int ne3,
+        cudaStream_t stream) {
+    const dim3 grid(S, n_head_kv, (a.n_q + tpb - 1)/tpb*ne3);
+    const dim3 block(FASP_WARP, a.G/FASP_HPW*tpb, 1);
     flash_attn_ext_sparse_pascal<D, type, true><<<grid, block, 0, stream>>>(a);
 }
 

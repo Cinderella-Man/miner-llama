@@ -183,22 +183,20 @@ bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggm
     a.G          = G;
     a.scale_log2 = scale*FASP_LOG2_E;
     a.fault      = env.fault;
-    a.tpb        = tpb;
-    a.n_lists    = (int) n_lists_seq;
 
     const int n_z = (int) (n_q*ne3);
     if (tpb > 1) {
         if (D == 256) {
             if (K->type == GGML_TYPE_F16) {
-                fasp_launch_union<256, FASP_F16>(a, S, (int) n_head_kv, (int) ne3, stream);
+                fasp_launch_union<256, FASP_F16>(a, tpb, S, (int) n_head_kv, (int) ne3, stream);
             } else {
-                fasp_launch_union<256, FASP_Q8_0>(a, S, (int) n_head_kv, (int) ne3, stream);
+                fasp_launch_union<256, FASP_Q8_0>(a, tpb, S, (int) n_head_kv, (int) ne3, stream);
             }
         } else {
             if (K->type == GGML_TYPE_F16) {
-                fasp_launch_union<128, FASP_F16>(a, S, (int) n_head_kv, (int) ne3, stream);
+                fasp_launch_union<128, FASP_F16>(a, tpb, S, (int) n_head_kv, (int) ne3, stream);
             } else {
-                fasp_launch_union<128, FASP_Q8_0>(a, S, (int) n_head_kv, (int) ne3, stream);
+                fasp_launch_union<128, FASP_Q8_0>(a, tpb, S, (int) n_head_kv, (int) ne3, stream);
             }
         }
     } else if (D == 256) {
