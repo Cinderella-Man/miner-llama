@@ -323,6 +323,9 @@ llama_build_and_test(test-cuda-profile-light.cpp  LABEL behavior)
 
 # GGML_CUDA_KEEPALIVE's settings, poll decision and start/stop controller, with a thread for each card's block
 llama_build_and_test(test-cuda-keepalive.cpp  LABEL behavior)
+
+# GGML_CUDA_GRAPHS_FORCE's choice of graphs and its capture decisions, in a model of the warm-up and capture logic
+llama_build_and_test(test-cuda-graph-force.cpp  LABEL behavior)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

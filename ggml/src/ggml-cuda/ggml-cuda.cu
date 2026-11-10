@@ -80,6 +80,7 @@
 #include "ggml-cuda/moe-persistent.cuh"
 #include "ggml-cuda/hop-mailbox.cuh"
 #include "ggml-cuda/keepalive.cuh"
+#include "ggml-cuda/graph-force.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -3311,12 +3312,8 @@ static bool ggml_cuda_graph_debug_enabled() {
     return enabled;
 }
 
-// GGML_CUDA_GRAPHS_FORCE=1 (C702; lukolszewski/llama.cpp-multigpu c8832a5f0): a batched graph is captured whenever its
-// properties change, without the warm-up of two unchanged calls. Under pipeline parallelism a prompt micro-batch's
-// graph is rebuilt every micro-batch, so the warm-up never completes and a split is launched kernel by kernel: the
-// card's launch queue fills at the third queued micro-batch (R42). Captured, a split reaches the card as one launch per
-// graph chunk. A graph is replayed only as before, when every node's properties equal those it was captured from.
-// Off by default
+// GGML_CUDA_GRAPHS_FORCE=1 (C702, graph-force.h): a batched graph is captured whenever its properties change, without
+// the warm-up of two unchanged calls. Off by default
 static bool ggml_cuda_graphs_force() {
     static const bool enabled = [] {
         const bool on = ggml_cuda_env_flag("GGML_CUDA_GRAPHS_FORCE");
@@ -3328,32 +3325,13 @@ static bool ggml_cuda_graphs_force() {
     return enabled;
 }
 
-// GGML_CUDA_GRAPHS_FORCE: whether this graph is captured at every change instead of after the warm-up. Only graphs
-// whose products take more token rows than the vector kernels (prompt micro-batches, a draft's catch-up passes; the
-// rows of a 2-D activation or of MUL_MAT_ID's third dimension, so that per-head products never count): decode graphs
-// keep the warm-up, which already ends in replays and makes their lazily made state (the persistent MoE kernel's
-// mapped host words, the attention kernels' counters) outside a capture. Not on a device without VMM, whose legacy pool
-// on a failed allocation synchronizes the device and drops every captured graph, which no capture survives; not with
-// concurrent streams (GGML_CUDA_GRAPH_OPT), whose pools and cuBLAS handles are made per stream; not when an ARGSORT takes
-// CUB's segmented path (over 1,024 columns, several rows), which sorts with another algorithm while the stream captures
-// (argsort.cu), so equal keys could come out in another order than in an eager launch
-static bool ggml_cuda_graph_force_capture(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
-    if (!ggml_cuda_info().devices[cuda_ctx->device].vmm || !cuda_ctx->stream_context().concurrent_events.empty()) {
-        return false;
-    }
-    bool batched = false;
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        if (node->op == GGML_OP_MUL_MAT) {
-            const ggml_tensor * src1 = node->src[1];
-            batched = batched || (src1->ne[1] > MMVQ_MAX_BATCH_SIZE && src1->ne[2] == 1 && src1->ne[3] == 1);
-        } else if (node->op == GGML_OP_MUL_MAT_ID) {
-            batched = batched || node->src[1]->ne[2] > MMVQ_MAX_BATCH_SIZE;
-        } else if (node->op == GGML_OP_ARGSORT && node->src[0]->ne[0] > 1024 && ggml_nrows(node->src[0]) > 1) {
-            return false;
-        }
-    }
-    return batched;
+// GGML_CUDA_GRAPHS_FORCE: whether this graph is captured at every change instead of after the warm-up (graph-force.h).
+// Not on a device without VMM, whose legacy pool on a failed allocation synchronizes the device and drops every
+// captured graph, which no capture survives; not with concurrent streams (GGML_CUDA_GRAPH_OPT), whose pools and cuBLAS
+// handles are made per stream
+static bool ggml_cuda_graph_force_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    return ggml_cuda_info().devices[cuda_ctx->device].vmm && cuda_ctx->stream_context().concurrent_events.empty() &&
+           ggml_cuda_graph_force_eligible(cgraph->nodes, cgraph->n_nodes, MMVQ_MAX_BATCH_SIZE);
 }
 
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
@@ -6747,24 +6725,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (ggml_cuda_graphs_force() && ggml_cuda_graph_force_capture(cuda_ctx, cgraph)) {
-                // the instances hold these properties only after a capture or replay with them: an eager evaluation
-                // (the warm-up's, or the one below) recorded its properties but left older instances
-                const bool props_current = graph->warmup_complete && !properties_changed;
-                if (!cuda_ctx->graphs_force_warm) {
-                    // the context's first batched graph runs eagerly, so that lazily made state (the stream's cuBLAS
-                    // handle and its workspace) is made outside a capture
-                    cuda_ctx->graphs_force_warm = true;
-                    graph->warmup_complete = false;
-                } else {
-                    // a change counts as a completed warm-up: sample mode's phase sets captured before it are stale
-                    if (!props_current) {
-                        graph->warmup_complete = true;
-                        graph->capture_gen++;
-                    }
-                    use_cuda_graph = true;
-                    cuda_graph_update_required = !props_current || graph->instances.empty() ||
-                                                 graph->profile_phases.stale(graph->capture_gen);
-                }
+                const ggml_cuda_graph_force_plan plan = ggml_cuda_graph_force_next(cuda_ctx->graphs_force_warm,
+                    graph->warmup_complete, graph->capture_gen, properties_changed, graph->instances.empty(),
+                    [graph](uint64_t gen) { return graph->profile_phases.stale(gen); });
+                use_cuda_graph             = plan.use_graph;
+                cuda_graph_update_required = plan.capture;
             } else if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
