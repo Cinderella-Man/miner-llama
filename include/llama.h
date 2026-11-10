@@ -1017,6 +1017,38 @@ extern "C" {
                     llama_seq_id   seq_id,
                          int32_t   store);
 
+    // C217: micro-batch cuts for the following decodes of a batch of one sequence, until set again (n = 0 clears them):
+    // each cut, a token offset in the batch, ends a micro-batch, and the batch splits into the micro-batches that
+    // separate calls cut there would take. Offsets outside (0, n_tokens) are ignored
+    LLAMA_API void llama_set_ubatch_cuts(
+            struct llama_context * ctx,
+                  const uint32_t * cuts,
+                          size_t   n);
+
+    // C217: fills a numbered device store inside the next decode, without waiting for the devices: the state of seq_id
+    // after the batch's first i_end tokens, as llama_state_seq_get_data_store would write it had that call ended there
+    // (the decode cuts its micro-batches at i_end, as llama_set_ubatch_cuts does). The copies are queued behind that
+    // micro-batch's work on the backends that hold the state; a host copy (llama_state_seq_store_get_data_host) waits
+    // for them. For a batch of one sequence and 0 < i_end < n_tokens; a request the decode cannot take leaves no result
+    LLAMA_API void llama_state_seq_store_at(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                         int32_t   store,
+                        uint32_t   i_end,
+           llama_state_seq_flags   flags);
+
+    // C217: after that decode, the fill's blob (what llama_state_seq_get_data_store returns; dst may be NULL for the
+    // size) and the sequence's lowest and highest positions at i_end (llama_memory_seq_pos_min and _max then); 0 if the
+    // fill was not taken
+    LLAMA_API size_t llama_state_seq_store_at_get(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+                         int32_t   store,
+                       llama_pos * pos_min,
+                       llama_pos * pos_max);
+
     // llama_state_seq_save_file with state flags (e.g. LLAMA_STATE_SEQ_FLAGS_SWA_RING); llama_state_seq_load_file reads
     // either
     LLAMA_API size_t llama_state_seq_save_file_ext(

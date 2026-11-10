@@ -62,6 +62,10 @@ struct llama_state_store {
 
     // a copy of that blob: a restore or a host copy checks that it is given the blob of this fill
     std::vector<uint8_t> meta;
+
+    // C217: a fill inside a decode (llama_state_seq_store_at) queues its copies on the backends that compute the state,
+    // with an event recorded on each after them; a host copy waits for these first. Empty after a fill that waited
+    std::vector<ggml_backend_event_ptr> fences;
 };
 
 struct llama_context {
@@ -254,6 +258,12 @@ struct llama_context {
     size_t state_seq_store_get_size_host(llama_seq_id seq_id, int32_t store);
     size_t state_seq_store_get_data_host(llama_seq_id seq_id, int32_t store, const uint8_t * src, size_t src_size, uint8_t * dst, size_t dst_size);
     void   state_seq_store_free(llama_seq_id seq_id, int32_t store);
+
+    // C217: micro-batch cuts for the following decodes (llama_set_ubatch_cuts), and device-store fills inside the next
+    // decode (llama_state_seq_store_at, llama_state_seq_store_at_get)
+    void   set_ubatch_cuts(const uint32_t * cuts, size_t n);
+    void   state_seq_store_at(llama_seq_id seq_id, int32_t store, uint32_t i_end, llama_state_seq_flags flags);
+    size_t state_seq_store_at_get(llama_seq_id seq_id, int32_t store, uint8_t * dst, size_t size, llama_pos * pos_min, llama_pos * pos_max) const;
 
     bool state_load_file(
             const char * filepath,
@@ -733,6 +743,27 @@ private:
     // thread and its writer are kept apart by the caller)
     std::map<std::pair<llama_seq_id, int32_t>, llama_state_store> state_stores;
     std::mutex state_stores_mtx;
+
+    // C217: the caller's micro-batch cuts, and the device-store fills requested for the next decode (store_at_next)
+    // and taken by the last one (store_at_last, with their blobs)
+    struct store_at_req {
+        llama_seq_id          seq_id;
+        int32_t               store;
+        uint32_t              i_end;
+        llama_state_seq_flags flags;
+
+        bool      done    = false;
+        llama_pos pos_min = -1;
+        llama_pos pos_max = -1;
+
+        std::vector<uint8_t> blob;
+    };
+    std::vector<uint32_t>     ubatch_cuts;
+    std::vector<store_at_req> store_at_next;
+    std::vector<store_at_req> store_at_last;
+
+    // fills r's store from the state as the host holds it now, the copies queued behind the work queued so far
+    bool state_seq_fill_store_at(store_at_req & r);
 
     bool has_evaluated_once = false;
 

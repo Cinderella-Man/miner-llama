@@ -575,6 +575,12 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // C217: process() of a target batch cut with llama_set_ubatch_cuts (the same cuts on the draft context) leaves what
+    // separate calls cut there leave, and get_state_at() gives the state at a cut
+    virtual bool incall_ok() const { return false; }
+    // C217: what get_state would return had the last processed batch ended before its row i_row
+    virtual bool get_state_at(llama_seq_id /*seq_id*/, int32_t /*i_row*/, std::vector<uint8_t> & /*data*/) const { return false; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -2693,6 +2699,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
     }
+
+    // a cut batch's draft pass takes the cuts too, and one row of h per target row joins the parts as pending_h joins
+    // calls; the chained heads re-read the draft cache from each call's start, and a shared cache has no catch-up
+    bool incall_ok() const override {
+        return !chain_heads && !is_mem_shared;
+    }
+
+    // pending_h after a call that ended before row i_row: that call's last row
+    bool get_state_at(llama_seq_id seq_id, int32_t i_row, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || i_row < 1 || is_mem_shared) {
+            return false;
+        }
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        data.resize(row_bytes);
+
+        if (dev_rows) {
+            return llama_get_embeddings_nextn_rows(params.ctx_tgt, i_row - 1, 1, (float *) data.data());
+        }
+
+        const float * h = llama_get_embeddings_nextn_ith(params.ctx_tgt, i_row - 1);
+        if (h == nullptr) {
+            return false;
+        }
+        std::memcpy(data.data(), h, row_bytes);
+        return true;
+    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
@@ -3925,6 +3958,34 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
 
     for (auto & impl : spec->impls) {
         if (impl->get_state(seq_id, data)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool common_speculative_incall_ok(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return true;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (!impl->incall_ok()) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool common_speculative_get_state_at(common_speculative * spec, llama_seq_id seq_id, int32_t i_row, std::vector<uint8_t> & data) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->get_state_at(seq_id, i_row, data)) {
             return true;
         }
     }

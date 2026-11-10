@@ -240,13 +240,25 @@ public:
     // of one sequence
     bool is_one_seq_tokens() const;
 
+    // C217: cuts (token offsets) in the current batch: a split stops at the next cut and treats it as the end of the
+    // batch (the trailing tokens of split_equal's n_keep_tail too), so the batch splits into the micro-batches of
+    // separate calls cut there. For batches of one sequence (is_one_seq); init() clears them, empty = no cuts
+    void set_ubatch_cuts(std::vector<uint32_t> cuts);
+
+    // all tokens of one sequence (the cuts apply)
+    bool is_one_seq() const;
+
 private:
     void clear();
 
     // the most tokens the next split may take under the plan, n_ubatch without one
     uint32_t plan_cap(uint32_t n_ubatch) const;
 
+    // C217: the first cut after the tokens used so far, UINT32_MAX without one
+    uint32_t cut_next() const;
+
     std::vector<uint32_t> ubatch_plan;
+    std::vector<uint32_t> ubatch_cuts;
 
     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed
