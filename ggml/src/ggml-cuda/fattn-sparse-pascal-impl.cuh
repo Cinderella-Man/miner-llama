@@ -27,8 +27,9 @@
 // their finite mask columns (upstream's compaction with ncols1 = tpb). Warp y takes the heads of warp y % (G/4) for
 // token y / (G/4), every warp walks the same cells in the same order, so a K or V row comes from DRAM once per block
 // instead of once per query token, and each warp's own mask row scores the cells its token does not keep -inf: a tile
-// without any of its token's cells leaves its state exactly as it was (factor 1, P 0). Each token's output is the
-// per-token kernel's to rounding (other tile and split boundaries); with the same list and splits it is the same bits.
+// without any of its token's cells would leave its state exactly as it was (factor 1, P 0), so the warp skips it. Each
+// token's output is the per-token kernel's to rounding (other tile and split boundaries); with the same list and
+// splits it is the same bits.
 
 #include <cuda_fp16.h>
 
@@ -384,6 +385,12 @@ static __global__ void flash_attn_ext_sparse_pascal(const fasp_args a) {
         if (e0 + lane < e_end) {
             cell = idx[e0 + lane];
             mk   = a.fault == 2 ? 0.0f : __half2float(mrow[cell])*FASP_LOG2_E;
+        }
+        if constexpr (uni) {
+            // a tile without any of this token's cells would leave its state exactly as it is: skip its reads
+            if (__all_sync(0xFFFFFFFF, mk == -INFINITY)) {
+                continue;
+            }
         }
         cell_sm[wy][lane] = cell;
         __syncwarp();
