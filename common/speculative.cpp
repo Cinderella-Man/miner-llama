@@ -2293,6 +2293,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
+        // LLAMA_STEP_TRACE (C405): the catch-up's batch, its decode and the verify pass's h rows read
+        llama_step_trace_mark("mtp.cu");
+
         const int32_t n_tokens = batch_in.size();
 
         // remember the first and last batch index for each sequence
@@ -2374,6 +2377,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             auto * mem_dft = llama_get_memory(ctx_dft);
 
+            llama_step_trace_mark("mtp.cu.dec");
+
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
                 if (chain_heads) {
@@ -2402,6 +2407,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!ok) {
                 return false;
             }
+
+            llama_step_trace_mark("mtp.cu.ret");
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2442,11 +2449,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     verify_h[seq_id].data() + (size_t) (h_rows - 1) * n_embd, row_bytes);
         }
 
+        llama_step_trace_mark("mtp.cu.end");
+
         return true;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        // LLAMA_STEP_TRACE (C405): per drafting pass its decode, its sampled id and the next pass's batch
+        llama_step_trace_mark("mtp.drf");
 
         batch.clear();
 
@@ -2534,11 +2546,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_carry(ctx_dft, i > 0, true);
             }
 
+            llama_step_trace_mark("mtp.dp");
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
             }
+            llama_step_trace_mark("mtp.dp.ret");
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
@@ -2553,6 +2567,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                llama_step_trace_mark("mtp.dp.smp");
                 // with the carry the row stayed on the device: the batch's state embedding is set but not read
                 const float * h_row = h_carry_on ? pending_h[seq_id].data() : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
@@ -2617,6 +2632,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     i_last[seq_id] = idx;
                 }
             }
+            llama_step_trace_mark("mtp.dp.row");
 
             if (batch.size() == 0) {
                 break;
@@ -2647,6 +2663,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 dp.result->clear();
             }
         }
+
+        llama_step_trace_mark("mtp.drf.end");
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {

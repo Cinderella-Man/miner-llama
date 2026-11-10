@@ -186,6 +186,9 @@ struct llama_context {
     bool nextn_carry_init();
     void set_nextn_carry(bool in, bool out);
 
+    // the prefix of this context's marks in a step trace (llama_step_trace_role)
+    void set_step_trace_role(char role) { step_trace_role = role; }
+
     // the device of the MTP layer's weights and this context's backend for it
     bool mtp_layer_device(ggml_backend_dev_t & dev, ggml_backend_t & backend) const;
 
@@ -765,6 +768,10 @@ private:
     // a graph was handed to the scheduler since the last synchronize(), so with pipeline parallelism it may still be
     // computing on the devices
     mutable bool gf_in_flight = false;
+
+    // LLAMA_STEP_TRACE (C405, llama-step-trace.h): mark the stages of decode() and the waits, as "<role>.<stage>"
+    bool step_trace      = false;
+    char step_trace_role = 'v';
 
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls

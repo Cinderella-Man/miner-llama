@@ -14,6 +14,7 @@
 #include "llama-moe-cache.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
+#include "llama-step-trace.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -26,6 +27,9 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+// LLAMA_STEP_TRACE (C405): a host timestamp of this context's stage; one flag when the variable is unset
+#define LLAMA_STEP_MARK(name) do { if (step_trace) { llama_step_trace_put(step_trace_role, name); } } while (0)
 
 //
 // llama_context
@@ -197,6 +201,9 @@ llama_context::llama_context(
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
+
+    step_trace      = llama_step_trace_active();
+    step_trace_role = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? 'd' : 'v';
 
     const auto & hparams = model.hparams;
 
@@ -1250,7 +1257,9 @@ void llama_context::synchronize() {
         return;
     }
 
+    LLAMA_STEP_MARK("sync");
     ggml_backend_sched_synchronize(sched.get());
+    LLAMA_STEP_MARK("sync.end");
     gf_in_flight = false;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -2948,6 +2957,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    LLAMA_STEP_MARK("ub.apply");
 
     auto * res = get_gf_res_prev(ubatch.n_tokens);
     auto * gf  = res->get_gf();
@@ -3023,6 +3033,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        LLAMA_STEP_MARK("ub.reuse");
     } else {
         if (ss) {
             ss->ready = nullptr;
@@ -3057,6 +3068,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         } else {
             gf_res_prev_active = res;
         }
+        LLAMA_STEP_MARK("ub.build");
     }
 
     // set the input data for the input tensors
@@ -3077,6 +3089,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    LLAMA_STEP_MARK("ub.in");
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
@@ -3084,6 +3097,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
+    LLAMA_STEP_MARK("ub.comp");
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -4026,6 +4040,8 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    LLAMA_STEP_MARK("dec");
+
     sched_active = nullptr; // the reserve and memory updates below use the shared scheduler
 
     // Q771: the caller's taper hints are for this call only
@@ -4122,6 +4138,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
+    LLAMA_STEP_MARK("dec.bal");
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
@@ -4233,6 +4250,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         break;
     }
+    LLAMA_STEP_MARK("dec.mem");
 
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
@@ -4281,6 +4299,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (write_h_nextn && ev_h_nextn_read_recorded) {
         ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
     }
+    LLAMA_STEP_MARK("dec.out");
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -4516,6 +4535,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched_res(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched_res(), &sampling.candidates_count);
         }
+        LLAMA_STEP_MARK("ub.cp");
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
@@ -4612,6 +4632,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    LLAMA_STEP_MARK("dec.end");
 
     return 0;
 }
@@ -7124,6 +7146,10 @@ bool llama_nextn_carry_init(llama_context * ctx) {
 
 void llama_set_nextn_carry(llama_context * ctx, bool in, bool out) {
     ctx->set_nextn_carry(in, out);
+}
+
+void llama_step_trace_role(llama_context * ctx, char role) {
+    ctx->set_step_trace_role(role);
 }
 
 bool llama_head_bound_init(llama_context * ctx) {

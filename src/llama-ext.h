@@ -206,6 +206,20 @@ LLAMA_API bool llama_embd_cache_stats(const struct llama_context * ctx, uint64_t
 LLAMA_API bool llama_nextn_carry_init(struct llama_context * ctx);
 LLAMA_API void llama_set_nextn_carry (struct llama_context * ctx, bool in, bool out);
 
+// Host timestamps along the server's steps (C405), with LLAMA_STEP_TRACE=<file> set: the marks of a step (a name and
+// the steady clock's time) are kept until llama_step_trace_end writes them as one JSON line, if a context marked a stage
+// since llama_step_trace_begin. The file's header gives the steady clock's time of its 0 ms, as GGML_CUDA_PROFILE_HOST's
+// log line does for its own, so the step lines go beside that profile's per-card times. A context marks its decode's
+// stages and its waits itself as "<role>.<stage>": 'v' for a main context, 'd' for an MTP context, or what
+// llama_step_trace_role sets. With the variable unset every call returns at once and a context checks one flag.
+// Names must outlive the step (string literals). One thread marks at a time.
+LLAMA_API bool llama_step_trace_on   (void);
+LLAMA_API void llama_step_trace_begin(const char * name);                // drops what is kept, then marks name
+LLAMA_API void llama_step_trace_mark (const char * name);
+LLAMA_API void llama_step_trace_count(const char * name, int64_t value); // added up per name on the step's line
+LLAMA_API void llama_step_trace_end  (void);
+LLAMA_API void llama_step_trace_role (struct llama_context * ctx, char role);
+
 // The main model's head over the context's shortlist (llama_head_shortlist_init) with an exact bound on every other
 // logit (Q619): while it is on, a decode with one output computes the shortlist's logits and gives every other token
 // -INFINITY; llama_head_bound_ith(i) is then at least every left-out logit the full head would have computed (Cauchy-

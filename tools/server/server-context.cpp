@@ -27,7 +27,7 @@
 #include "mtmd-helper.h"
 #include "base64.hpp"
 
-#include "../../src/llama-ext.h" // staging API: llama_set_head_bound (Q619)
+#include "../../src/llama-ext.h" // staging API: llama_set_head_bound (Q619), llama_step_trace_* (C405)
 
 #include <algorithm>
 #include <cstddef>
@@ -2422,6 +2422,9 @@ private:
 
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft;
+
+                // LLAMA_STEP_TRACE (C405): the draft context's stages are "d.*" for every drafter, not only MTP's
+                llama_step_trace_role(ctx_dft, 'd');
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
@@ -5410,6 +5413,16 @@ private:
         }
 #endif
 
+        // LLAMA_STEP_TRACE (C405): host timestamps along this call, one line if it decoded (llama_step_trace_* in
+        // llama-ext.h); every call returns at once with the variable unset
+        llama_step_trace_begin("s.upd");
+        struct step_trace_scope {
+            ~step_trace_scope() {
+                llama_step_trace_mark("s.upd.end");
+                llama_step_trace_end();
+            }
+        } step_trace_guard;
+
         // checkpoint copies to the host that finished in the background take their checkpoints' place
         if (!ckpt_spills.empty()) {
             for (auto & slot : slots) {
@@ -5444,6 +5457,7 @@ private:
                 queue_tasks.post(std::move(task));
             }
         }
+        llama_step_trace_mark("s.post");
 
         // pipelined speculation: a slot that generates alone runs through the pipe slots, one sampled token per turn
         if (params_base.pipe_depth > 0) {
@@ -5477,6 +5491,7 @@ private:
             // the batch is half-built and not rendered, skip now to avoid UB
             return;
         }
+        llama_step_trace_mark("s.pre.end");
 
         // note: TTS slots bypass the shared batch entirely
         try {
@@ -5526,6 +5541,8 @@ private:
             }
         }
 
+        llama_step_trace_mark("s.slots.end");
+
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
@@ -5535,6 +5552,8 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch.render(off, n_tokens);
+                llama_step_trace_mark("s.render");
+                llama_step_trace_count("tok", n_tokens);
                 bool ok = decode(n_batch, off);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
@@ -5725,6 +5744,7 @@ private:
                 slot.truncated = true;
             }
         });
+        llama_step_trace_mark("s.shift");
 
         // start populating the batch for this iteration
         batch.clear();
@@ -5819,12 +5839,17 @@ private:
                 }
             }
         });
+        llama_step_trace_mark("s.sel");
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            llama_step_trace_mark("s.drf");
             queue_tasks.yield_to_queue([&]() {
+                llama_step_trace_mark("s.drf.in");
                 common_speculative_draft(spec.get());
+                llama_step_trace_mark("s.drf.out");
             });
+            llama_step_trace_mark("s.drf.end");
         }
 
         // make checkpoints if needed
@@ -5838,6 +5863,7 @@ private:
             }
 
             slot.stats.n_draft_tokens += draft.size();
+            llama_step_trace_count("drf", (int64_t) draft.size());
 
             // LLAMA_SPEC_DRAFT_KEEP / LLAMA_SPEC_FORCE (server_spec_verify): the draft cut, the grammar's forced tokens
             // appended; the width stays within what the target's outputs and recurrent snapshots were sized for
@@ -5887,11 +5913,14 @@ private:
                 }
             }
         });
+        llama_step_trace_mark("s.ckpt");
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
             checkpoint_gen_maybe(slot);
+            llama_step_trace_mark("s.ckgen");
             slot.handle_last_sampled_token(batch);
+            llama_step_trace_mark("s.bat");
         });
 
         // process in chunks of params.n_batch
@@ -6693,6 +6722,8 @@ private:
     bool decode(int32_t & n_batch, int32_t off) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
+        llama_step_trace_mark("s.dec");
+
         metrics_pre_decode();
 
         if (batch.size() == 0) {
@@ -6760,12 +6791,17 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        llama_step_trace_mark("s.dec.y");
         queue_tasks.yield_to_queue([&]() {
+            llama_step_trace_mark("s.dec.in");
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            llama_step_trace_mark("s.dec.ret");
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            llama_step_trace_mark("s.dec.out");
         });
+        llama_step_trace_mark("s.dec.end");
 
         if (ret != 0) {
             {
@@ -6819,6 +6855,7 @@ private:
             // success, apply batch metrics
             metrics_post_decode(off, batch.view.size(), has_output);
         }
+        llama_step_trace_mark("s.mpd");
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
@@ -6826,8 +6863,11 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                llama_step_trace_mark("s.cu.in");
                 ok = common_speculative_process(spec.get(), batch.view);
+                llama_step_trace_mark("s.cu.out");
             });
+            llama_step_trace_mark("s.cu.end");
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -6866,6 +6906,8 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off) {
+        llama_step_trace_mark("s.pd");
+
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -7002,7 +7044,9 @@ private:
 
             // verify and try to accept the draft
             {
+                llama_step_trace_mark("s.acc");
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                llama_step_trace_mark("s.acc.cl");
 
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
@@ -7029,6 +7073,8 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+                llama_step_trace_mark("s.acc.smp");
+                llama_step_trace_count("acc", (int64_t) accepted.size() - 1);
 
                 if (server_spec_dump::on() && synth_probs.empty() && !slot.spec_is_replay) {
                     spec_dump_step(slot, slot.ctx_tgt, spec_i_batch, accepted, use_rejection);
@@ -7081,6 +7127,7 @@ private:
                 }
 
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                llama_step_trace_mark("s.acc.spec");
 
                 slot.spec_draft = std::move(accepted);
             }
@@ -7124,6 +7171,7 @@ private:
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            llama_step_trace_mark("s.rm");
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -7146,9 +7194,11 @@ private:
 
                     return;
                 }
+                llama_step_trace_mark("s.tok");
             }
 
             slot.print_timings_tg();
+            llama_step_trace_mark("s.tg");
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
