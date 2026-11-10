@@ -57,6 +57,9 @@ struct llama_memory_hybrid_idx::kpool_dev_state {
     uint32_t prev_n_valid = 0;
     bool     prev_in_step = false;
 
+    // LLAMA_QSA_KPOOL_STAGE=1 (C720): the small k-pool inputs ride in the update's stage, see qwen4exp's llm_graph_input_kpool
+    bool stage_small = false;
+
     uint64_t n_ubatch  = 0;
     uint64_t n_full    = 0; // updates that rewrote every row a graph reads
     uint64_t n_rows    = 0; // rows uploaded
@@ -528,6 +531,12 @@ void llama_memory_hybrid_idx::kpool_dev_init(const llama_model & model, bool no_
     const char * env_check = getenv("LLAMA_QSA_KPOOL_DEV_CHECK");
     dv->check = env_check != nullptr && atoi(env_check) != 0;
 
+    const char * env_stage = getenv("LLAMA_QSA_KPOOL_STAGE");
+    dv->stage_small = env_stage != nullptr && atoi(env_stage) != 0;
+    if (dv->stage_small) {
+        LLAMA_LOG_INFO("%s: k_idxs, tail_idxs, new_pool_idxs, new_pool_rep and new_pool_pos go up in the k-pool tables' update\n", __func__);
+    }
+
     size_t size = 0;
     for (const auto & buf : dv->bufs) {
         size += ggml_backend_buffer_get_size(buf.get());
@@ -950,6 +959,11 @@ bool llama_memory_hybrid_idx_context::kpool_dev_check_on() const {
     return mem != nullptr && mem->kpool_dev_check_on();
 }
 
+bool llama_memory_hybrid_idx_context::kpool_stage_on() const {
+    const auto * dv = mem != nullptr ? mem->kpool_dev_get() : nullptr;
+    return dv != nullptr && dv->stage_small;
+}
+
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool_upd() const {
     return kpool_cur().n_upd_g;
 }
@@ -1087,7 +1101,8 @@ void llama_memory_hybrid_idx_context::set_input_kpool_upd(ggml_tensor * upd, con
     const uint32_t n_upd = st.n_upd;
 
     GGML_ASSERT(dv.pending && n_upd == dv.rows.size());
-    GGML_ASSERT(ggml_nelements(upd) == (int64_t) (2 + kpool)*n_g);
+    // with LLAMA_QSA_KPOOL_STAGE the small inputs follow, which the caller writes
+    GGML_ASSERT(dv.stage_small ? ggml_nelements(upd) > (int64_t) (2 + kpool)*n_g : ggml_nelements(upd) == (int64_t) (2 + kpool)*n_g);
 
     float * rows  = (float *) upd->data;
     float * cells = rows + n_g;
