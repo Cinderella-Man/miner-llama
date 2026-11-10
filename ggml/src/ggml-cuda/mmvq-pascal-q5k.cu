@@ -31,7 +31,8 @@
 //     token, padded so that the L lanes of a group read distinct banks; every lane group of a warp reads the same L
 //     records, a broadcast) and loops over row blocks (a persistent grid of about 2 blocks per SM), so the staging and
 //     its block sums serve many rows: K = 2560 at 4 tokens is 13 KB beside 34.5 KB of weight staging at R = 2 (3 warps)
-//     and 33 KB at R = 1 (6 warps). The k-column kernel stages each block's activation records again for every 64 rows, in tiles.
+//     and 33 KB at R = 1 (6 warps). The k-column kernel stages each block's activation records again for every 64
+//     rows, in tiles.
 //   - By default each warp loads its next segments into registers before it computes the current ones (11 128-bit loads
 //     per lane and row in flight during the 64 x 4 dp4a of a super-block).
 
