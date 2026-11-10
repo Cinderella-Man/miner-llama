@@ -2943,6 +2943,13 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // LLAMA_UBATCH_TRACE: the host's parts of this micro-batch until its first split leaves for a card [TAG_UBATCH_TRACE]
+    const bool    trace    = llama_ubatch_trace() > 0;
+    const int64_t t_trace0 = trace ? ggml_time_us() : 0;
+    int64_t       t_trace_build = 0;
+    int64_t       t_trace_alloc = 0;
+    const char *  trace_why     = nullptr; // why the graph was rebuilt
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -3011,6 +3018,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const bool allocated = ss ? ss->ready == res : gf_res_prev_active == res;
+    const int64_t t_trace_pre = trace ? ggml_time_us() : 0;
 
     if (!graph_reuse_disable && reuse_safe && allocated && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -3023,7 +3031,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        t_trace_build = t_trace_alloc = trace ? ggml_time_us() : 0;
     } else {
+        if (trace) {
+            // the same order as the test above: can_reuse ran only if the first three passed
+            trace_why = graph_reuse_disable ? "disabled" : !reuse_safe ? "in_flight" : !allocated ? "not_allocated" :
+                    res->reuse_reject ? res->reuse_reject : "unknown";
+            while (*trace_why >= '0' && *trace_why <= '9') {
+                trace_why++; // a type name from typeid starts with its length
+            }
+        }
+
         if (ss) {
             ss->ready = nullptr;
         } else {
@@ -3045,12 +3063,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+        t_trace_build = trace ? ggml_time_us() : 0;
 
         if (!ggml_backend_sched_alloc_graph(sched_res(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        t_trace_alloc = trace ? ggml_time_us() : 0;
 
         if (ss) {
             ss->ready = res;
@@ -3078,7 +3098,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_trace_inputs = trace ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (trace) {
+        // pre: memory, scheduler choice and graph parameters; build: the reuse check, then the graph's construction
+        // (reused: the wait for the previous evaluation); alloc: the scheduler's split and allocation with any re-plan;
+        // inputs: the inputs set; submit: every split queued and the CPU's computed; card0: from the start until the
+        // first split off the CPU was launched (-1: none)
+        const int64_t t_dev0 = ggml_backend_sched_get_trace_t_dev0(sched_res());
+        const int64_t t_end  = ggml_time_us();
+        LLAMA_LOG_WARN("ubatch-trace: %s n_tokens = %u n_seqs = %u n_outputs = %u graph = %s%s%s pre = %lld build = %lld "
+                "alloc = %lld inputs = %lld submit = %lld card0 = %lld total = %lld us\n",
+                gtype == LLM_GRAPH_TYPE_DECODER_MTP ? "mtp" : gtype == LLM_GRAPH_TYPE_ENCODER ? "enc" : "dec",
+                ubatch.n_tokens, ubatch.n_seqs, n_outputs, trace_why ? "rebuilt" : "reused", trace_why ? " why = " : "",
+                trace_why ? trace_why : "", (long long) (t_trace_pre - t_trace0), (long long) (t_trace_build - t_trace_pre),
+                (long long) (t_trace_alloc - t_trace_build), (long long) (t_trace_inputs - t_trace_alloc),
+                (long long) (t_end - t_trace_inputs), (long long) (t_dev0 ? t_dev0 - t_trace0 : -1),
+                (long long) (t_end - t_trace0));
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -4026,6 +4063,8 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    const int64_t t_trace0 = llama_ubatch_trace() > 0 ? ggml_time_us() : 0; // [TAG_UBATCH_TRACE]
+
     sched_active = nullptr; // the reserve and memory updates below use the shared scheduler
 
     // Q771: the caller's taper hints are for this call only
@@ -4191,6 +4230,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    const int64_t t_trace_init = t_trace0 ? ggml_time_us() : 0;
     while (true) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
         if (!mctx) {
@@ -4233,6 +4273,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         break;
     }
+
+    const int64_t t_trace_wait = t_trace0 ? ggml_time_us() : 0;
 
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
@@ -4280,6 +4322,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const bool write_h_nextn = cparams.embeddings_nextn_dev && h_nextn_dev != nullptr;
     if (write_h_nextn && ev_h_nextn_read_recorded) {
         ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
+    }
+
+    if (t_trace0) {
+        // the call's host parts before its first micro-batch: prep (checks, waits for pipelined steps, the batch split
+        // plan), init (the memory's slots for every micro-batch), wait (the output buffer, the other context's rows)
+        const int64_t t = ggml_time_us();
+        LLAMA_LOG_WARN("decode-trace: %s n_tokens = %u n_outputs = %u prep = %lld init = %lld wait = %lld us\n",
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "dec", n_tokens_all, n_outputs_all,
+                (long long) (t_trace_init - t_trace0), (long long) (t_trace_wait - t_trace_init), (long long) (t - t_trace_wait));
     }
 
     do {

@@ -379,6 +379,10 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
+    // With LLAMA_UBATCH_TRACE set: ggml_time_us() when the last evaluation launched its first split on a backend other
+    // than the CPU, 0 if none (or the trace is off)
+    GGML_API int64_t              ggml_backend_sched_get_trace_t_dev0(ggml_backend_sched_t sched);
+
     // The caller guarantees that the previous evaluation of this scheduler has finished on every backend before it
     // computes the next one (for example by waiting on an event recorded after the last split). The scheduler then
     // skips the host-side waits before copying split inputs, so that evaluations of several schedulers that share

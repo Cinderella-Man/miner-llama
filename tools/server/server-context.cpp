@@ -5043,25 +5043,33 @@ private:
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
 // #define DEBUG_TIMINGS
+    // LLAMA_UBATCH_TRACE=1 (C701, [TAG_UBATCH_TRACE]): the phase averages below, every 5 s; 2: also wait for the cards
+    // after each decode, so that t_decode holds their time (a #define DEBUG_TIMINGS build: always, with the wait)
+    static int debug_timings() {
 #ifdef DEBUG_TIMINGS
+        return 2;
+#else
+        static const int level = [] {
+            const char * env = getenv("LLAMA_UBATCH_TRACE");
+            return env != nullptr ? atoi(env) : 0;
+        }();
+        return level;
+#endif
+    }
     struct scoped_timer {
         int64_t & t;
         int64_t & n;
         int64_t t_start;
         scoped_timer(int64_t & t_, int64_t & n_) : t(t_), n(n_) {
-            t_start = ggml_time_us();
+            t_start = debug_timings() ? ggml_time_us() : 0;
         }
         ~scoped_timer() {
-            t += ggml_time_us() - t_start;
-            n++;
+            if (debug_timings()) {
+                t += ggml_time_us() - t_start;
+                n++;
+            }
         }
     };
-#else
-    struct scoped_timer {
-        scoped_timer(int64_t &, int64_t &) {}
-        ~scoped_timer() {}
-    };
-#endif
 
     // fill slot.inp_embd with the next rows of the audio stream
     // returns false if the slot has nothing to decode now
@@ -5397,18 +5405,21 @@ private:
     }
 
     void update_slots() {
-#ifdef DEBUG_TIMINGS
-        static int64_t t_prev = 0;
-        int64_t t_start = ggml_time_us();
-        if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
-            t_prev = t_start;
-            SRV_INF("n_pre_decode      = %" PRId64 "\n", n_pre_decode);
-            SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / n_pre_decode / 1000.0);
-            SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
-            SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
-            SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
+        if (debug_timings()) {
+            static int64_t t_prev = 0;
+            int64_t t_start = ggml_time_us();
+            if (t_start - t_prev > 5 * 1000 * 1000 && n_decode > 0) { // every 5 seconds, then from zero
+                t_prev = t_start;
+                SRV_INF("n_pre_decode      = %" PRId64 "\n", n_pre_decode);
+                SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / std::max<int64_t>(1, n_pre_decode) / 1000.0);
+                SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
+                SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / std::max<int64_t>(1, n_post_decode) / 1000.0);
+                SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / std::max<int64_t>(1, n_sampl) / 1000.0);
+                SRV_INF("n_decode = %" PRId64 " n_sampl = %" PRId64 "\n", n_decode, n_sampl);
+                t_pre_decode = t_decode = t_post_decode = t_sampl = 0;
+                n_pre_decode = n_decode = n_post_decode = n_sampl = 0;
+            }
         }
-#endif
 
         // checkpoint copies to the host that finished in the background take their checkpoints' place
         if (!ckpt_spills.empty()) {
@@ -5536,9 +5547,9 @@ private:
 
                 batch.render(off, n_tokens);
                 bool ok = decode(n_batch, off);
-#ifdef DEBUG_TIMINGS
-                llama_synchronize(ctx_tgt);
-#endif
+                if (debug_timings() > 1) {
+                    llama_synchronize(ctx_tgt);
+                }
 
                 if (ok) {
                     // move the head of the batch forward with the number of tokens we just processed

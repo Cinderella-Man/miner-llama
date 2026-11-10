@@ -9,6 +9,7 @@
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -210,6 +211,14 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, size_t m
         default:
             return gguf_data_to_str(type, gguf_get_val_data(ctx_gguf, i), 0);
     }
+}
+
+int llama_ubatch_trace() {
+    static const int level = [] {
+        const char * env = getenv("LLAMA_UBATCH_TRACE");
+        return env != nullptr ? atoi(env) : 0;
+    }();
+    return level;
 }
 
 bool llama_backend_dev_has_feature(struct ggml_backend_device * dev, const char * name) {

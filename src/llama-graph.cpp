@@ -28,6 +28,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <typeinfo>
 #include <unordered_set>
 
 // dedup helpers
@@ -1543,12 +1544,14 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     const bool kq_mask_dev = llama_kq_mask_on_device(params.hparams, params.cparams, params.ubatch) &&
         mctx->get_attn()->get_kq_cells_resident();
     res &= kq_mask_dev == (inp_attn->kq_dev.upd != nullptr);
+    bool mask_ok;
     if (inp_attn->kq_dev.upd) {
         inp_attn->kq_dev.caches[0].mctx = mctx->get_attn();
-        res &= inp_attn->kq_dev.can_reuse(params.ubatch, params.cparams);
+        mask_ok = inp_attn->kq_dev.can_reuse(params.ubatch, params.cparams);
     } else {
-        res &= can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams);
+        mask_ok = can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams);
     }
+    res &= mask_ok;
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1557,6 +1560,17 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= inp_rs->grp  == mctx->get_recr()->get_grp();
+
+    // LLAMA_UBATCH_TRACE: each check's two sides, graph / new micro-batch [TAG_UBATCH_TRACE]
+    if (!res && llama_ubatch_trace()) {
+        LLAMA_LOG_WARN("ubatch-trace: mem_hybrid rejects reuse: k_idxs %d/%u kq_dev %d/%d mask %d s_copy %d/%d "
+                "s_copy_main %d/%u head %d/%d rs_z %d/%d grp %d/%d\n",
+                (int) inp_attn->self_k_idxs->ne[0], params.ubatch.n_tokens, (int) (inp_attn->kq_dev.upd != nullptr),
+                (int) kq_mask_dev, (int) mask_ok, (int) inp_rs->s_copy->ne[0], (int) mctx->get_recr()->get_n_rs(),
+                (int) inp_rs->s_copy_main->ne[0], params.ubatch.n_seqs, (int) inp_rs->head,
+                (int) mctx->get_recr()->get_head(), (int) inp_rs->rs_z, (int) mctx->get_recr()->get_rs_z(),
+                (int) inp_rs->grp, (int) mctx->get_recr()->get_grp());
+    }
 
     return res;
 }
@@ -1862,11 +1876,14 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
+    reuse_reject = nullptr;
+
     if (!this->params.allow_reuse(params)) {
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
 
+        reuse_reject = "params";
         return false;
     }
 
@@ -1881,6 +1898,9 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
+        }
+        if (!cur && reuse_reject == nullptr) {
+            reuse_reject = typeid(*input).name();
         }
 
         res = res && cur;
