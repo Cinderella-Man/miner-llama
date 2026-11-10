@@ -157,6 +157,13 @@ struct llama_context {
     bool get_h_nextn_rows(int64_t row0, int64_t n_rows, float * out);
     bool set_h_nextn_rows(int64_t row0, int64_t n_rows, const float * data);
 
+    // two halves of the h_nextn device buffer (C703), see llama_set_embeddings_nextn_dev_halves()
+    bool    set_h_nextn_halves(int32_t n);
+    bool    hold_h_nextn();
+    int64_t get_h_nextn_row0() const { return h_nextn_dev ? h_nextn_last*h_nextn_half_rows() : 0; }
+    int64_t h_nextn_half_rows() const { return h_nextn_dev ? h_nextn_dev->ne[1]/h_nextn_halves : 0; }
+    int32_t h_nextn_half_of(int64_t row) const { return h_nextn_halves > 1 && row >= h_nextn_half_rows() ? 1 : 0; }
+
     // state rows read from the h_nextn device buffer of src, see llama_set_embd_state_src()
     bool set_state_src(llama_context * src);
     bool supports_state_row() const;
@@ -721,10 +728,17 @@ private:
     ggml_tensor *           h_nextn_dev = nullptr;
     ggml_backend_dev_t      h_nextn_dev_dev = nullptr;
     ggml_backend_t          h_nextn_backend = nullptr;
-    ggml_backend_event_ptr  ev_h_nextn_written;
-    ggml_backend_event_ptr  ev_h_nextn_read;
-    bool ev_h_nextn_written_recorded = false;
-    bool ev_h_nextn_read_recorded    = false;
+    // C703: with two halves (h_nextn_halves = 2, LLAMA_MTP_CATCHUP_OVERLAP) the buffer holds the rows above twice, a
+    // decode writes the half of the last one unless a reader holds those rows (hold_h_nextn()), then the other half;
+    // each half has its own events. One half (the default) is the buffer above, events [0]
+    int32_t                 h_nextn_halves    = 1;
+    int32_t                 h_nextn_last      = 0;     // the half the last decode wrote
+    bool                    h_nextn_held      = false; // the next decode writes the other half
+    int64_t                 h_nextn_row0      = 0;     // the first row the decode's graphs write, see build_h_nextn_dev()
+    ggml_backend_event_ptr  ev_h_nextn_written[2];
+    ggml_backend_event_ptr  ev_h_nextn_read[2];
+    bool ev_h_nextn_written_recorded[2] = { false, false };
+    bool ev_h_nextn_read_recorded[2]    = { false, false };
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
