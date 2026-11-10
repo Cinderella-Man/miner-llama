@@ -923,10 +923,18 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
 
     // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
     // the older pools come from the rows earlier ubatches wrote
-    ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
-    ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
-    pooled = ggml_reshape_3d(ctx0, pooled, n_embd_indexer, 1, n_pool);
-    cb(pooled, "indexer_pool_k", il);
+    ggml_tensor * scattered = kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep);
+    ggml_build_forward_expand(gf, scattered);
+
+    // LLAMA_QSA_INDEXER_ROWS=1: no gather, the fused indexer reads the n_pool rep rows by cell where they are
+    const bool in_place = cparams.fused_lid && kpool_cache.indexer_rows();
+
+    ggml_tensor * pooled = nullptr;
+    if (!in_place) {
+        pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
+        pooled = ggml_reshape_3d(ctx0, pooled, n_embd_indexer, 1, n_pool);
+        cb(pooled, "indexer_pool_k", il);
+    }
 
     ggml_tensor * sel_idx = nullptr;
     {
@@ -936,7 +944,9 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
 
         ggml_tensor * score = nullptr;
         if (cparams.fused_lid) {
-            score = ggml_lightning_indexer(ctx0, iq, pooled, weights, inp_kpool->pool_mask);
+            score = in_place ?
+                ggml_lightning_indexer_rows(ctx0, iq, kpool_cache.pooled_cells(scattered), weights, inp_kpool->pool_mask, inp_kpool->pool_cells) :
+                ggml_lightning_indexer(ctx0, iq, pooled, weights, inp_kpool->pool_mask);
             res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
         } else {
             ggml_tensor * q_p = ggml_permute(ctx0, iq, 0, 2, 1, 3);     // [head_dim, n_tokens, n_head]

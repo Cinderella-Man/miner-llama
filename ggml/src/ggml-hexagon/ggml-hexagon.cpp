@@ -3060,6 +3060,9 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
     bool supp = false;
     if (ggml_op_is_empty(op->op) || ggml_is_empty(op)) {
         supp = true;
+    } else if (op->op == GGML_OP_LIGHTNING_INDEXER && op->src[4] != nullptr) {
+        // no kernel reads K rows by a list (ggml_lightning_indexer_rows)
+        supp = false;
     } else {
         supp = ggml_backend_hexagon_buffer_type_get_alloc_size(&dev_ctx->buffer_type, op) <= sess->max_vmem;
         for (int i = 0; supp && i < GGML_MAX_SRC; i++) {

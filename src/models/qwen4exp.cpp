@@ -1154,10 +1154,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
     // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
     // the older pools come from the rows earlier ubatches wrote
-    ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, ks.new_pool_rep));
-    ggml_tensor * pooled = kpool_cache.gather_pooled(pool_cells);
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
-    cb(pooled, "indexer_k", il);
+    ggml_tensor * scattered = kpool_cache.scatter_pooled(pooled_new, ks.new_pool_rep);
+    ggml_build_forward_expand(gf, scattered);
+
+    // LLAMA_QSA_INDEXER_ROWS=1: no gather, the indexer reads the n_pool rep rows by cell where they are
+    const bool in_place = kpool_cache.indexer_rows();
+
+    ggml_tensor * pooled = nullptr;
+    if (!in_place) {
+        pooled = kpool_cache.gather_pooled(pool_cells);
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
+        cb(pooled, "indexer_k", il);
+    }
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
@@ -1168,7 +1176,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
     // which is the lightning indexer with every head weight set to that scale
     ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
-    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
+    ggml_tensor * score = in_place ? // [n_pool, n_tokens]
+        ggml_lightning_indexer_rows(ctx0, q, kpool_cache.pooled_cells(scattered), weights, inp_kpool->pool_mask, pool_cells) :
+        ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask);
     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
     cb(score, "indexer_score", il);
 

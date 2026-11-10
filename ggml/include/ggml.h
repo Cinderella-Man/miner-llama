@@ -2802,6 +2802,22 @@ extern "C" {
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
 
+    // the lightning indexer over the k rows that rows names, read in place: the scores of
+    // ggml_lightning_indexer(q, ggml_get_rows(k, rows), weights, mask) without the gathered copy
+    //
+    // k:       [n_embd_idx, 1,          n_rows,  ne3 ] any row strides
+    // rows:    [n_kv] !! i32 !!, each in [0, n_rows), the same for every ne3
+    // mask:    [n_kv,       n_batch,    1,       ne33] !! f16 !!
+    // res:     [n_kv,       n_batch,    1,       ne3 ]
+    //
+    GGML_API struct ggml_tensor * ggml_lightning_indexer_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * rows);
+
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
     // using a richer representation through streams.
