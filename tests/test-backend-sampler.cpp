@@ -2060,6 +2060,167 @@ static void test_multi_output_cpu_suffix(const test_params & params) {
     printf("backend multi-output CPU suffix test PASSED\n");
 }
 
+static void test_set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
+// C691: the backend samplers' top-k of all output rows in one op (LLAMA_SAMPLING_TOP_K_ROWS=1, read when a context is
+// made) against each chain's own top-k (=0): the same sampled tokens, probabilities, logits and candidates for every
+// output, bit for bit, and the same tokens from llama_sampler_sample. The chains start with a top-k behind empty
+// samplers (as the server's default chain does at the presets' settings) and end in a draw, a greedy pick, nothing (the
+// top-k's candidates and logits are the outputs) or a draw right after the top-k; one chain starts with a logit bias, so
+// the graph keeps each chain's own top-k. Two sequences with up to four outputs each, and a batch without outputs
+static void test_top_k_rows_switch(const test_params & params) {
+    const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const char * sw = "LLAMA_SAMPLING_TOP_K_ROWS";
+
+    const char * env = getenv(sw);
+    const bool        env_had   = env != nullptr;
+    const std::string env_saved = env ? env : "";
+
+    auto make_chain = [&](int kind) {
+        llama_sampler_ptr c(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        switch (kind) {
+            case 0: // the server's order at the presets' settings (penalties and top-n-sigma empty)
+                llama_sampler_chain_add(c.get(), llama_sampler_init_penalties(n_vocab, 64, 1.0f, 0.0f, 0.0f));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_top_n_sigma(-1.0f));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_top_k(20));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_typical(1.0f, 1));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_top_p(0.95f, 1));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_min_p(0.0f, 1));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_temp_ext(0.7f, 0.0f, 1.0f));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_dist(1234));
+                break;
+            case 1: // a greedy request
+                llama_sampler_chain_add(c.get(), llama_sampler_init_top_k(40));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_top_p(0.95f, 1));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_temp_ext(0.0f, 0.0f, 1.0f));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_greedy());
+                break;
+            case 2: // a top-k alone on the backend (typical-p has no backend form): the rest on the host
+                llama_sampler_chain_add(c.get(), llama_sampler_init_top_k(8));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_typical(0.9f, 1));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_dist(77));
+                break;
+            case 3: // a draw right after the top-k
+                llama_sampler_chain_add(c.get(), llama_sampler_init_top_k(20));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_dist(4321));
+                break;
+            default: { // a logit bias first
+                const llama_logit_bias bias = { llama_vocab_bos(vocab), -0.5f };
+                llama_sampler_chain_add(c.get(), llama_sampler_init_logit_bias(n_vocab, 1, &bias));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_top_k(20));
+                llama_sampler_chain_add(c.get(), llama_sampler_init_dist(99));
+            } break;
+        }
+        return c;
+    };
+
+    struct output {
+        llama_token              sampled;
+        std::vector<float>       probs;
+        std::vector<float>       logits;
+        std::vector<llama_token> candidates;
+        llama_token              token;
+    };
+
+    // per batch, per sequence in batch order: {seq, tokens, outputs at the last of them}
+    const std::vector<std::vector<std::array<int, 3>>> batches = {
+        { {0, 6, 4}, {1, 4, 2} },
+        { {0, 1, 1}, {1, 3, 3} },
+        { {0, 2, 0} },
+        { {0, 4, 4} },
+        { {1, 2, 1}, {0, 2, 2} },
+    };
+
+    auto run = [&](bool on, int kind0, int kind1) {
+        test_set_env(sw, on ? "1" : "0");
+
+        llama_sampler_ptr chain0 = make_chain(kind0);
+        llama_sampler_ptr chain1 = make_chain(kind1);
+        llama_sampler * chains[2] = { chain0.get(), chain1.get() };
+        std::vector<llama_sampler_seq_config> configs = {{ 0, chains[0] }, { 1, chains[1] }};
+        test_context test_ctx(params, configs, 2, 8, 16, 4);
+        llama_context * ctx = test_ctx.ctx.get();
+
+        std::vector<output> res;
+        int32_t pos[2] = { 0, 0 };
+        for (const auto & b : batches) {
+            common_batch batch(ctx);
+            std::vector<llama_seq_id> out_seq;
+            for (const auto & [seq, n_tokens, n_out] : b) {
+                for (int t = 0; t < n_tokens; ++t) {
+                    const bool output = t >= n_tokens - n_out;
+                    batch.add((pos[seq] * 7919 + seq * 104729 + 13) % n_vocab, pos[seq], seq, output);
+                    out_seq.push_back(output ? seq : -1);
+                    pos[seq]++;
+                }
+            }
+            GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+
+            for (int i = 0; i < batch.size(); ++i) {
+                if (out_seq[i] < 0) {
+                    continue;
+                }
+                output o;
+                o.sampled = llama_get_sampled_token_ith(ctx, i);
+                const float * probs  = llama_get_sampled_probs_ith(ctx, i);
+                const float * logits = llama_get_sampled_logits_ith(ctx, i);
+                const llama_token * cand = llama_get_sampled_candidates_ith(ctx, i);
+                if (probs) {
+                    o.probs.assign(probs, probs + llama_get_sampled_probs_count_ith(ctx, i));
+                }
+                if (logits) {
+                    o.logits.assign(logits, logits + llama_get_sampled_logits_count_ith(ctx, i));
+                }
+                if (cand) {
+                    o.candidates.assign(cand, cand + llama_get_sampled_candidates_count_ith(ctx, i));
+                }
+                o.token = llama_sampler_sample(chains[out_seq[i]], ctx, i);
+                GGML_ASSERT(o.token >= 0 && o.token < n_vocab);
+                GGML_ASSERT(!o.candidates.empty() || o.sampled != LLAMA_TOKEN_NULL);
+                res.push_back(std::move(o));
+            }
+        }
+        return res;
+    };
+
+    auto same_floats = [](const std::vector<float> & a, const std::vector<float> & b) {
+        return a.size() == b.size() && (a.empty() || memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0);
+    };
+
+    for (const auto & [kind0, kind1] : std::vector<std::pair<int, int>>{ {0, 1}, {0, 0}, {2, 3}, {3, 2}, {0, 4} }) {
+        const std::vector<output> off = run(false, kind0, kind1);
+        const std::vector<output> on  = run(true,  kind0, kind1);
+
+        GGML_ASSERT(off.size() == 17 && on.size() == off.size());
+        size_t n_cand = 0;
+        for (size_t i = 0; i < off.size(); ++i) {
+            GGML_ASSERT(off[i].sampled == on[i].sampled);
+            GGML_ASSERT(same_floats(off[i].probs,  on[i].probs));
+            GGML_ASSERT(same_floats(off[i].logits, on[i].logits));
+            GGML_ASSERT(off[i].candidates == on[i].candidates);
+            GGML_ASSERT(off[i].token == on[i].token);
+            n_cand += off[i].candidates.size();
+        }
+        printf("chains %d and %d: %zu outputs, %zu candidates, the same with the switch off and on\n",
+                kind0, kind1, off.size(), n_cand);
+    }
+
+    test_set_env(sw, env_had ? env_saved.c_str() : nullptr);
+
+    printf("backend top-k rows switch test PASSED\n");
+}
+
 struct backend_test_case {
     std::string name;
     void (*fn)(const test_params &);
@@ -2092,6 +2253,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_multi_output_dist_transaction",       test_multi_output_dist_transaction,    true },
     { "test_multi_output_sampling_chain",         test_multi_output_sampling_chain,      true },
     { "test_multi_output_cpu_suffix",             test_multi_output_cpu_suffix,          true },
+    { "test_top_k_rows_switch",                   test_top_k_rows_switch,                true },
 };
 
 // TODO: add usage, examples

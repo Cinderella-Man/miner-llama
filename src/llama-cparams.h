@@ -67,6 +67,11 @@ struct llama_cparams {
     bool     screen_head;    // screened output head: exact logits only for the candidates of the model's output_screen
     uint32_t screen_head_m;  // number of candidates; 0 = the model's output_screen.top_m
 
+    // the backend samplers' top-k over every output row at once (C691, LLAMA_SAMPLING_TOP_K_ROWS): when every chain
+    // starts with a top-k, one top-k per k and one gather of the logits replace each chain's own, and the chains read
+    // rows of the logits without the padded copy (llm_graph_context::build_sampling)
+    bool sampling_top_k_rows = false;
+
     // a draft's head over a shortlist of tokens (llama_head_shortlist_*), used while head_short_on; head_short_n is the
     // number of further ids at the last change, so that a change rebuilds the graph
     const llama_head_shortlist * head_short    = nullptr;

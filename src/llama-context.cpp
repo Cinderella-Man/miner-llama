@@ -446,6 +446,16 @@ llama_context::llama_context(
         }
     }
 
+    // C691: LLAMA_SAMPLING_TOP_K_ROWS=1 takes the backend samplers' top-k of all output rows in one op (off by default;
+    // read when the context is made)
+    {
+        const char * LLAMA_SAMPLING_TOP_K_ROWS = getenv("LLAMA_SAMPLING_TOP_K_ROWS");
+        cparams.sampling_top_k_rows = LLAMA_SAMPLING_TOP_K_ROWS ? atoi(LLAMA_SAMPLING_TOP_K_ROWS) != 0 : false;
+        if (cparams.sampling_top_k_rows) {
+            LLAMA_LOG_INFO("%s: backend sampling: one top-k over the output rows (LLAMA_SAMPLING_TOP_K_ROWS=1)\n", __func__);
+        }
+    }
+
     // card-to-card hops: LLAMA_HOP_CAST=<type> sends the residual across every boundary between two GPUs of a layer
     // split in that type: cast on the card before the boundary, back to F32 on the card after it, so the scheduler
     // copies the narrow tensor (Flash-Next, 10,240 values a token: 40,960 B in F32, 20,480 in F16 or BF16, 10,880 in
