@@ -164,6 +164,11 @@ struct server_spec_verify {
                     "%d a step), drafts cut to %d tokens, draws kept across a replay %s\n", v.block ? "on" : "off",
                     v.force ? "on" : "off", v.force_chars, v.force_max, v.keep, v.block || v.keep_draws ? "on" : "off");
         }
+        // read in common (common_sampler_sample_and_accept_n_rejection); logged here, where the others are
+        if (common_spec_reject_stop()) {
+            LOG_INF("speculative verification: token-by-token rejection stops after an accepted end of generation, as "
+                    "sample-and-match does (LLAMA_SPEC_REJECT_STOP)\n");
+        }
     }
 };
 

@@ -284,6 +284,15 @@ llama_build_and_test(test-speculative-rejection-sampling.cpp ARGS
     -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
 set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQUIRED speculative-model)
 
+# LLAMA_SPEC_REJECT_STOP (Q1187), on the same model: its default off, then on from the environment
+llama_build_and_test(test-spec-reject-stop.cpp ARGS
+    -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
+set_tests_properties(test-spec-reject-stop PROPERTIES FIXTURES_REQUIRED speculative-model)
+llama_test(test-spec-reject-stop NAME test-spec-reject-stop-env ARGS
+    -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
+set_tests_properties(test-spec-reject-stop-env PROPERTIES FIXTURES_REQUIRED speculative-model
+    ENVIRONMENT "LLAMA_SPEC_REJECT_STOP=1")
+
 # Test context state handling across all architectures, using the generated dummy models
 llama_test(
     test-llama-context
