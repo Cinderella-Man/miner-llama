@@ -14,8 +14,10 @@
 //     lanes per row (the largest power of two, at most 32, dividing the row's super-blocks), lane sl of a row's group
 //     taking super-blocks sl, sl + L, ... in that order, its 176-byte segment staged by the lane group into the warp's
 //     shared memory with 128-bit loads, and the lanes' sums added with the same xor shuffles. So every token's result is
-//     the one-token kernel's, bit for bit. A lane group owns R = 1 (default) or 2 consecutive rows, which share every
-//     load of the activations; R changes no row's sum.
+//     the one-token kernel's, bit for bit. A lane group owns R = 2 (default) or 1 consecutive rows; the rows of a group
+//     share every load of the activations, and R changes no row's sum. At R = 1 a lane issues the k-column kernel's 96
+//     shared loads of activations per super-block at 4 tokens (2 x 128 + 64 bits per sub-block and token), est. 320 of
+//     the 408 load-store clocks of a warp's iteration on a P106; R = 2 halves them per row.
 //   - Each 32-weight sub-block of a row is decoded once into eight words of 5-bit codes and multiplied with dp4a by
 //     every token's activations. The earlier multi-token kernel decodes it once per token (mul_mat_vec_q_pascal_mc).
 //   - The floating-point steps are mmvqp_dot_q5_K's: per sub-block s and token, sumd = fmaf(d8, (float) (isum * sc), sumd)
@@ -359,9 +361,9 @@ static int q5kmt_mode() {
     return mode;
 }
 
-// GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R: rows per lane group, 1 (default) or 2
+// GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R: rows per lane group, 2 (default) or 1
 static int q5kmt_r() {
-    static const int r = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R", 1) == 2 ? 2 : 1;
+    static const int r = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R", 2) == 1 ? 1 : 2;
     return r;
 }
 
