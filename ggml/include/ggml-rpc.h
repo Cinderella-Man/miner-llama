@@ -9,9 +9,9 @@ extern "C" {
 // Miner Llama (the Pascal fork) adds three ops to stock ggml: GGML_OP_GDN_CONV before GGML_OP_UNARY, GGML_OP_KQ_MASK
 // after GGML_OP_GLU and GGML_OP_MOE_TAIL after it. Every op from GGML_OP_UNARY on therefore has another number than in
 // stock llama.cpp, and a graph sent between a fork build and a stock build would run the wrong ops. The fork's major
-// version (stock 8 + 100) makes each side refuse the other at the handshake: a client accepts only a server with its own
+// version (stock 9 + 100) makes each side refuse the other at the handshake: a client accepts only a server with its own
 // major version. A fork server without GGML_OP_MOE_TAIL (patch 2) rejects that op and runs every other.
-#define RPC_PROTO_MAJOR_VERSION    108
+#define RPC_PROTO_MAJOR_VERSION    109
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    3
 

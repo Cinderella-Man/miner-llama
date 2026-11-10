@@ -122,6 +122,7 @@ struct llama_cparams {
     bool head_bound_on = false;
 
     size_t moe_cache_size;
+    float  moe_cache_cpu_share;
 
     // card-to-card hops (LLAMA_HOP_CAST, off by default): the residual crosses each marked layer boundary as hop_type,
     // cast on the card before the boundary and back to F32 on the card after it (llm_graph_context::build_hop_cast);
@@ -131,6 +132,7 @@ struct llama_cparams {
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
+    bool embeddings_nextn_dev;     // write the unmasked h_nextn rows to a device buffer instead of host, see llama_set_embeddings_nextn_dev()
 
     // staircase drafter (llama_pipe_draft_*): layer inputs the pipe evaluations copy out (kept as graph outputs), and
     // whether a micro-batch with fewer outputs than tokens also computes every position's final hidden state
@@ -145,4 +147,7 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_embd_state_src()
+    llama_context * ctx_state_src;
 };
