@@ -168,6 +168,10 @@ struct server_spec_verify {
         if (common_spec_reject_stop()) {
             LOG_INF("speculative verification: token-by-token rejection stops after an accepted end of generation, as "
                     "sample-and-match does (LLAMA_SPEC_REJECT_STOP)\n");
+            if (v.block) {
+                LOG_INF("speculative verification: block verification ends each block at its first drafted end of "
+                        "generation (LLAMA_SPEC_REJECT_STOP)\n");
+            }
         }
     }
 };

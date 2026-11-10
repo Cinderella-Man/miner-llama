@@ -1193,7 +1193,8 @@ static llama_token spec_block_draw(const std::vector<llama_token_data> & dist, d
     return dist.back().id;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
+// next = false: a block accepted whole takes no next token (a block cut at an end of generation)
+static std::vector<llama_token> spec_block_verify(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first, bool next) {
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
 
@@ -1304,6 +1305,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_
     }
 
     if (tau == g) {
+        // as sample-and-match, which samples no row after a drafted EOG
+        if (!next) {
+            return result;
+        }
         y = common_sampler_sample(gsmpl, ctx, idxs[g], grammar_first);
     }
 
@@ -1311,6 +1316,36 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_
     result.push_back(y);
 
     return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
+    GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+
+    // LLAMA_SPEC_REJECT_STOP (Q1263): the block ends at its first drafted EOG before the last drafted token. Without it
+    // the walk accepts the EOG and goes on: the rows behind it are never output, and with a grammar the row after the
+    // end fails it and is drawn again from the full vocabulary on the host. Exact: a draft that ends at its first EOG is
+    // a valid draft (its length a function of its prefix), and no token behind an EOG is output
+    size_t g = draft.size();
+    if (common_spec_reject_stop()) {
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+        for (size_t i = 0; i + 1 < draft.size(); ++i) {
+            if (llama_vocab_is_eog(vocab, draft[i])) {
+                g = i + 1;
+                break;
+            }
+        }
+    }
+
+    if (g == draft.size()) {
+        return spec_block_verify(gsmpl, ctx, idxs, draft, draft_q, grammar_first, true);
+    }
+
+    const std::vector<int> idxs_cut(idxs.begin(), idxs.begin() + g + 1);
+    const llama_tokens     draft_cut(draft.begin(), draft.begin() + g);
+    const std::vector<std::vector<llama_token_data>> draft_q_cut(draft_q.begin(), draft_q.begin() + g);
+
+    return spec_block_verify(gsmpl, ctx, idxs_cut, draft_cut, draft_q_cut, grammar_first, false);
 }
 
 void common_sampler_copy_keep_rng(const struct common_sampler * src, struct common_sampler * dst) {
