@@ -1521,6 +1521,18 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // store K and V of layer il in the cache without attention (for graphs that read no outputs; llama.cpp #31750)
+    void build_attn_kv_store(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+                    int   il) const;
+
+    // an MTP pass whose result nobody reads, so that its layer writes only its caches (cparams.mtp_kv_only, Q1105):
+    // no output row, no unmasked h_nextn rows, no embeddings, and no backend sampler that draws a random number per
+    // chain in every graph (dist), whose draws would then come out of step
+    bool kv_only_pass() const;
+
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 
     ggml_tensor * build_attn(
