@@ -427,6 +427,16 @@ llama_context::llama_context(
     cparams.moe_down_rescale_tg = !model.devices.empty() &&
         llama_backend_dev_has_feature(model.devices[0].dev, "COMPUTE_6_1");
 
+    // LLAMA_MTP_KV_ONLY=1: the draft's catch-up passes write only its layer's caches (Q1105); only the architectures
+    // whose MTP graph calls llm_graph_context::kv_only_pass() use it (qwen4exp)
+    {
+        const char * LLAMA_MTP_KV_ONLY = getenv("LLAMA_MTP_KV_ONLY");
+        cparams.mtp_kv_only = LLAMA_MTP_KV_ONLY ? atoi(LLAMA_MTP_KV_ONLY) != 0 : false;
+        if (cparams.mtp_kv_only && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            LLAMA_LOG_INFO("%s: LLAMA_MTP_KV_ONLY: a draft pass with no output row writes only its layer's caches\n", __func__);
+        }
+    }
+
     // screened output head: LLAMA_SCREEN_HEAD=1 enables it for models with an output_screen tensor,
     // LLAMA_SCREEN_HEAD_M=<M> overrides the model's number of candidates
     {

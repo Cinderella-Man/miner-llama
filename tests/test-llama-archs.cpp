@@ -178,6 +178,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
+    LOG("  --mtp-kv-only            Check that LLAMA_MTP_KV_ONLY leaves the MTP draft's caches and drafts as they are (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -866,7 +867,7 @@ static llama_model_ptr get_model(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const bool load_mtp = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -875,6 +876,8 @@ static llama_model_ptr get_model(
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
+    // llama_model_init_from_user cannot skip the nextn layers of a fixture that has them
+    model_params.load_mtp = load_mtp;
 
     tensor_data_params tensor_params = { seed, stdev };
     llama_model_ptr model(gguf_ctx != nullptr ?
@@ -1925,6 +1928,322 @@ static int test_kv_shift(const std::string & arch_filter, const size_t seed, con
     return n_failed == 0 ? 0 : 1;
 }
 
+// the archs whose MTP graph writes only its caches on a pass without outputs while LLAMA_MTP_KV_ONLY is set (Q1105)
+static bool mtp_kv_only_arch(const llm_arch arch) {
+    return arch == LLM_ARCH_QWEN4EXP;
+}
+
+// the model fixture with one nextn (MTP) block after the trunk layers
+static gguf_context_ptr get_gguf_ctx_mtp(const llm_arch arch, const bool moe) {
+    gguf_context_ptr ret = get_gguf_ctx(arch, moe);
+    const std::string key_block_count = llama_arch_kv_name(arch, LLM_KV_BLOCK_COUNT);
+    const int64_t kid = gguf_find_key(ret.get(), key_block_count.c_str());
+    GGML_ASSERT(kid >= 0);
+    const uint32_t n_layer_all = gguf_get_val_u32(ret.get(), kid) + 1;
+    gguf_set_val_u32(ret.get(), key_block_count.c_str(), n_layer_all);
+    gguf_set_val_u32(ret.get(), llama_arch_kv_name(arch, LLM_KV_NEXTN_PREDICT_LAYERS).c_str(), 1);
+    if (arch == LLM_ARCH_QWEN4EXP) {
+        // the MTP block is a QSA layer too, so that its pass writes indexer keys and pooled keys
+        const std::vector<uint32_t> ratios(n_layer_all, 4);
+        gguf_set_arr_data(ret.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_COMPRESS_RATIOS).c_str(), GGUF_TYPE_UINT32,
+                ratios.data(), ratios.size());
+    }
+    return ret;
+}
+
+struct mtp_kv_only_config {
+    const char * name;
+    ggml_type    type_kv;
+    bool         fa;
+    int          smpl; // 0: no backend sampler, 1: top-k (the draft-mtp driver's), 2: top-k and dist
+};
+
+struct mtp_kv_only_run {
+    std::vector<uint8_t>     state_prompt; // the draft's sequence state after the prompt's catch-up
+    std::vector<uint8_t>     state_end;    // and after every pass
+    std::vector<float>       out;          // each draft pass's logits (or sampled logits) and h_nextn row
+    std::vector<llama_token> cand;         // each draft pass's sampled candidates and token
+    size_t                   n_nodes_catchup = 0;
+    bool                     smpl_ok = true;
+};
+
+struct mtp_node_count {
+    bool   on = false;
+    size_t n  = 0;
+};
+
+// LLAMA_MTP_KV_ONLY for the next context, or unset with nullptr
+static void mtp_kv_only_setenv(const char * value) {
+#ifdef _WIN32
+    _putenv_s("LLAMA_MTP_KV_ONLY", value ? value : "");
+#else
+    if (value) {
+        setenv("LLAMA_MTP_KV_ONLY", value, 1);
+    } else {
+        unsetenv("LLAMA_MTP_KV_ONLY");
+    }
+#endif
+}
+
+// what the draft-mtp driver does with an MTP context: the prompt's catch-up in three batches without outputs, a step of
+// two draft passes (the second reads the first one's h), the draft region removed and the catch-up over the step's three
+// accepted tokens, then the next step's first draft pass
+static mtp_kv_only_run mtp_kv_only_sequence(
+        llama_model * model, const std::vector<llama_token> & tokens, const std::vector<float> & h,
+        const mtp_kv_only_config & cfg, const bool kv_only, const size_t seed) {
+    // read once, when the context is made
+    mtp_kv_only_setenv(kv_only ? "1" : nullptr);
+
+    mtp_node_count count;
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
+    ctx_params.n_ctx           = 0;
+    ctx_params.n_batch         = 128;
+    // micro-batches that end inside the k-pool blocks, so that blocks complete across them
+    ctx_params.n_ubatch        = 18;
+    ctx_params.n_threads       = 4;
+    ctx_params.n_threads_batch = 4;
+    ctx_params.type_k          = cfg.type_kv;
+    ctx_params.type_v          = cfg.type_kv;
+    ctx_params.flash_attn_type = cfg.fa ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    ctx_params.n_outputs_max_per_seq = 4;
+    ctx_params.cb_eval = [](struct ggml_tensor * /*t*/, bool ask, void * user_data) {
+        mtp_node_count * c = (mtp_node_count *) user_data;
+        if (ask && c->on) {
+            c->n++;
+        }
+        return false;
+    };
+    ctx_params.cb_eval_user_data = &count;
+
+    llama_context_ptr lctx(llama_init_from_model(model, ctx_params));
+    mtp_kv_only_setenv(nullptr);
+    if (!lctx) {
+        throw std::runtime_error("failed to create MTP context");
+    }
+    llama_context * ctx = lctx.get();
+    llama_set_embeddings_nextn(ctx, true, /*masked*/ true);
+
+    mtp_kv_only_run run;
+
+    llama_sampler * chain = nullptr;
+    if (cfg.smpl > 0) {
+        chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+        if (cfg.smpl > 1) {
+            llama_sampler_chain_add(chain, llama_sampler_init_dist((uint32_t) seed));
+        }
+        if (!llama_set_sampler(ctx, 0, chain)) {
+            llama_sampler_free(chain);
+            run.smpl_ok = false;
+            return run;
+        }
+    }
+
+    const size_t n_embd   = llama_model_n_embd_out(model);
+    const int    n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int    n_prompt = (int) tokens.size() - 4;
+
+    auto catchup = [&](int p0, int p1) {
+        common_batch batch(ctx);
+        for (int pos = p0; pos < p1; pos++) {
+            const int32_t idx = batch.add(tokens[pos], pos, 0, false);
+            batch.set_embd_state(idx, { h.data() + pos*n_embd, 1, n_embd });
+        }
+        count.on = true;
+        const int32_t rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        count.on = false;
+        if (rc != 0) {
+            throw std::runtime_error("failed to decode an MTP catch-up batch");
+        }
+    };
+
+    // one draft pass: returns its h_nextn row, records its outputs
+    auto draft = [&](int pos, const float * h_row) {
+        common_batch batch(ctx);
+        const int32_t idx = batch.add(tokens[pos], pos, 0, true);
+        batch.set_embd_state(idx, { h_row, 1, n_embd });
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("failed to decode an MTP draft pass");
+        }
+        if (cfg.smpl > 0) {
+            const float * logits = llama_get_sampled_logits_ith(ctx, 0);
+            const uint32_t n_logits = llama_get_sampled_logits_count_ith(ctx, 0);
+            if (logits) {
+                run.out.insert(run.out.end(), logits, logits + n_logits);
+            }
+            const llama_token * cand = llama_get_sampled_candidates_ith(ctx, 0);
+            const uint32_t n_cand = llama_get_sampled_candidates_count_ith(ctx, 0);
+            if (cand) {
+                run.cand.insert(run.cand.end(), cand, cand + n_cand);
+            }
+            run.cand.push_back(llama_get_sampled_token_ith(ctx, 0));
+        } else {
+            const float * logits = llama_get_logits_ith(ctx, 0);
+            GGML_ASSERT(logits != nullptr);
+            run.out.insert(run.out.end(), logits, logits + n_vocab);
+        }
+        const float * h_out = llama_get_embeddings_nextn_ith(ctx, 0);
+        GGML_ASSERT(h_out != nullptr);
+        run.out.insert(run.out.end(), h_out, h_out + n_embd);
+        return std::vector<float>(h_out, h_out + n_embd);
+    };
+
+    auto state = [&]() {
+        std::vector<uint8_t> s(llama_state_seq_get_size(ctx, 0));
+        llama_state_seq_get_data(ctx, s.data(), s.size(), 0);
+        return s;
+    };
+
+    const int b0 = n_prompt*3/8;
+    const int b1 = n_prompt*3/4;
+    catchup(0,  b0);
+    catchup(b0, b1);
+    catchup(b1, n_prompt);
+    run.state_prompt = state();
+
+    const std::vector<float> h1 = draft(n_prompt, h.data() + n_prompt*n_embd);
+    draft(n_prompt + 1, h1.data());
+
+    if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, n_prompt, -1)) {
+        throw std::runtime_error("failed to remove the draft region");
+    }
+    catchup(n_prompt, n_prompt + 3);
+    draft(n_prompt + 3, h.data() + (n_prompt + 3)*n_embd);
+    run.state_end = state();
+
+    run.n_nodes_catchup = count.n;
+
+    if (chain) {
+        llama_set_sampler(ctx, 0, nullptr);
+        llama_sampler_free(chain);
+    }
+    return run;
+}
+
+static int test_mtp_kv_only(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    const mtp_kv_only_config configs[] = {
+        { "f16 fa",       GGML_TYPE_F16,  true,  0 },
+        { "f16",          GGML_TYPE_F16,  false, 0 },
+        { "q8_0 fa",      GGML_TYPE_Q8_0, true,  0 },
+        { "f16 fa top-k", GGML_TYPE_F16,  true,  1 },
+        { "f16 fa dist",  GGML_TYPE_F16,  true,  2 },
+    };
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    common_log_flush(common_log_main());
+    LOG("|%10s|%13s|%12s|%12s|%12s|%12s|%s\n", "Model arch.", "Config", "KV, prompt", "Drafts", "KV, end", "Nodes off/on", "Status");
+
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !mtp_kv_only_arch(arch)) {
+            continue;
+        }
+        const bool moe = moe_mandatory(arch) || moe_implemented(arch);
+
+        gguf_context_ptr gguf_ctx = get_gguf_ctx_mtp(arch, moe);
+
+        llama_model_ptr model;
+        try {
+            model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, nullptr, /*load_mtp*/ true);
+        } catch (const std::exception & err) {
+            LOG("|%10s|%13s|%12s|%12s|%12s|%12s|\033[1;31mERROR\033[0m (model load: %s)\n",
+                    llama_arch_name(arch), "", "", "", "", "", err.what());
+            n_tests++;
+            n_failed++;
+            continue;
+        }
+
+        // 100 prompt tokens, then the 4 positions of the draft step
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const std::vector<llama_token> tokens = get_tokens(104, n_vocab, seed);
+        std::vector<float> h(llama_model_n_embd_out(model.get())*tokens.size());
+        {
+            std::mt19937 gen(seed + 1);
+            std::normal_distribution<float> dis(0.0f, 1.0f);
+            for (float & v : h) {
+                v = dis(gen);
+            }
+        }
+
+        for (const mtp_kv_only_config & cfg : configs) {
+            n_tests++;
+            LOG("|%10s|%13s|", llama_arch_name(arch), cfg.name);
+            std::string status;
+            try {
+                const mtp_kv_only_run off = mtp_kv_only_sequence(model.get(), tokens, h, cfg, false, seed);
+                const mtp_kv_only_run on  = mtp_kv_only_sequence(model.get(), tokens, h, cfg, true,  seed);
+                if (!off.smpl_ok || !on.smpl_ok) {
+                    LOG("%12s|%12s|%12s|%12s|\033[1;33mSKIP\033[0m (no backend sampler on this device)\n", "", "", "", "");
+                    n_tests--;
+                    continue;
+                }
+
+                const bool same_prompt = off.state_prompt == on.state_prompt;
+                const bool same_drafts = off.out.size() == on.out.size() && !off.out.empty() &&
+                    memcmp(off.out.data(), on.out.data(), off.out.size()*sizeof(float)) == 0 && off.cand == on.cand;
+                const bool same_end    = off.state_end == on.state_end;
+                // the dist sampler keeps the full pass, so that its draws stay in step
+                const bool nodes_ok    = cfg.smpl == 2 ? on.n_nodes_catchup == off.n_nodes_catchup
+                                                       : on.n_nodes_catchup <  off.n_nodes_catchup;
+
+                char nodes_str[32];
+                snprintf(nodes_str, sizeof(nodes_str), "%zu/%zu", off.n_nodes_catchup, on.n_nodes_catchup);
+                LOG("%12s|%12s|%12s|%12s|", same_prompt ? "identical" : "DIFFERENT", same_drafts ? "identical" : "DIFFERENT",
+                        same_end ? "identical" : "DIFFERENT", nodes_str);
+
+                if (same_prompt && same_drafts && same_end && nodes_ok) {
+                    status = "\033[1;32mOK\033[0m";
+                } else {
+                    n_failed++;
+                    status = "\033[1;31mFAIL\033[0m";
+                    if (!nodes_ok) {
+                        status += cfg.smpl == 2 ? " (the pass was cut with a dist sampler)" : " (the pass was not cut)";
+                    }
+                }
+            } catch (const std::exception & err) {
+                n_failed++;
+                status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
+            }
+            LOG("%s\n", status.c_str());
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -1939,6 +2258,7 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool kv_shift = false;
+    bool mtp_kv_only = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2008,6 +2328,8 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[i], "--kv-shift") == 0) {
             kv_shift = true;
+        } else if (strcmp(argv[i], "--mtp-kv-only") == 0) {
+            mtp_kv_only = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -2028,6 +2350,9 @@ int main(int argc, char ** argv) {
         }
         if (kv_shift) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);
+        }
+        if (mtp_kv_only) {
+            return test_mtp_kv_only(arch_filter, seed, stdev, verbosity);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {

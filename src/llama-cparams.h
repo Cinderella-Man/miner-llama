@@ -86,6 +86,12 @@ struct llama_cparams {
     bool          nextn_carry_in  = false;
     bool          nextn_carry_out = false;
 
+    // the draft's catch-up writes only its layer's caches (Q1105, LLAMA_MTP_KV_ONLY=1, off by default): an MTP pass with
+    // no output row (the catch-up over a prompt or a verify step's tokens) builds the K and V of its rows, and with QSA
+    // their indexer keys and the pooled keys of the blocks they complete, and nothing else, see
+    // llm_graph_context::kv_only_pass()
+    bool mtp_kv_only = false;
+
     // fewer routed experts on confident tokens (Q618, llama_set_moe_tail, LLAMA_MOE_TAIL): after the router's top-k a
     // slot's weight becomes 0 when the shares of the slots ranked above it already sum to moe_tail_p, or when its own
     // share is below moe_tail_w (shares: the slot's weight over the token's sum of its k weights); moe_tail_renorm
