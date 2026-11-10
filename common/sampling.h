@@ -90,7 +90,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
 // LLAMA_SPEC_REJECT_STOP=1 (Q1187): the rejection above stops where sample-and-match stops for the rows behind a
 // token: after an accepted end-of-generation token that is not the last drafted one, and where the screened head meets
-// a grammar that has become active. Off by default (upstream's path). Read once; the setter overrides it (tests)
+// a grammar that has become active. Block verification below (Q1263) ends its block at the first drafted
+// end-of-generation token that is not the last drafted one, and takes no next token when it accepts that block whole.
+// Off by default (upstream's path). Read once; the setter overrides it (tests)
 bool common_spec_reject_stop();
 void common_spec_reject_stop_set(bool on);
 
