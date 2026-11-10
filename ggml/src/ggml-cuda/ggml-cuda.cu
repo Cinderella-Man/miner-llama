@@ -3311,6 +3311,16 @@ static bool ggml_cuda_graph_debug_enabled() {
     return enabled;
 }
 
+// GGML_CUDA_GRAPHS_FORCE=1 (C702; lukolszewski/llama.cpp-multigpu c8832a5f0): a graph is captured from its first call
+// and captured again whenever its properties change, without the warm-up of two unchanged calls. Under pipeline
+// parallelism a prompt micro-batch's graph is rebuilt every micro-batch, so the warm-up never completes and a split is
+// launched kernel by kernel: the card's launch queue fills at the third queued micro-batch (R42). Captured, a split
+// reaches the card as one launch per graph chunk. Off by default
+static bool ggml_cuda_graphs_force() {
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_GRAPHS_FORCE");
+    return enabled;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -6701,7 +6711,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
-            if (!graph->warmup_complete) {
+            if (ggml_cuda_graphs_force()) {
+                // a change counts as a completed warm-up: sample mode's phase sets captured before it are stale
+                if (!graph->warmup_complete || properties_changed) {
+                    graph->warmup_complete = true;
+                    graph->capture_gen++;
+                }
+                use_cuda_graph = true;
+                cuda_graph_update_required = properties_changed || graph->instances.empty() ||
+                                             graph->profile_phases.stale(graph->capture_gen);
+            } else if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;
