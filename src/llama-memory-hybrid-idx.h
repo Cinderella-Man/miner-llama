@@ -137,6 +137,12 @@ public:
         ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
         ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
+        // every cell's pooled slot as [n_embd, 1, n_cells], the keys ggml_lightning_indexer_rows reads in place; a
+        // view of scatter_pooled's result, so that a reader of it follows the scatter in every graph order
+        ggml_tensor * pooled_cells(ggml_tensor * scattered) const;
+
+        // LLAMA_QSA_INDEXER_ROWS=1: the indexer reads each pool's key in its rep row instead of a gathered copy
+        static bool indexer_rows();
 
     private:
         friend class llama_memory_hybrid_idx_context;

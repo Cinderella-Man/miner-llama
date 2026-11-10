@@ -11245,6 +11245,123 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// GGML_OP_LIGHTNING_INDEXER over a list of K rows (ggml_lightning_indexer_rows, Q1244), as the k-pool indexer reads
+// the pooled keys in place: K is the pooled half of n_cells cache rows (raw key | pooled key), the list kv of those
+// cells in any order, some of them repeated (the padded pools all read one cell)
+// same: the output holds the scores of ggml_lightning_indexer over get_rows(K, list) too, and a case whose two parts
+// differ in any bit, on the tested backend or the reference, fails
+struct test_lightning_indexer_rows : public test_case {
+    const int64_t hsk;     // indexer K head size
+    const int64_t nh;      // num indexer heads
+    const int64_t n_cells; // cache rows
+    const int64_t kv;      // listed rows, the scores per token
+    const int64_t nb;      // batch size
+    const int64_t ns;      // num streams, one list for all
+    const ggml_type type_K;
+    const bool same;
+
+    std::string vars() override {
+        return VARS_TO_STR8(hsk, nh, n_cells, kv, nb, ns, type_K, same);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    // with same, only the output's two parts are compared
+    bool run_whole_graph() override {
+        return same;
+    }
+
+    // the harness has matched the infinities of the mask already, so the nmse is over the finite scores
+    double err(const float * a, const float * b, size_t n) override {
+        if (same) {
+            // per stream the listed rows' scores, then the gather's
+            const size_t blk = kv*nb;
+            for (const float * x : { a, b }) {
+                for (size_t s = 0; s < n/(2*blk); ++s) {
+                    if (memcmp(x + 2*s*blk, x + (2*s + 1)*blk, blk*sizeof(float)) != 0) {
+                        return INFINITY;
+                    }
+                }
+            }
+        }
+        double mse_a_b = 0.0;
+        double mse_a_0 = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (std::isfinite(a[i]) && std::isfinite(b[i])) {
+                mse_a_b += ((double) a[i] - b[i])*((double) a[i] - b[i]);
+                mse_a_0 += (double) a[i]*a[i];
+            }
+        }
+        return mse_a_0 > 0.0 ? mse_a_b/mse_a_0 : mse_a_b;
+    }
+
+    test_lightning_indexer_rows(int64_t hsk = 128, int64_t nh = 4, int64_t n_cells = 1000, int64_t kv = 250, int64_t nb = 4,
+            int64_t ns = 1, ggml_type type_K = GGML_TYPE_F16, bool same = true)
+        : hsk(hsk), nh(nh), n_cells(n_cells), kv(kv), nb(nb), ns(ns), type_K(type_K), same(same) {
+        GGML_ASSERT(!same || ns == 1);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * cache = ggml_new_tensor_4d(ctx, type_K, 2*hsk, n_cells, ns, 1);
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * k = ggml_view_4d(ctx, cache, hsk, 1, n_cells, ns,
+                cache->nb[1], cache->nb[1], cache->nb[2], ggml_row_size(type_K, hsk));
+        ggml_set_name(k, "k");
+
+        ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
+        ggml_set_name(rows, "rows");
+
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, ns);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_lightning_indexer_rows(ctx, q, k, w, m, rows);
+
+        if (same) {
+            ggml_tensor * k2 = ggml_view_2d(ctx, cache, hsk, n_cells, cache->nb[1], ggml_row_size(type_K, hsk));
+            ggml_tensor * g  = ggml_reshape_3d(ctx, ggml_get_rows(ctx, k2, rows), hsk, 1, kv);
+            out = ggml_concat(ctx, out, ggml_lightning_indexer(ctx, q, g, w, m), 2);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(std::random_device{}());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else if (strcmp(t->name, "rows") == 0) {
+                // distinct cells in a random order, every seventh entry a repeat of the last
+                std::vector<int32_t> cells(n_cells);
+                for (int64_t i = 0; i < n_cells; ++i) {
+                    cells[i] = (int32_t) i;
+                }
+                std::shuffle(cells.begin(), cells.end(), gen);
+                std::vector<int32_t> data(kv);
+                for (int64_t i = 0; i < kv; ++i) {
+                    data[i] = i % 7 == 6 ? data[i - 1] : cells[i % n_cells];
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_TOP_K_MASK
 struct test_top_k_mask : public test_case {
     const ggml_type type;
@@ -15486,6 +15603,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // the k-pool indexer reading the pooled keys in place (Q1244), against its scores over the gathered copy: one
+    // token, a verify pass, the smallest and a prompt tile of tokens
+    for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
+        for (int nh : { 4, 32, 64 }) {
+            for (int nb : { 1, 4, 8, 512 }) {
+                test_cases.emplace_back(new test_lightning_indexer_rows(128, nh, 1000, 250, nb, 1, type_K, true));
+            }
+        }
+    }
+    // lists not a multiple of a block, and longer than the cache
+    for (int kv : { 1, 7, 63, 65, 1100 }) {
+        test_cases.emplace_back(new test_lightning_indexer_rows(128, 4, 1000, kv, 4, 1, GGML_TYPE_F16, true));
+        test_cases.emplace_back(new test_lightning_indexer_rows(128, 4, 1000, kv, 9, 1, GGML_TYPE_F16, true));
+    }
+    // Flash-Next's pools at 16,384 and 49,152 tokens of a 65,536-cell cache, decode and verify
+    for (auto [n_cells, kv] : { std::pair{65536, 4096}, std::pair{65536, 12288} }) {
+        for (int nb : { 1, 4 }) {
+            test_cases.emplace_back(new test_lightning_indexer_rows(128, 4, n_cells, kv, nb, 1, GGML_TYPE_F16, true));
+        }
+    }
+    // streams, one list for all
+    test_cases.emplace_back(new test_lightning_indexer_rows(128,  4, 300, 100,  4, 2, GGML_TYPE_F16,  false));
+    test_cases.emplace_back(new test_lightning_indexer_rows(128,  4, 300, 100, 16, 2, GGML_TYPE_Q8_0, false));
+    test_cases.emplace_back(new test_lightning_indexer_rows(128, 64, 300, 100,  1, 2, GGML_TYPE_F32,  false));
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -15681,6 +15823,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Qwen3.8-Flash-Next pooled indexer prefill.
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_Q4_0));
+
+    // its pools at 49,152 tokens of a 65,536-cell F16 cache read in place (Q1244), and the indexer over their F32 copy
+    for (int nb : { 1, 4 }) {
+        test_cases.emplace_back(new test_lightning_indexer_rows(128, 4, 65536, 12288, nb, 1, GGML_TYPE_F16, false));
+        test_cases.emplace_back(new test_lightning_indexer(128, 4, 12288, nb, 1, 1, GGML_TYPE_F32));
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

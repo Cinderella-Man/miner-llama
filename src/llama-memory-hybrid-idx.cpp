@@ -595,6 +595,20 @@ ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::gather_pooled(ggml_
     return ggml_get_rows(ctx, pooled, idxs);
 }
 
+ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::pooled_cells(ggml_tensor * scattered) const {
+    GGML_ASSERT(scattered->op == GGML_OP_SET_ROWS && scattered->src[2] == pooled);
+
+    return ggml_view_3d(ctx, scattered, pooled->ne[0], 1, pooled->ne[1], pooled->nb[1], pooled->nb[1], 0);
+}
+
+bool llama_memory_hybrid_idx_context::kpool_access::indexer_rows() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_QSA_INDEXER_ROWS");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 llama_memory_hybrid_idx_context::kpool_access llama_memory_hybrid_idx_context::get_kpool_access(
         ggml_context * ctx, int32_t il, int64_t n_embd) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
