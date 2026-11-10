@@ -15074,6 +15074,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  4096, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 2051));
         }
     }
+    // union lists (GGML_CUDA_FATTN_SPARSE_PASCAL_UNION=1): Flash-Next's QSA call at 2 to 8 query tokens (4 tokens a
+    // block and list: 2 to 4 in one list, 5 to 8 in two) and 128 (32 lists) from 4,096 to 49,152 cells; two sequences
+    // (6 tokens: lists of 4 and 2 in each); head 128 with 4 query heads per KV head (8 tokens a list, 13: 8 and 5), 8 with
+    // sinks (6 a list, 7: 6 and 1), 16 (3 a list, 5: 3 and 2, lists shorter than a tile)
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int64_t kv : { 4096, 12288, 49152 }) {
+            for (int64_t nb : { 2, 3, 4, 5, 6, 7, 8, 128 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 2051));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2},  8192,  6, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 2051));
+        for (int64_t nb : { 8, 13 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, { 4, 1},  4096, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false,  333));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, { 8, 1},  4096,  7, true, true,  0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 1027));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {16, 1},  4096,  5, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false,   31));
+    }
 
     // Sparse gather: native block sizes, padded slots, and head/batch strides.
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {

@@ -128,9 +128,16 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const dim3 blocks_num((n_queries + ncols1 - 1)/ncols1, mask->ne[3], 1);
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
-    // the last group of queries is partial only if ncols1 does not divide n_queries
-    GGML_ASSERT(ncols1 == 1 || ncols1 == 8);
+    // the last group of queries is partial only if ncols1 does not divide n_queries; groups of 2 to 7 (the Pascal sparse
+    // kernel's union lists, fattn-sparse-pascal.cu) always take the bounds-checked kernel
+    GGML_ASSERT(ncols1 >= 1 && ncols1 <= 8);
     const auto kernel = ncols1 == 1       ? flash_attn_mask_to_sparse_indices<1, false> :
+                        ncols1 == 2       ? flash_attn_mask_to_sparse_indices<2, true>  :
+                        ncols1 == 3       ? flash_attn_mask_to_sparse_indices<3, true>  :
+                        ncols1 == 4       ? flash_attn_mask_to_sparse_indices<4, true>  :
+                        ncols1 == 5       ? flash_attn_mask_to_sparse_indices<5, true>  :
+                        ncols1 == 6       ? flash_attn_mask_to_sparse_indices<6, true>  :
+                        ncols1 == 7       ? flash_attn_mask_to_sparse_indices<7, true>  :
                         n_queries % 8 != 0 ? flash_attn_mask_to_sparse_indices<8, true>  :
                                              flash_attn_mask_to_sparse_indices<8, false>;
     ggml_cuda_kernel_launch(kernel, launch_params,
