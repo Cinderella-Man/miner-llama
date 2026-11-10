@@ -85,6 +85,31 @@ static __host__ __device__ __forceinline__ void fasp_split_range(const int count
     end   = begin + share < count ? begin + share : count;
 }
 
+// Which calls the switch sends here (fattn-sparse-pascal.cu reads it from the environment; bench/fattn_sparse checks it
+// on the host). A call of at most nq query tokens per sequence is decode or verify: each query token reads its own list
+// and the dense kernels read the cache once for all of them, so mode 1 takes it from min_ratio x n_kv_max cells per
+// query token. A call of more tokens is a prompt micro-batch, taken only with prompt on and up to prompt_nq tokens: the
+// dense kernels compute every cell for each query token, so mode 1 takes it once the cache holds prompt_min_ratio x
+// n_kv_max cells, whatever its size. Any other mode takes both at any cache size.
+struct fasp_rule {
+    int   mode             = 0;
+    int   nq               = 8;
+    float min_ratio        = 1.5f;
+    int   prompt           = 0;
+    int   prompt_nq        = 128;
+    float prompt_min_ratio = 1.0f;
+};
+
+static inline bool fasp_rule_takes(const fasp_rule & r, const int64_t n_q, const int64_t n_kv, const int32_t n_kv_max) {
+    if (n_q <= r.nq) {
+        return r.mode != 1 || !((double) n_kv < r.min_ratio*n_kv_max*n_q);
+    }
+    if (r.prompt == 0 || n_q > r.prompt_nq) {
+        return false;
+    }
+    return r.mode != 1 || !((double) n_kv < r.prompt_min_ratio*n_kv_max);
+}
+
 // Splits per list: about 4 blocks per SM in all, at least 64 entries a split.
 static __host__ __device__ __forceinline__ int fasp_pick_splits(const int n_kv_max, const int n_cols, const int nsm) {
     const int target = 4*nsm;

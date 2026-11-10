@@ -15056,6 +15056,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {16, 1},  4096,  1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false,   31));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  4096,  2, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false,   32));
     }
+    // prompt micro-batches through it (GGML_CUDA_FATTN_SPARSE_PASCAL_PROMPT=1): Flash-Next's QSA call at 9 to 128 query
+    // tokens from 1.5 to 16 times the kept cells (_PROMPT_MIN_RATIO 1.0 takes every one, 2.5 only 8k and 32k), two
+    // sequences, head 128 with sinks; 129 tokens (one over the default _PROMPT_NQ), 256 and 512 (2 KV heads x 512 fill
+    // the kernel's 1,024 columns)
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int64_t nb : { 9, 16, 64, 128 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  8192, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 2051));
+        }
+        for (int64_t nb : { 9, 128 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  3072, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 2051));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 128, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 2051));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2},  4096,  64, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 2051));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, { 8, 1},  4096,  32, true, true,  0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 1027));
+        for (int64_t nb : { 129, 256, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  4096, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 2051));
+        }
+    }
 
     // Sparse gather: native block sizes, padded slots, and head/batch strides.
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
