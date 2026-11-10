@@ -7074,7 +7074,6 @@ private:
 
                 GGML_ASSERT(accepted.size() >= 1);
                 llama_step_trace_mark("s.acc.smp");
-                llama_step_trace_count("acc", (int64_t) accepted.size() - 1);
 
                 if (server_spec_dump::on() && synth_probs.empty() && !slot.spec_is_replay) {
                     spec_dump_step(slot, slot.ctx_tgt, spec_i_batch, accepted, use_rejection);
@@ -7144,6 +7143,7 @@ private:
 
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
+            llama_step_trace_count("acc", (int64_t) n_accepted);
             slot.stats.n_draft_verif_steps += 1;
 
             if (slot.spec_adapt_step.pending) {

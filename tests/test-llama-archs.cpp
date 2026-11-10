@@ -175,6 +175,7 @@ static void usage(char ** argv) {
     LOG("  -s, --seed <seed>        Set the random seed for tensor initialization and token generation\n");
     LOG("  -d, --stdev <stdev>      Set the standard deviation of the tensor initialization distribution (default: 0.1f)\n");
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
+    LOG("  --mtp                    With -o: save qwen4exp's MoE model with one MTP block as <dir>/qwen4exp-moe-mtp.gguf\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
@@ -866,7 +867,7 @@ static llama_model_ptr get_model(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const bool load_mtp = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -875,6 +876,8 @@ static llama_model_ptr get_model(
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
+    // llama_model_init_from_user cannot skip the nextn layers of a fixture that has them
+    model_params.load_mtp = load_mtp;
 
     tensor_data_params tensor_params = { seed, stdev };
     llama_model_ptr model(gguf_ctx != nullptr ?
@@ -1257,7 +1260,27 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
-static int save_models(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const std::string & dir) {
+// --mtp: the model fixture with one nextn (MTP) block after the trunk layers, so that llama-server's draft-mtp runs on
+// a saved model (C405's CPU check of LLAMA_STEP_TRACE)
+static gguf_context_ptr get_gguf_ctx_nextn(const llm_arch arch, const bool moe) {
+    gguf_context_ptr ret = get_gguf_ctx(arch, moe);
+    const std::string key_block_count = llama_arch_kv_name(arch, LLM_KV_BLOCK_COUNT);
+    const int64_t kid = gguf_find_key(ret.get(), key_block_count.c_str());
+    GGML_ASSERT(kid >= 0);
+    const uint32_t n_layer_all = gguf_get_val_u32(ret.get(), kid) + 1;
+    gguf_set_val_u32(ret.get(), key_block_count.c_str(), n_layer_all);
+    gguf_set_val_u32(ret.get(), llama_arch_kv_name(arch, LLM_KV_NEXTN_PREDICT_LAYERS).c_str(), 1);
+    if (arch == LLM_ARCH_QWEN4EXP) {
+        // the loader requires one compress ratio per layer, the MTP block's included
+        const std::vector<uint32_t> ratios(n_layer_all, 4);
+        gguf_set_arr_data(ret.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_COMPRESS_RATIOS).c_str(), GGUF_TYPE_UINT32,
+                ratios.data(), ratios.size());
+    }
+    return ret;
+}
+
+static int save_models(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const std::string & dir,
+        const bool mtp = false) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -1301,9 +1324,12 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
                 LOG_INF("%s: %s model (%s) is unsupported, skipping\n", __func__, llama_arch_name(arch), moe ? "MoE" : "dense");
                 continue;
             }
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
-            llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
-            const std::string path = dir + "/" + llama_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
+            if (mtp && (arch != LLM_ARCH_QWEN4EXP || !moe)) {
+                continue;
+            }
+            gguf_context_ptr gguf_ctx = mtp ? get_gguf_ctx_nextn(arch, moe) : get_gguf_ctx(arch, moe);
+            llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, nullptr, mtp);
+            const std::string path = dir + "/" + llama_arch_name(arch) + (moe ? "-moe" : "-dense") + (mtp ? "-mtp.gguf" : ".gguf");
             LOG_INF("%s: '%s %s' -> %s ...", __func__, llama_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
             llama_model_save_to_file(model.get(), path.c_str());
             const std::uintmax_t size = std::filesystem::file_size(path);
@@ -1939,6 +1965,7 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool kv_shift = false;
+    bool save_mtp = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2008,6 +2035,8 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[i], "--kv-shift") == 0) {
             kv_shift = true;
+        } else if (strcmp(argv[i], "--mtp") == 0) {
+            save_mtp = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -2024,7 +2053,7 @@ int main(int argc, char ** argv) {
 
     try {
         if (!out.empty()) {
-            return save_models(arch_filter, seed, stdev, verbosity, out);
+            return save_models(arch_filter, seed, stdev, verbosity, out, save_mtp);
         }
         if (kv_shift) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);
