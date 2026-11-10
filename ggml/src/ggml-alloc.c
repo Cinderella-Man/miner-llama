@@ -822,6 +822,26 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
+// LLAMA_UBATCH_TRACE (C701): why a graph needs a new plan, and which compute buffers grow [TAG_UBATCH_TRACE]
+static bool ggml_gallocr_trace(void) {
+    static int trace = -1;
+    if (trace < 0) {
+        const char * env = getenv("LLAMA_UBATCH_TRACE");
+        trace = env != NULL && atoi(env) != 0;
+    }
+    return trace != 0;
+}
+
+// a tensor larger than its place in the plan: kind, index, its name (and its reader's, for a source), shape and sizes
+static void ggml_gallocr_trace_tensor(ggml_gallocr_t galloc, const char * kind, int i, const struct ggml_tensor * reader,
+        const struct ggml_tensor * t, const struct tensor_alloc * talloc) {
+    GGML_LOG_WARN("galloc-trigger: %s %d '%s'%s%s%s (%s) ne = [%lld, %lld, %lld, %lld] needs %zu bytes in %s, planned %zu\n",
+            kind, i, t->name, reader ? " of '" : "", reader ? reader->name : "", reader ? "'" : "", ggml_op_desc(t),
+            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+            ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], t),
+            ggml_backend_buft_name(galloc->bufts[talloc->buffer_id]), talloc->size_max);
+}
+
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
@@ -1009,26 +1029,6 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
         node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node);
     }
     return talloc->size_max >= node_size;
-}
-
-// LLAMA_UBATCH_TRACE (C701): why a graph needs a new plan, and which compute buffers grow [TAG_UBATCH_TRACE]
-static bool ggml_gallocr_trace(void) {
-    static int trace = -1;
-    if (trace < 0) {
-        const char * env = getenv("LLAMA_UBATCH_TRACE");
-        trace = env != NULL && atoi(env) != 0;
-    }
-    return trace != 0;
-}
-
-// a tensor larger than its place in the plan: kind, index, its name (and its reader's, for a source), shape and sizes
-static void ggml_gallocr_trace_tensor(ggml_gallocr_t galloc, const char * kind, int i, const struct ggml_tensor * reader,
-        const struct ggml_tensor * t, const struct tensor_alloc * talloc) {
-    GGML_LOG_WARN("galloc-trigger: %s %d '%s'%s%s%s (%s) ne = [%lld, %lld, %lld, %lld] needs %zu bytes in %s, planned %zu\n",
-            kind, i, t->name, reader ? " of '" : "", reader ? reader->name : "", reader ? "'" : "", ggml_op_desc(t),
-            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
-            ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], t),
-            ggml_backend_buft_name(galloc->bufts[talloc->buffer_id]), talloc->size_max);
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
