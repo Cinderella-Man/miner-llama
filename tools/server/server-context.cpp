@@ -2169,8 +2169,6 @@ private:
     int     ckpt_incall_slot = -1;
     std::vector<ckpt_incall_job> ckpt_incall;
     std::vector<int32_t>         incall_cuts;
-    // by slot id: the draft context's part of a checkpoint, the same bytes wherever it is taken
-    std::vector<std::vector<uint8_t>> ckpt_dft_blob;
 
     // Q771: the target context's micro-batch taper: the server's (--ubatch-taper, else LLAMA_UBATCH_TAPER) and the one
     // set now (a request's "ubatch_taper" sets it for the batches of its prompt)
@@ -2800,8 +2798,7 @@ private:
                     ckpt_vram_n, params_base.checkpoint_vram_sync ? "at once" : "in the background");
         }
         // C217: checkpoints inside a prompt's calls go into device stores, need a model without sliding-window layers
-        // (whose checkpoints hold a ring of cells), a speculative decoder that follows the calls' cuts, and a draft whose
-        // part of a checkpoint is its header alone (attention only: the partial state leaves its cache out)
+        // (whose checkpoints hold a ring of cells), and a speculative decoder whose pass over a call follows its cuts
         ckpt_incall_on = false;
         if (params_base.checkpoint_incall) {
             const char * why = nullptr;
@@ -2811,16 +2808,6 @@ private:
                 why = "not with sliding-window layers";
             } else if (!common_speculative_incall_ok(spec.get())) {
                 why = "not with this speculative decoding";
-            } else if (ctx_dft != nullptr) {
-                ckpt_dft_blob.assign(params_base.n_parallel, {});
-                for (int i = 0; i < params_base.n_parallel && why == nullptr; ++i) {
-                    auto & blob = ckpt_dft_blob[i];
-                    blob.resize(llama_state_seq_get_size_ext(ctx_dft, i, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
-                    if (blob.size() != sizeof(uint32_t) + sizeof(llama_seq_id) ||
-                        llama_state_seq_get_data_ext(ctx_dft, blob.data(), blob.size(), i, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != blob.size()) {
-                        why = "the draft's part of a checkpoint depends on where it is taken";
-                    }
-                }
             }
             if (why != nullptr) {
                 SRV_WRN("--ctx-checkpoints-incall: %s - off\n", why);
@@ -4267,7 +4254,8 @@ private:
     }
 
     // before the decode call of the batch rows [off, off + n): its fills inside the call and its micro-batch cuts, as rows
-    // of the call (cuts)
+    // of the call (cuts). The draft context gets the same fills for its part of each checkpoint (under the checkpoint's
+    // store id in that context), taken in its pass over the call
     void ckpt_incall_begin(int32_t off, int32_t n, std::vector<uint32_t> & cuts) {
         for (const int32_t b : incall_cuts) {
             if (b > off && b < off + n) {
@@ -4284,6 +4272,9 @@ private:
                 continue;
             }
             llama_state_seq_store_at(ctx_tgt, slot->id, ic.ck->store, (uint32_t) (ic.i_batch - off), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (ctx_dft != nullptr) {
+                llama_state_seq_store_at(ctx_dft, slot->id, ic.ck->store, (uint32_t) (ic.i_batch - off), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
         }
         llama_set_ubatch_cuts(ctx_tgt, cuts.data(), cuts.size());
     }
@@ -4312,14 +4303,26 @@ private:
             return;
         }
 
+        // the draft's part as update_dft takes it: its fill in the draft's pass, in the host format
+        if (ctx_dft != nullptr) {
+            std::vector<uint8_t> blob(llama_state_seq_store_at_get(ctx_dft, nullptr, 0, slot.id, cur.store, nullptr, nullptr));
+            const size_t n_host = blob.empty() ? 0 : llama_state_seq_store_get_size_host(ctx_dft, slot.id, cur.store);
+            cur.data_dft.resize(n_host);
+            if (n_host == 0 ||
+                llama_state_seq_store_at_get(ctx_dft, blob.data(), blob.size(), slot.id, cur.store, nullptr, nullptr) != blob.size() ||
+                llama_state_seq_store_get_data_host(ctx_dft, blob.data(), blob.size(), cur.data_dft.data(), n_host, slot.id, cur.store) != n_host) {
+                SLT_WRN(slot, "the draft's part of the context checkpoint at n_tokens = %" PRId64 " was not taken inside the call - erased, and checkpoints cut the calls again from now on\n",
+                        cur.n_tokens);
+                slot.prompt.checkpoints.remove(ic.ck);
+                ckpt_incall_on = false;
+                return;
+            }
+        }
+
         cur.data_tgt.resize(n);
         llama_state_seq_store_at_get(ctx_tgt, cur.data_tgt.data(), n, slot.id, cur.store, nullptr, nullptr);
         cur.update_pos(cur.n_tokens, pos_min, pos_max);
         cur.size_dev = llama_state_seq_store_get_size_host(ctx_tgt, slot.id, cur.store) - n;
-
-        if (ctx_dft != nullptr && slot.id >= 0 && slot.id < (int) ckpt_dft_blob.size()) {
-            cur.data_dft.assign(ckpt_dft_blob[slot.id].begin(), ckpt_dft_blob[slot.id].end());
-        }
         // the draft's speculative state at the checkpoint, as the call that ended there would leave it
         common_speculative_get_state_at(spec.get(), slot.id, ic.i_batch - off, cur.data_spec);
 
