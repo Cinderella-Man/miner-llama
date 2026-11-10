@@ -4127,7 +4127,12 @@ void llm_graph_context::build_attn_kv_store(
 // for the chains without a row
 static bool llm_graph_sampler_draws(llama_sampler * smpl) {
     if (llama_sampler_chain_get(smpl, -1) == nullptr) {
-        return strcmp(llama_sampler_name(smpl), "dist") == 0;
+        // a backend sampler's name carries a + once it runs on the backend, a - when it cannot
+        const char * name = llama_sampler_name(smpl);
+        if (name[0] == '+' || name[0] == '-') {
+            name++;
+        }
+        return strcmp(name, "dist") == 0;
     }
     for (int i = 0; i < llama_sampler_chain_n(smpl); ++i) {
         if (llm_graph_sampler_draws(llama_sampler_chain_get(smpl, i))) {
