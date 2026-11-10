@@ -198,9 +198,12 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
     }
 
     // KV-shared layers do not write to the KV cache, so prune non-output token rows before the first KV-shared layer
+    // (not with the masks built on the device, LLAMA_GPU_KQ_MASK: the host masks pruned below are then empty, and the
+    // per-layer device masks hold a row for every token of the batch)
     bool prune_shared = crop_before_nextn(inp_out_ids) &&
                         hparams.n_layer_kv_from_start > 0 && hparams.n_layer_kv_from_start < n_layer &&
-                        !cparams.embeddings && cparams.n_seq_max == 1;
+                        !cparams.embeddings && cparams.n_seq_max == 1 &&
+                        inp_attn->kq_dev.upd == nullptr;
     for (int il = (int) hparams.n_layer_kv_from_start; prune_shared && il <= n_layer; ++il) {
         prune_shared = !cparams.embeddings_layer_inp[il];
     }
