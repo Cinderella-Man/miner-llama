@@ -4317,7 +4317,7 @@ private:
         cur.update_pos(cur.n_tokens, pos_min, pos_max);
         cur.size_dev = llama_state_seq_store_get_size_host(ctx_tgt, slot.id, cur.store) - n;
 
-        if (ctx_dft != nullptr) {
+        if (ctx_dft != nullptr && slot.id >= 0 && slot.id < (int) ckpt_dft_blob.size()) {
             cur.data_dft.assign(ckpt_dft_blob[slot.id].begin(), ckpt_dft_blob[slot.id].end());
         }
         // the draft's speculative state at the checkpoint, as the call that ended there would leave it
