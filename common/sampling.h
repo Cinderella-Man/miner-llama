@@ -88,6 +88,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // as above, but verifies by rejection sampling; draft_q holds the draft's candidates per token
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
 
+// LLAMA_SPEC_REJECT_STOP=1 (Q1187): the rejection above stops where sample-and-match stops for the rows behind a
+// token: after an accepted end-of-generation token that is not the last drafted one, and where the screened head meets
+// a grammar that has become active. Off by default (upstream's path). Read once; the setter overrides it (tests)
+bool common_spec_reject_stop();
+void common_spec_reject_stop_set(bool on);
+
 // as above, but verifies the drafted block jointly: block verification (Sun et al., "Block Verification Accelerates
 // Speculative Decoding", arXiv:2403.10444, Algorithm 2). Exact in distribution like token-by-token rejection, and its
 // expected accepted length is never shorter. draft_q holds the draft's candidates per token, as for the rejection
