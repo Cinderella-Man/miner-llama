@@ -2529,8 +2529,18 @@ static int test_mtp_catchup_overlap(const std::string & arch_filter, const size_
             LOG("|%10s|%15s|", llama_arch_name(arch), cfg.name);
             std::string status;
             try {
-                const mtp_overlap_run off = mtp_overlap_sequence(model.get(), tokens, cfg, false);
-                const mtp_overlap_run on  = mtp_overlap_sequence(model.get(), tokens, cfg, true);
+                // the driver's own log lines stay out of the table
+                struct log_pause {
+                    log_pause()  { common_log_pause(common_log_main()); }
+                    ~log_pause() { common_log_resume(common_log_main()); }
+                };
+                mtp_overlap_run off;
+                mtp_overlap_run on;
+                {
+                    log_pause pause;
+                    off = mtp_overlap_sequence(model.get(), tokens, cfg, false);
+                    on  = mtp_overlap_sequence(model.get(), tokens, cfg, true);
+                }
 
                 auto same = [](const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) {
                     return !a.empty() && a == b;
