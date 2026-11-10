@@ -30,8 +30,8 @@
 //   - Each block stages all tokens' activations once into shared memory (the int8 words and (d8, S) per sub-block and
 //     token, padded so that the L lanes of a group read distinct banks; every lane group of a warp reads the same L
 //     records, a broadcast) and loops over row blocks (a persistent grid of about 2 blocks per SM), so the staging and
-//     its block sums serve many rows: K = 2560 at 4 tokens is 13 KB beside 33 KB of weight staging (6 warps at R = 1,
-//     3 at R = 2). The k-column kernel stages each block's activation records again for every 64 rows, in tiles.
+//     its block sums serve many rows: K = 2560 at 4 tokens is 13 KB beside 34.5 KB of weight staging at R = 2 (3 warps)
+//     and 33 KB at R = 1 (6 warps). The k-column kernel stages each block's activation records again for every 64 rows, in tiles.
 //   - By default each warp loads its next segments into registers before it computes the current ones (11 128-bit loads
 //     per lane and row in flight during the 64 x 4 dp4a of a super-block).
 
@@ -39,7 +39,6 @@
 #define Q5KMT_MAX_COLS 4
 #define Q5KMT_SB       176                  // bytes of a super-block (block_q5_K)
 #define Q5KMT_NU       (Q5KMT_SB / 16)      // its 16-byte units
-#define Q5KMT_STAGE    (WARP_SIZE * Q5KMT_SB) // a warp's staging buffer per row of its lane groups
 #define Q5KMT_SMEM_MAX (48 * 1024)
 
 static_assert(sizeof(block_q5_K) == Q5KMT_SB, "block_q5_K is 176 bytes");
@@ -60,6 +59,8 @@ struct q5kmt_args {
     int          stride_col_dst;
     int          ds_off;        // words from the start of shared memory to the (d8, S) region
     int          stage_off;     // bytes from the start of shared memory to the warps' staging buffers
+    int          wstage;        // bytes of a warp's staging buffer
+    int          gstride;       // bytes between two lane groups' segments in it (q5kmt_gstride)
 };
 
 // Words per super-block position of the staged activations: NT tokens x 8 sub-blocks of 8 int8 words, and of (d8, S),
@@ -215,7 +216,7 @@ static __global__ void mul_mat_vec_q5_K_pascal_mt(const q5kmt_args p) {
     const int gpw      = WARP_SIZE >> lpr_log2;      // lane groups per warp
     const int seg      = Q5KMT_SB << lpr_log2;       // bytes of a row's segment per iteration
     // the lane group's R row segments in the warp's staging buffer, and this lane's super-block in each
-    char * smw = (char *) q5kmt_sm + p.stage_off + wid * R * Q5KMT_STAGE + grp * R * seg;
+    char * smw = (char *) q5kmt_sm + p.stage_off + wid * p.wstage + grp * p.gstride;
     const char * sws[R];
 #pragma unroll
     for (int i = 0; i < R; ++i) {
@@ -367,6 +368,28 @@ static int q5kmt_r() {
     return r;
 }
 
+// log2 of the lanes per row: the largest power of two, at most 32, that divides the row's super-blocks (as
+// ggml_cuda_mmvq_pascal chooses it for Q5_K)
+static int q5kmt_lpr_log2(const int nsb) {
+    int lpr_log2 = 0;
+    while (lpr_log2 < 5 && nsb % (2 << lpr_log2) == 0) {
+        lpr_log2++;
+    }
+    return lpr_log2;
+}
+
+// Bytes between two lane groups' row segments in a warp's staging buffer: R segments of 176 L bytes, at R = 2 with
+// 16 ((5 L) mod 8) bytes of padding, so that the 8 lanes of a quarter warp start in distinct 4-bank groups for every L
+// (at R = 1 the segments alone do that, as in the one-token kernel; unpadded, R = 2 puts lane groups g and g + 2 of
+// L = 2 on the same banks).
+static int q5kmt_gstride(const int r, const int lpr_log2) {
+    return r * (Q5KMT_SB << lpr_log2) + (r == 2 ? 16 * ((5 << lpr_log2) & 7) : 0);
+}
+
+static int q5kmt_wstage(const int r, const int lpr_log2) {
+    return (WARP_SIZE >> lpr_log2) * q5kmt_gstride(r, lpr_log2);
+}
+
 // The warps per block for nt tokens and nsb super-blocks per row: GGML_CUDA_MMVQ_PASCAL_Q5K_MT_NW (default and at most
 // 6 at R = 1, 3 at R = 2), fewer where the shared memory would pass 48 KB; 0 if not even one warp fits.
 static int q5kmt_nw(const int nt, const int nsb) {
@@ -374,18 +397,11 @@ static int q5kmt_nw(const int nt, const int nsb) {
     const int r   = q5kmt_r();
     int       nw  = std::min(std::max(nw_env, 1), Q5KMT_NW_MAX / r);
     const int act = q5kmt_act_bytes(nt, nsb);
-    while (nw > 0 && act + nw * r * Q5KMT_STAGE > Q5KMT_SMEM_MAX) {
+    const int ws  = q5kmt_wstage(r, q5kmt_lpr_log2(nsb));
+    while (nw > 0 && act + nw * ws > Q5KMT_SMEM_MAX) {
         nw--;
     }
     return nw;
-}
-
-static int q5kmt_lpr_log2(const int nsb) {
-    int lpr_log2 = 0;
-    while (lpr_log2 < 5 && nsb % (2 << lpr_log2) == 0) {
-        lpr_log2++;
-    }
-    return lpr_log2;
 }
 
 template <int NT, int R>
@@ -449,7 +465,9 @@ bool ggml_cuda_mmvq_pascal_q5k_mt(const void * vx, const void * vy, float * dst,
     p.ds_off         = nsb * (64 * nt + 4);
     const int act    = q5kmt_act_bytes(nt, nsb);
     p.stage_off      = act;
-    const int smem   = act + nw * r * Q5KMT_STAGE;
+    p.wstage         = q5kmt_wstage(r, p.lpr_log2);
+    p.gstride        = q5kmt_gstride(r, p.lpr_log2);
+    const int smem   = act + nw * p.wstage;
 
     // a persistent grid: as many blocks as the SMs hold at once by shared memory and threads (the launch bounds keep the
     // registers for 2 blocks of the most warps), at most one per nw warp row blocks
