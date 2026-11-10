@@ -867,10 +867,27 @@ struct case_store_at : ctx_test {
             CTX_REQUIRE(get_seq_state(ctx_ref.get(), 0, flags, host_end), tag + "reference save failed");
             CTX_REQUIRE(get_current_logits(ctx_ref.get(), logits_end), tag + "reference logits missing");
 
-            const auto same_end = [&](llama_context * ctx, std::vector<uint8_t> & state, std::vector<float> & logits) {
+            // the reference again from its state at the first cut, restored from the host as the server restores a
+            // checkpoint (the cells after a restore can sit elsewhere than in the unbroken run, so a restore is compared
+            // with a restore)
+            std::vector<uint8_t> host_rst;
+            std::vector<float>   logits_rst;
+            CTX_REQUIRE(set_seq_state(ctx_ref.get(), 0, flags, host[0]) && llama_memory_seq_rm(llama_get_memory(ctx_ref.get()), 0, cuts[0], -1),
+                        tag + "the reference's restore failed");
+            CTX_REQUIRE(decode_seq(ctx_ref.get(), tokens, cuts[0], cuts[1], 0, false) && decode_seq(ctx_ref.get(), tokens, cuts[1], n_prompt, 0, true),
+                        tag + "the reference's decode after its restore failed");
+            CTX_REQUIRE(get_seq_state(ctx_ref.get(), 0, flags, host_rst) && get_current_logits(ctx_ref.get(), logits_rst),
+                        tag + "the reference's state after its restore was not read");
+
+            const auto same_as = [&](llama_context * ctx, const std::vector<uint8_t> & want_state, const std::vector<float> & want_logits) {
+                std::vector<uint8_t> state;
+                std::vector<float>   logits;
                 return get_seq_state(ctx, 0, flags, state) && get_current_logits(ctx, logits) &&
-                    state == host_end && logits.size() == logits_end.size() &&
-                    memcmp(logits.data(), logits_end.data(), logits.size()*sizeof(float)) == 0;
+                    state == want_state && logits.size() == want_logits.size() &&
+                    memcmp(logits.data(), want_logits.data(), logits.size()*sizeof(float)) == 0;
+            };
+            const auto same_end = [&](llama_context * ctx) {
+                return same_as(ctx, host_end, logits_end);
             };
 
             // one call with a store fill at each cut
@@ -880,9 +897,7 @@ struct case_store_at : ctx_test {
             }
             CTX_REQUIRE(decode_seq(lctx, tokens, 0, n_prompt, 0, true), tag + "the call with fills failed");
 
-            std::vector<uint8_t> state;
-            std::vector<float>   logits;
-            CTX_REQUIRE(same_end(lctx, state, logits), tag + "the call with fills ends in another state or other logits than the cut calls");
+            CTX_REQUIRE(same_end(lctx), tag + "the call with fills ends in another state or other logits than the cut calls");
 
             std::vector<std::vector<uint8_t>> blobs(cuts.size());
             for (size_t k = 0; k < cuts.size(); ++k) {
@@ -908,7 +923,7 @@ struct case_store_at : ctx_test {
                         llama_memory_seq_rm(llama_get_memory(lctx), 0, cuts[0], -1), tag + "the restore of the first fill failed");
             CTX_REQUIRE(decode_seq(lctx, tokens, cuts[0], cuts[1], 0, false) && decode_seq(lctx, tokens, cuts[1], n_prompt, 0, true),
                         tag + "the decode after the restore failed");
-            CTX_REQUIRE(same_end(lctx, state, logits), tag + "the restored fill does not continue as the cut calls");
+            CTX_REQUIRE(same_as(lctx, host_rst, logits_rst), tag + "the restored fill does not continue as the reference's restored state");
 
             // a request the next call cannot take leaves no result, and nothing is left for the call after
             CTX_REQUIRE(llama_state_seq_store_at_get(lctx, nullptr, 0, 0, 0, nullptr, nullptr) == 0, tag + "a fill result outlived its call");
@@ -918,11 +933,11 @@ struct case_store_at : ctx_test {
             llama_set_ubatch_cuts(ctx_cut.get(), ucuts, 2);
             CTX_REQUIRE(decode_seq(ctx_cut.get(), tokens, 0, n_prompt, 0, true), tag + "the cut call failed");
             llama_set_ubatch_cuts(ctx_cut.get(), nullptr, 0);
-            CTX_REQUIRE(same_end(ctx_cut.get(), state, logits), tag + "the call with cuts ends in another state than the cut calls");
+            CTX_REQUIRE(same_end(ctx_cut.get()), tag + "the call with cuts ends in another state than the cut calls");
 
             // the control: one call without cuts takes other micro-batches (reported, not required)
             CTX_REQUIRE(decode_seq(ctx_one.get(), tokens, 0, n_prompt, 0, true), tag + "the control call failed");
-            report += " " + tag + (same_end(ctx_one.get(), state, logits) ? "an uncut call ends the same;" : "an uncut call ends elsewhere;");
+            report += " " + tag + (same_end(ctx_one.get()) ? "an uncut call ends the same;" : "an uncut call ends elsewhere;");
         }
 
         TLOG_INF("%s:%s\n", name(), report.c_str());
