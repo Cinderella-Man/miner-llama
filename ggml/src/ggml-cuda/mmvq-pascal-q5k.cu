@@ -17,7 +17,7 @@
 //     the one-token kernel's, bit for bit. A lane group owns R = 2 (default) or 1 consecutive rows; the rows of a group
 //     share every load of the activations, and R changes no row's sum. At R = 1 a lane issues the k-column kernel's 96
 //     shared loads of activations per super-block at 4 tokens (2 x 128 + 64 bits per sub-block and token), est. 320 of
-//     the 408 load-store clocks of a warp's iteration on a P106; R = 2 halves them per row.
+//     the 452 load-store clocks of a warp's iteration on a P106; R = 2 halves them per row.
 //   - Each 32-weight sub-block of a row is decoded once into eight words of 5-bit codes and multiplied with dp4a by
 //     every token's activations. The earlier multi-token kernel decodes it once per token (mul_mat_vec_q_pascal_mc).
 //   - The floating-point steps are mmvqp_dot_q5_K's: per sub-block s and token, sumd = fmaf(d8, (float) (isum * sc), sumd)
