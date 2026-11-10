@@ -122,6 +122,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
     kpool_dev_init(model, no_alloc, offload);
+    pool_mask_dev_init(model);
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -448,6 +449,38 @@ llama_memory_hybrid_idx::~llama_memory_hybrid_idx() {
                        " rows uploaded (%.1f a ubatch), %" PRIu64 " checked\n", __func__, dv.tables.size(), dv.n_ubatch, dv.n_full,
                        dv.n_rows, dv.n_read, (double) dv.n_rows/dv.n_ubatch, dv.n_checked);
     }
+    if (pool_mask_st.n_ubatch > 0) {
+        LLAMA_LOG_INFO("%s: QSA pool mask built on the devices: %" PRIu64 " ubatches, %" PRIu64 " checked (%" PRIu64 " masks)\n",
+                       __func__, pool_mask_st.n_ubatch, pool_mask_st.n_checked, pool_mask_st.n_masks);
+    }
+}
+
+void llama_memory_hybrid_idx::pool_mask_dev_init(const llama_model & model) {
+    // read per memory, as LLAMA_QSA_KPOOL_DEV
+    const char * env = getenv("LLAMA_QSA_POOL_MASK_DEV");
+    const int mode = env ? atoi(env) : 0;
+    if (mode <= 0 || mem_idx == nullptr || get_kpool() == 0 || model.arch != LLM_ARCH_QWEN4EXP) {
+        return;
+    }
+
+    const std::vector<uint32_t> layer_ids = mem_idx->get_layer_ids();
+    const bool draft = !layer_ids.empty() && std::all_of(layer_ids.begin(), layer_ids.end(),
+            [&](uint32_t il) { return il >= model.hparams.n_layer(); });
+    if (mode == 2 && !draft) {
+        return;
+    }
+    // tensor split spreads a layer over the devices, so a layer has no one device to build its mask on
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        LLAMA_LOG_WARN("%s: LLAMA_QSA_POOL_MASK_DEV needs no tensor split, keeping the host mask\n", __func__);
+        return;
+    }
+
+    const char * env_check = getenv("LLAMA_QSA_POOL_MASK_DEV_CHECK");
+    pool_mask_check = env_check != nullptr && atoi(env_check) != 0;
+    pool_mask_dev   = true;
+
+    LLAMA_LOG_INFO("%s: QSA pool mask built on the devices (%s)%s\n", __func__, draft ? "MTP draft" : "model",
+            pool_mask_check ? ", checked" : "");
 }
 
 void llama_memory_hybrid_idx::kpool_dev_init(const llama_model & model, bool no_alloc, bool offload) {
@@ -950,6 +983,58 @@ bool llama_memory_hybrid_idx_context::kpool_dev_check_on() const {
     return mem != nullptr && mem->kpool_dev_check_on();
 }
 
+bool llama_memory_hybrid_idx_context::pool_mask_dev_on() const {
+    return mem != nullptr && mem->pool_mask_dev_on();
+}
+
+bool llama_memory_hybrid_idx_context::pool_mask_dev_check_on() const {
+    return mem != nullptr && mem->pool_mask_dev_check_on();
+}
+
+void llama_memory_hybrid_idx_context::pool_mask_dev_sent() const {
+    GGML_ASSERT(pool_mask_dev_on());
+    mem->pool_mask_stats().n_ubatch++;
+}
+
+void llama_memory_hybrid_idx_context::pool_mask_dev_check(const std::vector<const ggml_tensor *> & masks, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(pool_mask_dev_check_on());
+
+    // set_input_kpool filled it with this ubatch's ranges
+    const auto & ref = mem->pool_mask_ref();
+
+    std::vector<ggml_fp16_t> got(ref.size());
+    for (const ggml_tensor * m : masks) {
+        const int64_t n_pool = m->ne[0];
+        GGML_ASSERT(m->type == GGML_TYPE_F16 && m->ne[1] == (int64_t) ubatch->n_tokens);
+        GGML_ASSERT(ref.size() == (size_t) n_pool*ubatch->n_tokens);
+
+        ggml_backend_tensor_get(m, got.data(), 0, ggml_nbytes(m));
+        if (memcmp(got.data(), ref.data(), ggml_nbytes(m)) != 0) {
+            size_t n_diff = 0;
+            size_t first  = SIZE_MAX;
+            for (size_t k = 0; k < ref.size(); ++k) {
+                if (got[k] != ref[k]) {
+                    first = std::min(first, k);
+                    n_diff++;
+                }
+            }
+            LLAMA_LOG_ERROR("%s: %s in %s differs from the host mask in %zu of %zu entries, the first pool %zu of token %zu\n",
+                    __func__, m->name, ggml_backend_buffer_name(m->buffer), n_diff, ref.size(),
+                    (size_t) (first % n_pool), (size_t) (first / n_pool));
+            GGML_ABORT("LLAMA_QSA_POOL_MASK_DEV_CHECK: a device's pool mask differs from the host mask");
+        }
+    }
+
+    auto & st = mem->pool_mask_stats();
+    st.n_checked++;
+    st.n_masks += masks.size();
+    if (st.n_checked == 1 || st.n_checked % 256 == 0) {
+        LLAMA_LOG_INFO("%s: %" PRIu64 " ubatches checked: %zu masks built on the devices identical to the host mask "
+                       "(n_pool %" PRId64 ", %u tokens)\n", __func__, st.n_checked, masks.size(),
+                       masks.empty() ? (int64_t) 0 : masks[0]->ne[0], ubatch->n_tokens);
+    }
+}
+
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool_upd() const {
     return kpool_cur().n_upd_g;
 }
@@ -1233,7 +1318,8 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
-    GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
+    // the mask, or each token's range of visible pools (LLAMA_QSA_POOL_MASK_DEV)
+    GGML_ASSERT(pool_mask->ne[0] == (pool_mask->type == GGML_TYPE_I32 ? 2 : (int64_t) n_pool) && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(!tables || (pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool));
     GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
@@ -1416,7 +1502,10 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
     }
 
-    // a pool is visible when it belongs to the token's sequence and ends at or before it
+    // a pool is visible when it belongs to the token's sequence and ends at or before it: pools [p0, p0 + nv) of its row.
+    // LLAMA_QSA_POOL_MASK_DEV: rng gets each token's range, which ggml_range_mask expands on the devices, and the host
+    // mask (data) is filled only for the check
+    int32_t * rng = pool_mask->type == GGML_TYPE_I32 ? (int32_t *) pool_mask->data : nullptr;
     auto fill_mask = [&](auto * data) {
         using T = std::remove_pointer_t<decltype(data)>;
         const T keep = llama_cast<T>(0.0f);
@@ -1426,14 +1515,20 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             const llama_seq_id s = ubatch->seq_id[i][0];
             const llama_pos    p = ubatch->pos[i];
 
-            T * row = data + (size_t) i*n_pool;
-            std::fill(row, row + n_pool, drop);
-
             const uint32_t p0 = seq_pool_start[s];
             const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
             const uint32_t nv = by_order ? std::min(p1 - p0, (uint32_t) ((rank[i] + 1)/kpool)) :
                 (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
-            std::fill(row + p0, row + p0 + nv, keep);
+
+            if (data != nullptr) {
+                T * row = data + (size_t) i*n_pool;
+                std::fill(row, row + n_pool, drop);
+                std::fill(row + p0, row + p0 + nv, keep);
+            }
+            if (rng != nullptr) {
+                rng[2*i + 0] = (int32_t) p0;
+                rng[2*i + 1] = (int32_t) (p0 + nv);
+            }
 
             // Finite visible pools occupy the first min(nv, n_top) ranked slots.
             if (gm != nullptr) {
@@ -1444,7 +1539,15 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
     };
-    if (pool_mask->type == GGML_TYPE_F16) {
+    if (rng != nullptr) {
+        auto & ref = mem->pool_mask_ref();
+        if (mem->pool_mask_dev_check_on()) {
+            ref.resize((size_t) n_pool*n_tokens);
+            fill_mask(ref.data());
+        } else {
+            fill_mask((ggml_fp16_t *) nullptr);
+        }
+    } else if (pool_mask->type == GGML_TYPE_F16) {
         fill_mask((ggml_fp16_t *) pool_mask->data);
     } else {
         fill_mask((float *) pool_mask->data);

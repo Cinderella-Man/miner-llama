@@ -241,6 +241,8 @@ llama_build(test-moe-ids.cpp)
 llama_build(test-route-once.cpp)
 # the QSA k-pool tables kept on the devices (C100) on a qwen4exp file, e.g. one test-llama-archs wrote: run by hand
 llama_build(test-kpool-dev.cpp)
+# the QSA pool mask built on the devices (C719) on a qwen4exp file, e.g. one test-llama-archs wrote: run by hand
+llama_build(test-pool-mask-dev.cpp)
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_build(test-fp8.cpp)
     set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")

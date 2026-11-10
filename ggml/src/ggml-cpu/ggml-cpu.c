@@ -2123,6 +2123,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_kq_mask(params, tensor);
             } break;
+        case GGML_OP_RANGE_MASK:
+            {
+                ggml_compute_forward_range_mask(params, tensor);
+            } break;
         case GGML_OP_GET_REL_POS:
             {
                 ggml_compute_forward_get_rel_pos(params, tensor);
@@ -2490,6 +2494,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ROLL:
         case GGML_OP_ARANGE:
         case GGML_OP_KQ_MASK:
+        case GGML_OP_RANGE_MASK:
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:

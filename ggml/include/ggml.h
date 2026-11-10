@@ -619,6 +619,8 @@ extern "C" {
 
         GGML_OP_MOE_TAIL,
 
+        GGML_OP_RANGE_MASK,
+
         GGML_OP_COUNT,
     };
 
@@ -1869,6 +1871,15 @@ extern "C" {
             enum ggml_type        type,
             int                   swa_type,
             int                   n_swa);
+
+    // a mask of one visible range per row, so it can be computed on the device that uses it:
+    //   ranges: I32 [2, ne1, ne2, ne3], contiguous: per row its first visible column and one past its last
+    //   result [n, ne1, ne2, ne3] of type (F16 or F32): 0 where ranges[0] <= j < ranges[1], -INFINITY elsewhere
+    GGML_API struct ggml_tensor * ggml_range_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ranges,
+            int64_t               n,
+            enum ggml_type        type);
 
     GGML_API struct ggml_tensor * ggml_soft_max_ext_inplace(
             struct ggml_context * ctx,
