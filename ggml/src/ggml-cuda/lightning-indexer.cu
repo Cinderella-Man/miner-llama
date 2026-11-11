@@ -687,13 +687,22 @@ static void lightning_indexer_launch(ggml_backend_cuda_context & ctx, ggml_tenso
     }
 }
 
-// GGML_CUDA_LID_ROWS_FAULT=1 (checks only): a list of rows scores K rows 0 to n-1 instead of the listed ones
+// GGML_CUDA_LID_ROWS_FAULT=1 (checks only): a list of rows scores K rows i mod n_cells instead of the listed ones, so
+// that a list longer than the cache stays inside it
 static bool lightning_indexer_rows_fault() {
     static const bool fault = [] {
         const char * env = getenv("GGML_CUDA_LID_ROWS_FAULT");
         return env != nullptr && atoi(env) != 0;
     }();
     return fault;
+}
+
+// the fault's list: entry i is row i mod n_cells
+static __global__ void lightning_indexer_rows_fault_list(int32_t * r, const int n, const int n_cells) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        r[i] = i % n_cells;
+    }
 }
 
 void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -710,8 +719,10 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // kernel, which rounds the queries to half, never takes an F32 copy, so it stays out here too
     GGML_ASSERT(r->type == GGML_TYPE_I32 && ggml_is_contiguous(r));
     if (lightning_indexer_rows_fault()) {
-        GGML_ASSERT(r->ne[0] <= k->ne[2]);
-        lightning_indexer_launch<false>(ctx, dst, nullptr, r->ne[0], false);
+        const int n = r->ne[0];
+        ggml_cuda_pool_alloc<int32_t> rows(ctx.pool(), n);
+        lightning_indexer_rows_fault_list<<<(n + 255)/256, 256, 0, ctx.stream()>>>(rows.get(), n, k->ne[2]);
+        lightning_indexer_launch<true>(ctx, dst, rows.get(), n, false);
         return;
     }
     lightning_indexer_launch<true>(ctx, dst, (const int32_t *) r->data, r->ne[0], false);
