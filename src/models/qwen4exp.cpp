@@ -22,6 +22,17 @@ static bool qwen4exp_gdn_fuse_enabled() {
     return enabled;
 }
 
+// LLAMA_MTP_EMBD_FIRST=1 (C771, Q1357): the MTP draft's graph starts with its token rows' gather, so the k-pool tables'
+// update on the layer's card (LLAMA_QSA_KPOOL_DEV) follows it and the scheduler gives that card one split a pass, not
+// the update's own split before the gather's card; the same nodes, only their order
+static bool qwen4exp_mtp_embd_first() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_MTP_EMBD_FIRST");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
@@ -668,6 +679,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
         tok_embd = inp->embd;
     }
     cb(tok_embd, "mtp_tok_embd", il);
+    if (ubatch.token && qwen4exp_mtp_embd_first()) {
+        // without it the first node to read the rows comes after the layer's k-pool update (build_kpool_dev)
+        ggml_build_forward_expand(gf, tok_embd);
+    }
 
     res->add_input(std::move(inp));
 
