@@ -47,6 +47,7 @@ int server_queue::post(server_task && task, bool front) {
     trace_post(task.type);
     const int  task_id     = task.id;
     const bool reset_timer = task_resets_idle_timer(task.type);
+    const bool for_yield   = lazy_wake && yield_takes(task.type);
     QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
     if (front) {
         queue_tasks.push_front(std::move(task));
@@ -57,7 +58,7 @@ int server_queue::post(server_task && task, bool front) {
         time_last_task = ggml_time_ms();
     }
     condition_tasks.notify_one();
-    if (lazy_wake_locked()) {
+    if (for_yield && lazy_wake_locked()) {
         worker.cv.notify_one();
     }
     return task_id;
@@ -66,6 +67,7 @@ int server_queue::post(server_task && task, bool front) {
 int server_queue::post(std::vector<server_task> && tasks, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     bool reset_timer = false;
+    bool for_yield   = false;
     for (auto & task : tasks) {
         if (task.id == -1) {
             task.id = id++;
@@ -75,6 +77,7 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
             cleanup_pending_task(task.id_target);
         }
         reset_timer |= task_resets_idle_timer(task.type);
+        for_yield   |= lazy_wake && yield_takes(task.type);
         trace_post(task.type);
         QUE_DBG("new task, id = %d/%d, front = %d\n", task.id, (int) tasks.size(), front);
         if (front) {
@@ -87,7 +90,7 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
         time_last_task = ggml_time_ms();
     }
     condition_tasks.notify_one();
-    if (lazy_wake_locked()) {
+    if (for_yield && lazy_wake_locked()) {
         worker.cv.notify_one();
     }
     return 0;
@@ -130,7 +133,7 @@ void server_queue::pop_deferred_task(int id_slot) {
     }
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
-    if (!queue_tasks.empty() && lazy_wake_locked()) {
+    if (lazy_wake && !queue_tasks.empty() && yield_takes(queue_tasks.front().type) && lazy_wake_locked()) {
         worker.cv.notify_one();
     }
 }
@@ -260,12 +263,15 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
 
     QUE_DBG("%s", "yielding to queue\n");
 
-    // C741: with lazy_wake the worker sleeps through a yield that no task meets (post() wakes it for one that comes)
+    // C741: with lazy_wake the worker sleeps through a yield that no task it can take meets (post() wakes it for one that
+    // comes); a task it would decline (the loop's own NEXT_RESPONSE, a completion) waits in the queue for the loop
     bool wake = true;
     {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         GGML_ASSERT(!worker.busy && "yield_to_queue() cannot be nested");
-        wake = !lazy_wake || !queue_tasks.empty();
+        wake = !lazy_wake || std::any_of(queue_tasks.begin(), queue_tasks.end(), [&](const server_task & t) {
+            return yield_takes(t.type);
+        });
         worker.busy     = wake;
         worker.yielding = true;
         n_yield++;

@@ -393,6 +393,8 @@ static void test_server_queue_yield(testing & t) {
         t.test(lazy ? "lazy wake" : "a wake every yield", [lazy](testing & t) {
             server_queue q;
             q.set_lazy_wake(lazy);
+            // as llama-server: a yield takes reads only
+            q.on_yield_takes([](server_task_type type) { return type == SERVER_TASK_TYPE_METRICS; });
 
             std::mutex m;
             std::condition_variable cv;
@@ -430,19 +432,34 @@ static void test_server_queue_yield(testing & t) {
                 });
             };
 
+            // the order in which the tasks were taken
+            auto order = [&](int id) {
+                std::lock_guard<std::mutex> lock(m);
+                for (size_t i = 0; i < taken.size(); i++) {
+                    if (taken[i].first == id) {
+                        return (int) i;
+                    }
+                }
+                return -1;
+            };
+
             uint64_t y[5] = {};
             uint64_t w[5] = {};
             bool during_ok = false, during_y = false;
             bool before_ok = false, before_y = false;
             bool cmpl_in_step = true, cmpl_y = true;
+            bool next_in_step = true, next_y = true;
             int id_cmpl = -1;
+            int id_next = -1;
             int n_steps = 0;
 
             q.on_update_slots([&]() {
                 n_steps++;
                 if (n_steps == 1) {
+                    // as update_slots at a busy step's start: the loop's own task, which a yield declines
+                    id_next = post(SERVER_TASK_TYPE_NEXT_RESPONSE);
                     q.yield_counts(y[0], w[0]);
-                    // 1. no task meets the yield
+                    // 1. only a task the yield declines meets it
                     q.yield_to_queue([]() {});
                     q.yield_counts(y[1], w[1]);
                     // 2. a read comes during the yield: answered before the yield ends
@@ -464,10 +481,12 @@ static void test_server_queue_yield(testing & t) {
                     q.yield_counts(y[4], w[4]);
                     bool unused = false;
                     cmpl_in_step = find(id_cmpl, 0, unused);
+                    next_in_step = find(id_next, 0, unused);
                 } else {
-                    bool yielding = true;
-                    if (id_cmpl >= 0 && find(id_cmpl, 0, yielding)) {
-                        cmpl_y = yielding;
+                    bool yc = true, yn = true;
+                    if (id_cmpl >= 0 && find(id_cmpl, 0, yc) && find(id_next, 0, yn)) {
+                        cmpl_y = yc;
+                        next_y = yn;
                         q.terminate();
                     }
                 }
@@ -478,14 +497,15 @@ static void test_server_queue_yield(testing & t) {
             loop.join();
 
             t.assert_equal("yields", (uint64_t) 4, y[4] - y[0]);
-            t.assert_equal("wakes, no task", (uint64_t) (lazy ? 0 : 1), w[1] - w[0]);
+            t.assert_equal("wakes, only the loop's task waits", (uint64_t) (lazy ? 0 : 1), w[1] - w[0]);
             t.assert_equal("wakes, a read during the yield", (uint64_t) 1, w[2] - w[1]);
             t.assert_equal("wakes, a read before the yield", (uint64_t) 1, w[3] - w[2]);
-            t.assert_equal("wakes, a completion during the yield", (uint64_t) 1, w[4] - w[3]);
+            t.assert_equal("wakes, a completion during the yield", (uint64_t) (lazy ? 0 : 1), w[4] - w[3]);
             t.assert_true("a read that comes during the yield is answered in it", during_ok && during_y);
             t.assert_true("a read waiting at the yield's start is answered in it", before_ok && before_y);
-            t.assert_true("a completion is not taken during the step", !cmpl_in_step);
-            t.assert_true("the completion is taken by the loop at the next step", !cmpl_y);
+            t.assert_true("neither the loop's task nor the completion is taken during the step", !cmpl_in_step && !next_in_step);
+            t.assert_true("both are taken by the loop before the next step", !cmpl_y && !next_y);
+            t.assert_true("in the order they were posted", order(id_next) >= 0 && order(id_next) < order(id_cmpl));
             t.assert_equal("steps", 2, n_steps);
         });
     }

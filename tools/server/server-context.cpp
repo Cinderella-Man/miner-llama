@@ -1977,7 +1977,9 @@ static uint32_t server_tail_ckpt_min() {
 //   1: a generation step's draft and catch-up run without a yield; the verify pass (its decode and the wait for its
 //      outputs) keeps its yield, as do a prompt batch's decode and catch-up and the image encodes. A metrics or slot read
 //      that comes during the draft or the catch-up is answered at the verify pass's yield or when the step ends.
-//   2: as 1, and a yield wakes the worker only for a task: one waiting when the yield starts, or one that comes during it.
+//   2: as 1, and a yield wakes the worker only for a read: one waiting when the yield starts, or one that comes during it.
+//      Upstream's worker wakes at every yield, finds the loop's own NEXT_RESPONSE task (posted at every busy step's start),
+//      declines it and puts it back.
 // Completions, cancels and every other task that changes a slot are never taken during a yield (process_single_task
 // declines them): they wait for the step's end either way. The work runs on the server's own thread with or without a
 // yield, so every output is the same.
@@ -1987,6 +1989,11 @@ static int server_yield_mode() {
         return env ? std::clamp(atoi(env), 0, 2) : 0;
     }();
     return mode;
+}
+
+// the tasks the queue's worker takes during a yield (process_single_task declines every other): reads of the server state
+static bool server_task_yield_takes(server_task_type type) {
+    return type == SERVER_TASK_TYPE_METRICS || type == SERVER_TASK_TYPE_SLOT_GET;
 }
 
 // After the first token that differs (n), the longest stretch over which the cached tokens and the prompt spell the
@@ -2942,10 +2949,11 @@ private:
         });
 
         // C741: LLAMA_SERVER_YIELD
+        queue_tasks.on_yield_takes(server_task_yield_takes);
         queue_tasks.set_lazy_wake(server_yield_mode() >= 2);
         if (server_yield_mode() > 0) {
             SRV_INF("LLAMA_SERVER_YIELD=%d: a generation step's draft and catch-up without a yield to the task queue%s\n",
-                    server_yield_mode(), server_yield_mode() >= 2 ? "; a yield wakes the queue's worker only for a task" : "");
+                    server_yield_mode(), server_yield_mode() >= 2 ? "; a yield wakes the queue's worker only for a read" : "");
         }
 
         metrics.init();
@@ -4822,7 +4830,7 @@ private:
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
-        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+        if (is_yielding && !server_task_yield_takes(task.type)) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
         }

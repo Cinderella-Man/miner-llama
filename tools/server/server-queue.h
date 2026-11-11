@@ -52,6 +52,7 @@ private:
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
+    std::function<bool(server_task_type)>     callback_yield_takes; // C741: see on_yield_takes()
 
 public:
     ~server_queue() { worker_stop(); }
@@ -127,12 +128,19 @@ public:
     // Functions below are not thread-safe, must only be used before start_loop() is called
     //
 
-    // C741 (LLAMA_SERVER_YIELD=2): with on, a yield leaves the worker thread asleep unless a task is in the queue when
-    // the yield starts, and post() wakes it for a task that comes during the yield; a yield that no task meets then
-    // ends without waiting for the worker. Off (the default): every yield wakes the worker and waits for it at its end
+    // C741 (LLAMA_SERVER_YIELD=2): with on, a yield leaves the worker thread asleep unless a task it can take is in the
+    // queue when the yield starts, and post() wakes it for one that comes during the yield; a yield that no such task
+    // meets then ends without waiting for the worker. Off (the default): every yield wakes the worker and waits for it
+    // at its end
     void set_lazy_wake(bool on) {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         lazy_wake = on;
+    }
+
+    // C741: the task types callback_new_task takes while yielding (it declines the others, which wait for the loop);
+    // the lazy wake wakes the worker for these only. Unset: every type. Called with mutex_tasks held: it must not lock
+    void on_yield_takes(std::function<bool(server_task_type)> callback) {
+        callback_yield_takes = std::move(callback);
     }
 
     // Register function to process a new task
@@ -173,6 +181,11 @@ private:
     // C741: with lazy_wake, marks the worker busy if a yield is on and the worker sleeps; the caller holds mutex_tasks
     // and notifies worker.cv when this returns true
     bool lazy_wake_locked();
+
+    // C741: whether a yield can take a task of this type (callback_yield_takes; every type when unset)
+    bool yield_takes(server_task_type type) const {
+        return !callback_yield_takes || callback_yield_takes(type);
+    }
 };
 
 // struct for managing server responses
