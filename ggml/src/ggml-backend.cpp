@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-sched-preupload.h"
 
 #include <assert.h>
 #include <limits.h>

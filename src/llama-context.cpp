@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-sched-preupload.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
