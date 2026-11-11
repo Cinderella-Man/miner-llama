@@ -140,6 +140,11 @@ public:
     // counts since the memory was created; false when the switch is off
     bool kpool_dev_stats(uint64_t * n_ubatch, uint64_t * n_full, uint64_t * n_rows, uint64_t * n_checked) const;
 
+    // appends the indexer's own host state to out as raw bytes (the staleness of each sequence's pools, the pool
+    // layout, what the k-pool tables' copies hold and their counts, the pool mask's counts), so that two memories in the
+    // same state give the same bytes; the caches' cells are llama_kv_cache::debug_state's. For tests (C740)
+    void debug_state(std::string & out) const;
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore

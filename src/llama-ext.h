@@ -218,6 +218,17 @@ LLAMA_API bool llama_kpool_dev_stats(const struct llama_context * ctx, uint64_t 
 LLAMA_API bool llama_pool_mask_dev_stats(const struct llama_context * ctx, uint64_t * n_ubatch, uint64_t * n_checked,
                                          uint64_t * n_masks);
 
+// For tests (C740): the host state of a memory as raw bytes, so that two memories in the same state give the same
+// bytes: every KV cache's heads, cells, per-sequence (pos, cell) indexes and cell bits, and the cells changed for the
+// device copies of the cells; a QSA memory's pool staleness, pool layout and k-pool tables. Empty for a memory whose
+// kind it does not cover (DeepSeek V4's); a recurrent memory's own cells are left out (the state write holds them).
+LLAMA_API std::string llama_memory_debug_state(const llama_memory_t mem);
+
+// LLAMA_KV_SEQ_RM_BOUND (C740), summed over the memory's KV caches since they were created: out[0] seq_rm calls for one
+// sequence, out[1] of them that sorted their cells, out[2] of them that scanned the used range, out[3] calls for every
+// sequence, out[4] cells visited. All zero while the switch is off
+LLAMA_API void llama_memory_seq_rm_stats(const llama_memory_t mem, uint64_t out[5]);
+
 // Host timestamps along the server's steps (C405), with LLAMA_STEP_TRACE=<file> set: the marks of a step (a name and
 // the steady clock's time) are kept until llama_step_trace_end writes them as one JSON line, if a context marked a stage
 // since llama_step_trace_begin. The file's header gives the steady clock's time of its 0 ms, as GGML_CUDA_PROFILE_HOST's
