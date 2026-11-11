@@ -2,12 +2,12 @@
 
 #include "common.cuh"
 
-// Plain IQ4_XS and Q4_K products of 2 to 4 tokens (MUL_MAT, no fusion) on compute capability 6.1 that read and decode
+// Plain IQ4_XS and Q4_K products of 2 to 8 tokens (MUL_MAT, no fusion) on compute capability 6.1 that read and decode
 // each weight once for all tokens and give every token, bit for bit, the sums of the one-token Pascal kernel
 // (mul_mat_vec_q_pascal, mmvq-pascal.cu): Qwen3.8-Flash-Next's attention and recurrent projections in a speculative
 // verify, which the k-column kernel runs at one row per lane group with sums other than the one-token kernel's (C722,
 // Q1277; C690's Q5_K kernel, mmvq-pascal-q5k.cu, carried to the other types). The design is at the top of
-// mmvq-pascal-dmt.cu.
+// mmvq-pascal-dmt.cu. 5 to 8 tokens: GGML_CUDA_MMVQ_PASCAL_RO8 (C729; 1 on, 2 without the prefetch; R = 1 only).
 //
 // GGML_CUDA_MMVQ_PASCAL_DMT: 0 (default) off, the k-column and the earlier kernels as before; 1 on, at one row per lane
 // group with the register prefetch of each warp's next weight segments, except IQ4_XS's 2 tokens at K = 2560, which run
