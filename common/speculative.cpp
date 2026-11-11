@@ -581,11 +581,13 @@ struct common_speculative_impl {
     virtual bool pending() const { return false; }
     virtual bool flush() { return true; }
 
-    // C217: process() of a target batch cut with llama_set_ubatch_cuts (the same cuts on the draft context) leaves what
-    // separate calls cut there leave, and get_state_at() gives the state at a cut
+    // C217: process() of a target batch cut with llama_set_ubatch_cuts (the same cuts on the draft context, set_cuts)
+    // leaves what separate calls cut there leave, and get_state_at() gives the state at a cut
     virtual bool incall_ok() const { return false; }
     // C217: what get_state would return had the last processed batch ended before its row i_row
     virtual bool get_state_at(llama_seq_id /*seq_id*/, int32_t /*i_row*/, std::vector<uint8_t> & /*data*/) const { return false; }
+    // C735: the draft context's cuts and fills for its pass over the next process()'s batch
+    virtual void set_cuts(const std::vector<uint32_t> & /*cuts*/, const std::vector<common_speculative_store_at> & /*fills*/) {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -2039,12 +2041,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // target keeps the call's h rows in its buffer's other half meanwhile (llama_hold_embeddings_nextn). The passes, their
     // inputs and their order are the ones of the immediate catch-up
     bool overlap = false;
+
+    // C217 (C735): the cuts and fills of the draft's pass over a batch, from set_cuts() for the next process(); a
+    // catch-up that waits keeps its own
+    struct cut_plan {
+        std::vector<uint32_t>                    cuts;
+        std::vector<common_speculative_store_at> fills;
+    };
+    cut_plan cuts_next;
+
     struct {
         bool                             active   = false;
         std::vector<common_batch::token> tokens;
         int64_t                          row_base = 0; // the first row of the half with the call's rows
+        cut_plan                         cuts;
     } deferred;
     uint64_t n_deferred = 0;
+
+    // the first row of the half the last catch-up read: get_state_at() reads that batch's rows there
+    int64_t cu_row_base = 0;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -2331,7 +2346,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    void set_cuts(const std::vector<uint32_t> & cuts, const std::vector<common_speculative_store_at> & fills) override {
+        cuts_next.cuts  = cuts;
+        cuts_next.fills = fills;
+    }
+
     bool process(const common_batch & batch_in) override {
+        // C735: set_cuts() was for this batch only
+        cut_plan cuts = std::move(cuts_next);
+        cuts_next = {};
+
         if (batch_in.size() <= 0) {
             return true;
         }
@@ -2350,13 +2374,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             deferred.row_base = llama_get_embeddings_nextn_row0(ctx_tgt);
             deferred.active   = llama_hold_embeddings_nextn(ctx_tgt);
             if (deferred.active) {
+                deferred.cuts = std::move(cuts);
                 n_deferred++;
                 return true;
             }
             deferred.tokens.clear();
         }
 
-        return catch_up(batch_in.tokens, dev_rows ? llama_get_embeddings_nextn_row0(ctx_tgt) : 0);
+        return catch_up(batch_in.tokens, dev_rows ? llama_get_embeddings_nextn_row0(ctx_tgt) : 0, cuts);
     }
 
     bool pending() const override {
@@ -2369,8 +2394,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         deferred.active = false;
         const std::vector<common_batch::token> tokens = std::move(deferred.tokens);
+        const cut_plan cuts = std::move(deferred.cuts);
         deferred.tokens.clear();
-        return catch_up(tokens, deferred.row_base);
+        deferred.cuts = {};
+        return catch_up(tokens, deferred.row_base, cuts);
     }
 
     // a batch whose catch-up can wait: token ids only (no vision embeddings), no row the caller reads back
@@ -2383,10 +2410,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
-    // the catch-up over a target batch's tokens; with dev_rows its h rows start at row row_base of the target's buffer
-    bool catch_up(const std::vector<common_batch::token> & tokens_in, const int64_t row_base) {
+    // the catch-up over a target batch's tokens; with dev_rows its h rows start at row row_base of the target's buffer;
+    // its pass takes the batch's cuts and fills (C217)
+    bool catch_up(const std::vector<common_batch::token> & tokens_in, const int64_t row_base, const cut_plan & cuts) {
         // LLAMA_STEP_TRACE (C405): the catch-up's batch, its decode and the verify pass's h rows read
         llama_step_trace_mark("mtp.cu");
+
+        cu_row_base = row_base;
 
         const int32_t n_tokens = (int32_t) tokens_in.size();
 
@@ -2469,6 +2499,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             auto * mem_dft = llama_get_memory(ctx_dft);
 
+            // C217: the pass is cut as the target's call was, and fills the draft's part of each checkpoint inside it;
+            // the fills go to the next decode, which is this one
+            if (!cuts.cuts.empty()) {
+                llama_set_ubatch_cuts(ctx_dft, cuts.cuts.data(), cuts.cuts.size());
+            }
+            for (const auto & f : cuts.fills) {
+                llama_state_seq_store_at(ctx_dft, f.seq_id, f.store, f.i_end, f.flags);
+            }
+
             llama_step_trace_mark("mtp.cu.dec");
 
             bool ok = true;
@@ -2495,6 +2534,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+            }
+            if (!cuts.cuts.empty()) {
+                llama_set_ubatch_cuts(ctx_dft, nullptr, 0);
             }
             if (!ok) {
                 return false;
@@ -2810,7 +2852,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return !chain_heads && !is_mem_shared;
     }
 
-    // pending_h after a call that ended before row i_row: that call's last row
+    // pending_h after a call that ended before row i_row: that call's last row, in the half the last catch-up read
+    // (C735: with LLAMA_MTP_CATCHUP_OVERLAP the target's next call writes the other one)
     bool get_state_at(llama_seq_id seq_id, int32_t i_row, std::vector<uint8_t> & data) const override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || i_row < 1 || is_mem_shared) {
             return false;
@@ -2820,7 +2863,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         data.resize(row_bytes);
 
         if (dev_rows) {
-            return llama_get_embeddings_nextn_rows(params.ctx_tgt, i_row - 1, 1, (float *) data.data());
+            return llama_get_embeddings_nextn_rows(params.ctx_tgt, cu_row_base + i_row - 1, 1, (float *) data.data());
         }
 
         const float * h = llama_get_embeddings_nextn_ith(params.ctx_tgt, i_row - 1);
@@ -4159,6 +4202,17 @@ bool common_speculative_get_state_at(common_speculative * spec, llama_seq_id seq
     }
 
     return false;
+}
+
+void common_speculative_set_cuts(common_speculative * spec, const std::vector<uint32_t> & cuts,
+        const std::vector<common_speculative_store_at> & fills) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->set_cuts(cuts, fills);
+    }
 }
 
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {

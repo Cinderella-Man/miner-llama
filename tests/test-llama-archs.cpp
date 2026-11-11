@@ -183,6 +183,8 @@ static void usage(char ** argv) {
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
     LOG("  --mtp-kv-only            Check that LLAMA_MTP_KV_ONLY leaves the MTP draft's caches and drafts as they are (CPU only)\n");
     LOG("  --mtp-catchup-overlap    Check that LLAMA_MTP_CATCHUP_OVERLAP leaves the MTP draft's caches and drafts as they are (CPU only)\n");
+    LOG("  --mtp-incall-overlap     Check that checkpoints inside a call (C217) give the MTP draft's parts and drafts of separate calls,\n");
+    LOG("                           with LLAMA_MTP_CATCHUP_OVERLAP off and on (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -2690,6 +2692,418 @@ static int test_mtp_catchup_overlap(const std::string & arch_filter, const size_
     return n_failed == 0 ? 0 : 1;
 }
 
+// C735: how a prompt's checkpoints are taken, in llama-server's order
+enum mtp_incall_mode {
+    MTP_INCALL_CUT,    // separate calls end at each checkpoint, taken between calls (the reference)
+    MTP_INCALL_JOINED, // --ctx-checkpoints-incall (C217): the calls joined and cut there; the draft's cuts and fills go
+                       // through common_speculative_set_cuts, its part of a checkpoint is read behind its catch-up
+    MTP_INCALL_OLD,    // the same as pascal-p106-v4-b12246-c748's server takes them: the draft's fills and cuts set on its
+                       // context around the driver's call, its part read right after that call
+};
+
+struct mtp_incall_run {
+    std::vector<std::vector<uint8_t>> ckpt_dft;  // each checkpoint's draft part (update_dft's bytes)
+    std::vector<std::vector<uint8_t>> ckpt_spec; // and the driver's state at it
+    std::vector<uint8_t>     state_prompt; // the draft's sequence state and the driver's after the prompt
+    std::vector<uint8_t>     spec_prompt;
+    std::vector<uint8_t>     state_end;    // both after the last step
+    std::vector<uint8_t>     spec_end;
+    std::vector<llama_token> drafts;       // each step's draft, its length first
+    std::vector<float>       probs;        // the drafter's probability of each drafted token
+    int                      n_pending = 0; // prompt calls whose catch-up waited for the next call
+};
+
+// a prompt of 100 tokens with checkpoints after 20, 50 and 84 of them: in separate calls (20, 30, 14, 20, 12, 4) or in
+// joined ones (64 cut at 20 and 50, 32 cut at 20, then 4), the last one with an output, the cut of the memory past each
+// call's start as the server takes it; then three draft steps as in mtp_overlap_sequence. The target's calls are cut
+// at the checkpoints as the server cuts them (llama_set_ubatch_cuts), so the joined calls' micro-batches are the
+// separate calls'
+static mtp_incall_run mtp_incall_sequence(llama_model * model, const std::vector<llama_token> & tokens,
+        const mtp_overlap_config & cfg, const mtp_incall_mode mode, const bool overlap) {
+    test_setenv("LLAMA_MTP_KV_ONLY", cfg.kv_only ? "1" : nullptr);
+    test_setenv("LLAMA_MTP_CATCHUP_OVERLAP", overlap ? "1" : nullptr);
+
+    auto ctx_params_for = [&](const bool mtp) {
+        llama_context_params p = llama_context_default_params();
+        p.ctx_type        = mtp ? LLAMA_CONTEXT_TYPE_MTP : LLAMA_CONTEXT_TYPE_DEFAULT;
+        p.n_ctx           = 0;
+        p.n_batch         = 64;
+        // the target's calls cross micro-batches; the draft's passes end inside the k-pool blocks
+        p.n_ubatch        = mtp ? 18 : 8;
+        p.n_threads       = 4;
+        p.n_threads_batch = 4;
+        p.type_k          = cfg.type_kv;
+        p.type_v          = cfg.type_kv;
+        p.flash_attn_type = cfg.fa ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        p.n_outputs_max_per_seq = 4;
+        return p;
+    };
+
+    llama_context_ptr lctx_tgt(llama_init_from_model(model, ctx_params_for(false)));
+    llama_context_ptr lctx_dft(llama_init_from_model(model, ctx_params_for(true)));
+    test_setenv("LLAMA_MTP_KV_ONLY", nullptr);
+    if (!lctx_tgt || !lctx_dft) {
+        test_setenv("LLAMA_MTP_CATCHUP_OVERLAP", nullptr);
+        throw std::runtime_error("failed to create the target or the MTP context");
+    }
+    llama_context * ctx_tgt = lctx_tgt.get();
+    llama_context * ctx_dft = lctx_dft.get();
+
+    common_params_speculative sp;
+    sp.types                  = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    sp.draft.ctx_tgt          = ctx_tgt;
+    sp.draft.ctx_dft          = ctx_dft;
+    sp.draft.n_max            = 3;
+    sp.draft.n_min            = 0;
+    sp.draft.p_min            = 0.0f;
+    sp.draft.backend_sampling = cfg.backend_sampling;
+    common_speculative_ptr spec(common_speculative_init(sp, 1));
+    test_setenv("LLAMA_MTP_CATCHUP_OVERLAP", nullptr);
+    if (!spec) {
+        throw std::runtime_error("failed to create the draft-mtp driver");
+    }
+    if (mode != MTP_INCALL_CUT && !common_speculative_incall_ok(spec.get())) {
+        throw std::runtime_error("the draft-mtp driver takes no checkpoints inside a call");
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    mtp_incall_run run;
+
+    auto state_dft = [&]() {
+        std::vector<uint8_t> s(llama_state_seq_get_size(ctx_dft, 0));
+        llama_state_seq_get_data(ctx_dft, s.data(), s.size(), 0);
+        return s;
+    };
+
+    // a fill of the draft's last pass, in update_dft's format, as the server's ckpt_incall_finish_dft reads it
+    auto store_host = [&](const int32_t store) {
+        std::vector<uint8_t> out;
+        std::vector<uint8_t> blob(llama_state_seq_store_at_get(ctx_dft, nullptr, 0, 0, store, nullptr, nullptr));
+        if (blob.empty()) {
+            return out;
+        }
+        out.resize(llama_state_seq_store_get_size_host(ctx_dft, 0, store));
+        if (out.empty() ||
+            llama_state_seq_store_at_get(ctx_dft, blob.data(), blob.size(), 0, store, nullptr, nullptr) != blob.size() ||
+            llama_state_seq_store_get_data_host(ctx_dft, blob.data(), blob.size(), out.data(), out.size(), 0, store) != out.size()) {
+            out.clear();
+        }
+        return out;
+    };
+
+    auto argmax = [&](int32_t i) {
+        const float * logits = llama_get_logits_ith(ctx_tgt, i);
+        GGML_ASSERT(logits != nullptr);
+        return (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
+    };
+
+    const std::vector<int> ckpts = { 20, 50, 84 };
+    const std::vector<int> ends  = mode == MTP_INCALL_CUT ? std::vector<int>{ 20, 50, 64, 84, 96, 100 } : std::vector<int>{ 64, 96, 100 };
+
+    run.ckpt_dft.resize(ckpts.size());
+    run.ckpt_spec.resize(ckpts.size());
+
+    llama_tokens context;
+    int i0 = 0;
+    for (size_t c = 0; c < ends.size(); ++c) {
+        const int  i1   = ends[c];
+        const bool last = c + 1 == ends.size();
+
+        common_memory mem_tgt;
+        mem_tgt.init(ctx_tgt);
+        mem_tgt.seq_rm(0, i0, -1);
+        common_speculative_after_catchup(spec.get(), [&, p0 = i0]() {
+            common_memory mem_dft;
+            mem_dft.init(ctx_dft);
+            mem_dft.seq_rm(0, p0, -1);
+        });
+
+        // the checkpoints inside this call: a cut and a fill of the draft's store k at each
+        std::vector<uint32_t>                    cuts;
+        std::vector<common_speculative_store_at> fills;
+        for (size_t k = 0; k < ckpts.size(); ++k) {
+            if (ckpts[k] > i0 && ckpts[k] < i1) {
+                cuts.push_back((uint32_t) (ckpts[k] - i0));
+                fills.push_back({ 0, (int32_t) k, (uint32_t) (ckpts[k] - i0), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY });
+            }
+        }
+        if (mode == MTP_INCALL_OLD) {
+            for (const auto & f : fills) {
+                llama_state_seq_store_at(ctx_dft, f.seq_id, f.store, f.i_end, f.flags);
+            }
+        }
+
+        common_batch batch(ctx_tgt);
+        for (int i = i0; i < i1; ++i) {
+            batch.add(tokens[i], i, 0, last && i + 1 == i1);
+            context.push_back(tokens[i]);
+        }
+        llama_set_ubatch_cuts(ctx_tgt, cuts.data(), cuts.size());
+        const int32_t rc = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        llama_set_ubatch_cuts(ctx_tgt, nullptr, 0);
+        if (rc != 0) {
+            throw std::runtime_error("failed to decode a prompt call");
+        }
+
+        if (mode == MTP_INCALL_JOINED) {
+            common_speculative_set_cuts(spec.get(), cuts, fills);
+        } else if (mode == MTP_INCALL_OLD) {
+            llama_set_ubatch_cuts(ctx_dft, cuts.data(), cuts.size());
+        }
+        const bool ok = common_speculative_process(spec.get(), batch);
+        if (mode == MTP_INCALL_OLD) {
+            llama_set_ubatch_cuts(ctx_dft, nullptr, 0);
+        }
+        if (!ok) {
+            throw std::runtime_error("the driver failed on a prompt call");
+        }
+        run.n_pending += common_speculative_pending(spec.get()) ? 1 : 0;
+
+        for (const auto & f : fills) {
+            auto take = [&, k = f.store, i_row = (int32_t) f.i_end]() {
+                run.ckpt_dft[k] = store_host(k);
+                common_speculative_get_state_at(spec.get(), 0, i_row, run.ckpt_spec[k]);
+            };
+            if (mode == MTP_INCALL_OLD) {
+                take();
+            } else {
+                common_speculative_after_catchup(spec.get(), take);
+            }
+        }
+        // a checkpoint where a separate call ends, as create_checkpoint takes the draft's part
+        for (size_t k = 0; k < ckpts.size(); ++k) {
+            if (mode == MTP_INCALL_CUT && ckpts[k] == i1) {
+                common_speculative_after_catchup(spec.get(), [&, k]() {
+                    common_prompt_checkpoint ck;
+                    ck.update_dft(ctx_dft, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    run.ckpt_dft[k].assign(ck.data_dft.begin(), ck.data_dft.end());
+                    common_speculative_get_state(spec.get(), 0, run.ckpt_spec[k]);
+                });
+            }
+        }
+
+        i0 = i1;
+    }
+    common_speculative_flush(spec.get());
+    run.state_prompt = state_dft();
+    common_speculative_get_state(spec.get(), 0, run.spec_prompt);
+
+    // three draft steps from the prompt's end; the verify batch accepts n_acc of each draft as far as the driver is told
+    llama_pos pos = i0;
+    auto step = [&](llama_token id_last, int n_acc) {
+        llama_tokens draft;
+        std::vector<float> probs;
+        common_speculative_get_draft_params(spec.get(), 0) = {
+            /* .drafting = */ true,
+            /* .n_max    = */ 3,
+            /* .pos0     = */ pos,
+            /* .id_last  = */ id_last,
+            /* .prompt   = */ &context,
+            /* .result   = */ &draft,
+            /* .result_q = */ nullptr,
+            /* .temp     = */ 1.0f,
+            /* .seed     = */ LLAMA_DEFAULT_SEED,
+            /* .info     = */ nullptr,
+            /* .result_p = */ &probs,
+        };
+        common_speculative_draft(spec.get());
+        run.drafts.push_back((llama_token) draft.size());
+        run.drafts.insert(run.drafts.end(), draft.begin(), draft.end());
+        run.probs.insert(run.probs.end(), probs.begin(), probs.end());
+
+        if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, pos, -1)) {
+            throw std::runtime_error("failed to remove the draft region");
+        }
+
+        common_batch batch(ctx_tgt);
+        batch.add(id_last, pos++, 0, true);
+        context.push_back(id_last);
+        for (const llama_token t : draft) {
+            batch.add(t, pos++, 0, true);
+            context.push_back(t);
+        }
+        if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("failed to decode a verify batch");
+        }
+        if (!common_speculative_process(spec.get(), batch)) {
+            throw std::runtime_error("the driver failed on a verify batch");
+        }
+        common_speculative_accept(spec.get(), 0, (uint16_t) std::min<int>(n_acc, (int) draft.size()));
+        return argmax(batch.size() - 1);
+    };
+
+    common_speculative_begin(spec.get(), 0, context);
+    llama_token id = argmax(-1);
+    id = step(id, 0);
+    id = step(id, 1);
+    step(id, 3);
+
+    common_speculative_flush(spec.get());
+    run.state_end = state_dft();
+    common_speculative_get_state(spec.get(), 0, run.spec_end);
+
+    spec.reset();
+    return run;
+}
+
+// --mtp-incall-overlap (C735): every arm against the separate calls with LLAMA_MTP_CATCHUP_OVERLAP off; the joined calls
+// with it on in detail
+static int test_mtp_incall_overlap(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    const mtp_overlap_config configs[] = {
+        { "f16 fa",         GGML_TYPE_F16,  true,  false, true  },
+        { "f16",            GGML_TYPE_F16,  false, false, true  },
+        { "q8_0 fa",        GGML_TYPE_Q8_0, true,  false, true  },
+        { "f16 fa kv-only", GGML_TYPE_F16,  true,  true,  true  },
+        { "f16 fa host",    GGML_TYPE_F16,  true,  false, false },
+    };
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    common_log_flush(common_log_main());
+    LOG("|%10s|%15s|%10s|%10s|%10s|%10s|%10s|%10s|%10s|%10s|%10s|%8s|%s\n", "Model arch.", "Config", "Ckpt dft", "Ckpt spec",
+            "Prompt", "Drafts", "End", "cut on", "joined off", "old off", "old on", "Waited", "Status");
+
+    auto same = [](const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) {
+        return !a.empty() && a == b;
+    };
+    auto same_list = [&](const std::vector<std::vector<uint8_t>> & a, const std::vector<std::vector<uint8_t>> & b) {
+        if (a.size() != b.size()) {
+            return false;
+        }
+        for (size_t k = 0; k < a.size(); ++k) {
+            if (!same(a[k], b[k])) {
+                return false;
+            }
+        }
+        return true;
+    };
+    auto same_drafts = [](const mtp_incall_run & a, const mtp_incall_run & b) {
+        return !a.drafts.empty() && a.drafts == b.drafts && a.probs.size() == b.probs.size() &&
+            memcmp(a.probs.data(), b.probs.data(), a.probs.size()*sizeof(float)) == 0;
+    };
+    auto same_all = [&](const mtp_incall_run & a, const mtp_incall_run & b) {
+        return same_list(a.ckpt_dft, b.ckpt_dft) && same_list(a.ckpt_spec, b.ckpt_spec) &&
+            same(a.state_prompt, b.state_prompt) && same(a.spec_prompt, b.spec_prompt) && same_drafts(a, b) &&
+            same(a.state_end, b.state_end) && same(a.spec_end, b.spec_end);
+    };
+
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !mtp_kv_only_arch(arch)) {
+            continue;
+        }
+        const bool moe = moe_mandatory(arch) || moe_implemented(arch);
+
+        gguf_context_ptr gguf_ctx = get_gguf_ctx_mtp(arch, moe);
+
+        llama_model_ptr model;
+        try {
+            model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, nullptr, /*load_mtp*/ true);
+        } catch (const std::exception & err) {
+            LOG("|%10s|%15s|%10s|%10s|%10s|%10s|%10s|%10s|%10s|%10s|%10s|%8s|\033[1;31mERROR\033[0m (model load: %s)\n",
+                    llama_arch_name(arch), "", "", "", "", "", "", "", "", "", "", "", err.what());
+            n_tests++;
+            n_failed++;
+            continue;
+        }
+
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const std::vector<llama_token> tokens = get_tokens(160, n_vocab, seed);
+
+        for (const mtp_overlap_config & cfg : configs) {
+            n_tests++;
+            LOG("|%10s|%15s|", llama_arch_name(arch), cfg.name);
+            std::string status;
+            try {
+                // the driver's own log lines stay out of the table
+                struct log_pause {
+                    log_pause()  { common_log_pause(common_log_main()); }
+                    ~log_pause() { common_log_resume(common_log_main()); }
+                };
+                mtp_incall_run ref, cut_on, joined_off, joined_on, old_off, old_on;
+                {
+                    log_pause pause;
+                    ref        = mtp_incall_sequence(model.get(), tokens, cfg, MTP_INCALL_CUT,    false);
+                    cut_on     = mtp_incall_sequence(model.get(), tokens, cfg, MTP_INCALL_CUT,    true);
+                    joined_off = mtp_incall_sequence(model.get(), tokens, cfg, MTP_INCALL_JOINED, false);
+                    joined_on  = mtp_incall_sequence(model.get(), tokens, cfg, MTP_INCALL_JOINED, true);
+                    old_off    = mtp_incall_sequence(model.get(), tokens, cfg, MTP_INCALL_OLD,    false);
+                    old_on     = mtp_incall_sequence(model.get(), tokens, cfg, MTP_INCALL_OLD,    true);
+                }
+
+                const bool ok_dft    = same_list(ref.ckpt_dft, joined_on.ckpt_dft);
+                const bool ok_spec   = same_list(ref.ckpt_spec, joined_on.ckpt_spec);
+                const bool ok_prompt = same(ref.state_prompt, joined_on.state_prompt) && same(ref.spec_prompt, joined_on.spec_prompt);
+                const bool ok_drafts = same_drafts(ref, joined_on);
+                const bool ok_end    = same(ref.state_end, joined_on.state_end) && same(ref.spec_end, joined_on.spec_end);
+                const bool ok_cut    = same_all(ref, cut_on);
+                const bool ok_joined = same_all(ref, joined_off);
+                const bool ok_old    = same_all(ref, old_off);
+                // the control: -c748's order with the switch on leaves the draft's parts unread or read from another pass
+                const bool old_differs = !same_all(ref, old_on);
+                // off: no call waits; on: the calls without an output (5 separate, 2 joined)
+                const bool waited_ok = ref.n_pending == 0 && joined_off.n_pending == 0 && cut_on.n_pending == 5 && joined_on.n_pending == 2;
+
+                char waited_str[32];
+                snprintf(waited_str, sizeof(waited_str), "%d/%d", cut_on.n_pending, joined_on.n_pending);
+                auto id = [](bool b) { return b ? "identical" : "DIFFERENT"; };
+                LOG("%10s|%10s|%10s|%10s|%10s|%10s|%10s|%10s|%10s|%8s|", id(ok_dft), id(ok_spec), id(ok_prompt), id(ok_drafts),
+                        id(ok_end), id(ok_cut), id(ok_joined), id(ok_old), old_differs ? "differs" : "IDENTICAL", waited_str);
+
+                if (ok_dft && ok_spec && ok_prompt && ok_drafts && ok_end && ok_cut && ok_joined && ok_old && old_differs && waited_ok) {
+                    status = "\033[1;32mOK\033[0m";
+                } else {
+                    n_failed++;
+                    status = "\033[1;31mFAIL\033[0m";
+                    if (!old_differs) {
+                        status += " (the control does not see the old order)";
+                    }
+                    if (!waited_ok) {
+                        status += " (the catch-ups did not wait as they should)";
+                    }
+                }
+            } catch (const std::exception & err) {
+                n_failed++;
+                status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
+            }
+            LOG("%s\n", status.c_str());
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -2706,6 +3120,7 @@ int main(int argc, char ** argv) {
     bool kv_shift = false;
     bool mtp_kv_only = false;
     bool mtp_catchup_overlap = false;
+    bool mtp_incall_overlap = false;
     bool save_mtp = false;
 
     int verbosity = LOG_LEVEL_ERROR;
@@ -2780,6 +3195,8 @@ int main(int argc, char ** argv) {
             mtp_kv_only = true;
         } else if (strcmp(argv[i], "--mtp-catchup-overlap") == 0) {
             mtp_catchup_overlap = true;
+        } else if (strcmp(argv[i], "--mtp-incall-overlap") == 0) {
+            mtp_incall_overlap = true;
         } else if (strcmp(argv[i], "--mtp") == 0) {
             save_mtp = true;
         } else {
@@ -2808,6 +3225,9 @@ int main(int argc, char ** argv) {
         }
         if (mtp_catchup_overlap) {
             return test_mtp_catchup_overlap(arch_filter, seed, stdev, verbosity);
+        }
+        if (mtp_incall_overlap) {
+            return test_mtp_incall_overlap(arch_filter, seed, stdev, verbosity);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {
