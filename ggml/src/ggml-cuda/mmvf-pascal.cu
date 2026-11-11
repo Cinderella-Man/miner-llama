@@ -83,16 +83,16 @@ static int mmvfp_rule() {
 
 // GGML_CUDA_MMVF_PASCAL_EXACT=1 (C750, Q1325): every product of 2 to 4 tokens adds each row in the order of one token.
 // Where the 3-4 token rule gives 32 lanes and one token 128 (on a P106-090 the 10,240-wide hyper-connection products),
-// mul_mat_vec_bf16_pascal_x4 takes it: the 128-lane order with the 32-lane shape's loads. Where the two shapes' lane
-// counts differ otherwise (on cards of more SMs: 128 lanes at 3-4 tokens against 32 at one), the product takes its
-// one-token shape. 0 (default): the rule alone, whose 3-4 token shapes may add in another order. A forced shape
-// (GGML_CUDA_MMVF_PASCAL_SHAPE) is left as it is.
-static bool mmvfp_exact() {
-    static const bool on = mmvfp_env_int("GGML_CUDA_MMVF_PASCAL_EXACT", 0) != 0;
-    return on;
+// mul_mat_vec_bf16_pascal_x4p takes it: the 128-lane order with the 32-lane shape's loads; =2: mul_mat_vec_bf16_pascal_x4,
+// the same order with the four chains interleaved. Where the two shapes' lane counts differ otherwise (on cards of more
+// SMs: 128 lanes at 3-4 tokens against 32 at one), the product takes its one-token shape. 0 (default): the rule alone,
+// whose 3-4 token shapes may add in another order. A forced shape (GGML_CUDA_MMVF_PASCAL_SHAPE) is left as it is.
+static int mmvfp_exact() {
+    static const int mode = mmvfp_env_int("GGML_CUDA_MMVF_PASCAL_EXACT", 0);
+    return mode;
 }
 
-// GGML_CUDA_MMVF_PASCAL_EXACT_FAULT=1 (checks only): mul_mat_vec_bf16_pascal_x4 leaves a quarter of each row's terms out
+// GGML_CUDA_MMVF_PASCAL_EXACT_FAULT=1 (checks only): the 32-lane kernels of that order leave a quarter of each row's terms out
 static bool mmvfp_exact_fault() {
     static const bool on = mmvfp_env_int("GGML_CUDA_MMVF_PASCAL_EXACT_FAULT", 0) != 0;
     return on;
@@ -168,15 +168,24 @@ static void mmvfp_launch_cols(const mmvfp_params & p, const int ncols_dst, cudaS
     }
 }
 
-template <int R, int T>
-static void mmvfp_launch_x4(const mmvfp_params & p, cudaStream_t stream) {
+template <int R, int T, bool fault>
+static void mmvfp_launch_x4_kernel(const mmvfp_params & p, cudaStream_t stream) {
     const dim3 grid(mmvfp_blocks(p.nrows, 32, R), 1, 1);
-    if (mmvfp_exact_fault()) {
-        mul_mat_vec_bf16_pascal_x4<R, T, true><<<grid, MMVF_PASCAL_NT, 0, stream>>>(
+    if (mmvfp_exact() == 2) {
+        mul_mat_vec_bf16_pascal_x4<R, T, fault><<<grid, MMVF_PASCAL_NT, 0, stream>>>(
             p.x, p.y, p.dst, p.nrows, p.nchunks, p.stride_row, p.stride_col_y4, p.stride_col_dst);
     } else {
-        mul_mat_vec_bf16_pascal_x4<R, T, false><<<grid, MMVF_PASCAL_NT, 0, stream>>>(
+        mul_mat_vec_bf16_pascal_x4p<R, T, fault><<<grid, MMVF_PASCAL_NT, 0, stream>>>(
             p.x, p.y, p.dst, p.nrows, p.nchunks, p.stride_row, p.stride_col_y4, p.stride_col_dst);
+    }
+}
+
+template <int R, int T>
+static void mmvfp_launch_x4(const mmvfp_params & p, cudaStream_t stream) {
+    if (mmvfp_exact_fault()) {
+        mmvfp_launch_x4_kernel<R, T, true>(p, stream);
+    } else {
+        mmvfp_launch_x4_kernel<R, T, false>(p, stream);
     }
 }
 
@@ -257,7 +266,7 @@ bool ggml_cuda_mmvf_pascal(const ggml_tensor * src0, const ggml_tensor * src1, c
     int G = 0;
     int R = 0;
     mmvfp_pick_shape(p.nchunks, p.nrows, (int) ncols_dst, nsm, G, R);
-    if (mmvfp_exact() && ncols_dst >= 2 && ncols_dst <= 4 && mmvfp_forced_shape()[0] == 0) {
+    if (mmvfp_exact() != 0 && ncols_dst >= 2 && ncols_dst <= 4 && mmvfp_forced_shape()[0] == 0) {
         int G1 = 0;
         int R1 = 0;
         mmvfp_pick_shape(p.nchunks, p.nrows, 1, nsm, G1, R1);

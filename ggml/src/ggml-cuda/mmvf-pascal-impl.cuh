@@ -158,14 +158,101 @@ static __global__ void mul_mat_vec_bf16_pascal(
     }
 }
 
-// The 128-lane kernel's sums with 32 lanes (C750): mul_mat_vec_bf16_pascal<128, R', T'>'s bits for every output, for any
-// R' and T', with the loads of mul_mat_vec_bf16_pascal<32, R, T>. Lane j of a 32-lane group takes the 32-lane kernel's
-// chunks j, j + 32, j + 64, ...; its n-th chunk, j + 32 n, is chunk n / 4 of the 128-lane kernel's lane j + 32 (n % 4),
-// so it keeps four accumulators per output, acc[v] for lane j + 32 v, and adds each chunk to acc[n % 4] with the same
-// FMAs. Each acc[v] is then reduced over the warp with the 128-lane kernel's butterfly within its warp v, and the four
-// sums are added 0 + 1 + 2 + 3, as there warp 0 adds warps 1, 2 and 3. 4 T R accumulators a lane, 4 times the
-// butterflies of the 32-lane kernel; no shared memory. fault (checks only, GGML_CUDA_MMVF_PASCAL_EXACT_FAULT=1) leaves
-// acc[3] out of the sum, a quarter of the terms, which every check of the product must catch.
+// The 128-lane kernel's sums with 32 lanes (C750, GGML_CUDA_MMVF_PASCAL_EXACT=1): mul_mat_vec_bf16_pascal<128, R', T'>'s
+// bits for every output, for any R' and T', with the loads of mul_mat_vec_bf16_pascal<32, R, T>. The 128-lane kernel's lane
+// j + 32 v (warp v, v = 0..3) adds the chunks j + 32 v, j + 32 v + 128, ...; lane j of a 32-lane group here runs those
+// four chains one after another, in pass v with one accumulator per output and the same FMAs. At the end of pass v the
+// warp's butterfly gives warp v's sum, and the running sum takes it: s = S0, then s += S1, s += S2, s += S3, as there warp
+// 0 adds warps 1, 2 and 3. Each chunk is loaded once, by lane j as in the 32-lane kernel, in four passes of stride 128
+// instead of one of stride 32; 2 T R sums a lane (T R accumulators and T R running sums), 4 times the butterflies of the
+// 32-lane kernel, no shared memory. fault (checks only, GGML_CUDA_MMVF_PASCAL_EXACT_FAULT=1) leaves S3 out, a quarter of
+// the terms, which every check of the product must catch.
+template <int R, int T, bool fault>
+MMVF_PASCAL_X4_BOUNDS
+static __global__ void mul_mat_vec_bf16_pascal_x4p(
+        const uint4 * __restrict__ x, const float4 * __restrict__ y, float * __restrict__ dst,
+        const int nrows, const int nchunks, const int stride_row, const int stride_col_y4, const int stride_col_dst) {
+    constexpr int warp = 32;
+    constexpr int V    = 4; // the 128-lane kernel's warps
+
+    const int tid  = threadIdx.x;
+    const int lg   = tid % warp;
+    const int row0 = (blockIdx.x * (MMVF_PASCAL_NT / warp) + tid / warp) * R;
+
+    float sum[T][R];
+#pragma unroll
+    for (int v = 0; v < V; ++v) {
+        const uint4 * xr[R];
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            xr[i] = x + (int64_t) min(row0 + i, nrows - 1) * stride_row + v * warp + lg;
+        }
+        const float4 * yp = y + 2 * (v * warp + lg);
+
+        float acc[T][R];
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                acc[t][i] = 0.0f;
+            }
+        }
+
+#pragma unroll 2
+        for (int c = v * warp + lg; c < nchunks; c += V * warp) {
+            uint4 w[R];
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                w[i] = __ldg(xr[i]);
+                xr[i] += V * warp;
+            }
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                const float4 a = __ldg(yp + t * stride_col_y4);
+                const float4 b = __ldg(yp + t * stride_col_y4 + 1);
+#pragma unroll
+                for (int i = 0; i < R; ++i) {
+                    acc[t][i] = mmvfp_dot8(w[i], a, b, acc[t][i]);
+                }
+            }
+            yp += 2 * V * warp;
+        }
+
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+#pragma unroll
+                for (int off = warp / 2; off > 0; off >>= 1) {
+                    acc[t][i] += __shfl_xor_sync(0xFFFFFFFF, acc[t][i], off, warp);
+                }
+                if (v == 0) {
+                    sum[t][i] = acc[t][i];
+                } else if (!fault || v < V - 1) {
+                    sum[t][i] += acc[t][i];
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            const int row = row0 + i;
+            if ((t * R + i) % warp != lg || row >= nrows) {
+                continue;
+            }
+            dst[t * stride_col_dst + row] = sum[t][i];
+        }
+    }
+}
+
+// The same sums with the four chains interleaved (GGML_CUDA_MMVF_PASCAL_EXACT=2): lane j takes the 32-lane kernel's chunks
+// j, j + 32, j + 64, ... in that order; its n-th chunk, j + 32 n, is chunk n / 4 of the 128-lane kernel's lane j + 32 (n % 4),
+// so it keeps four accumulators per output, acc[v] for lane j + 32 v, and adds each chunk to acc[n % 4]. Each acc[v] then
+// goes through the butterfly, and the four sums are added 0 + 1 + 2 + 3. 4 T R accumulators a lane: at the 128 registers
+// of MMVF_PASCAL_X4_MIN_BLOCKS=4 the compiler keeps some on the stack. fault leaves acc[3] out.
 template <int R, int T, bool fault>
 MMVF_PASCAL_X4_BOUNDS
 static __global__ void mul_mat_vec_bf16_pascal_x4(
