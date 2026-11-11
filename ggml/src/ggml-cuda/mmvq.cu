@@ -4,6 +4,7 @@
 #include "mmvq-pascal-mtok.cuh"
 #include "mmvq-pascal-q5k.cuh"
 #include "mmvq-pascal-dmt.cuh"
+#include "mmvq-pascal-q3kmt.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1760,6 +1761,12 @@ void ggml_cuda_mul_mat_vec_q(
     // of a verify), the same way
     if (!ids && !fusion && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmvq_pascal_dmt(src0->type, src0->data, src1_q8, dst_d, ne00, ne01, ne11, nb01, s11, s1, stream)) {
+        return;
+    }
+    // ... and 2 to 8 tokens of a plain Q3_K product with GGML_CUDA_MMVQ_PASCAL_Q3K_MT, each token's sums those of the
+    // k-column kernel at one token (Q3_K's one-token kernel)
+    if (!ids && !fusion && src0->type == GGML_TYPE_Q3_K && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_cuda_mmvq_pascal_q3kmt(src0->data, src1_q8, dst_d, ne00, ne01, ne11, nb01, s11, s1, stream)) {
         return;
     }
 

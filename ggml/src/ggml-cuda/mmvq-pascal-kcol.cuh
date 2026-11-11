@@ -29,6 +29,11 @@
 bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                 ggml_tensor * dst);
 
+// Whether the k-column kernels are on for weights of type (GGML_CUDA_MMVQ_PASCAL_KCOL not 0, the type one of theirs and
+// not in GGML_CUDA_MMVQ_PASCAL_KCOL_SKIP); the caller checks GGML_CUDA_MMVQ_PASCAL. For kernels that keep their sums
+// (mmvq-pascal-q3kmt.cu: Q3_K's one-token kernel is the k-column kernel).
+bool ggml_cuda_mmvq_pascal_kcol_on(ggml_type type);
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 namespace kcol { struct params; }
 

@@ -2,6 +2,7 @@
 #include "mmvq-pascal.cuh"
 #include "mmvq-pascal-q5k.cuh"
 #include "mmvq-pascal-dmt.cuh"
+#include "mmvq-pascal-q3kmt.cuh"
 
 #include <algorithm>
 #include <climits>
@@ -188,6 +189,10 @@ static int kcol_smem_sm(const int dev) {
 
 } // namespace
 
+bool ggml_cuda_mmvq_pascal_kcol_on(const ggml_type type) {
+    return kcol_mode() != 0 && kcol_type(type) >= 0 && !kcol_skip_type(type);
+}
+
 bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                 ggml_tensor * dst) {
     const int mode = kcol_mode();
@@ -224,6 +229,11 @@ bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tens
     }
     // GGML_CUDA_MMVQ_PASCAL_DMT: IQ4_XS's and Q4_K's products of 2 to 4 columns go to mmvq-pascal-dmt.cu (the same)
     if (ggml_cuda_mmvq_pascal_dmt_takes(src0->type, K, nrows, ncols, src0->nb[1], src0->data)) {
+        return false;
+    }
+    // GGML_CUDA_MMVQ_PASCAL_Q3K_MT: Q3_K's products of 2 to 8 columns go to mmvq-pascal-q3kmt.cu (each token's sums those
+    // of this kernel at one column)
+    if (src0->type == GGML_TYPE_Q3_K && ggml_cuda_mmvq_pascal_q3kmt_takes(K, nrows, ncols, src0->nb[1], src0->data)) {
         return false;
     }
     if (ncols == 1 && mode == 1) {
@@ -291,6 +301,11 @@ bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tens
 }
 
 #else
+
+bool ggml_cuda_mmvq_pascal_kcol_on(const ggml_type type) {
+    GGML_UNUSED(type);
+    return false;
+}
 
 bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                 ggml_tensor * dst) {
