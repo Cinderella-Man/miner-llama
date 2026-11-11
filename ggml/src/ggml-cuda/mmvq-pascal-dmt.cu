@@ -108,7 +108,6 @@ struct dmt_args {
     int          stage_off;     // bytes from the start of shared memory to the warps' staging buffers
     int          wstage;        // bytes of a warp's staging buffer
     int          gstride;       // bytes between two lane groups' segments in it (dmt_gstride)
-    int          fault;         // Q6_K: GGML_CUDA_MMVQ_PASCAL_Q6K_MT_FAULT (checks only)
 };
 
 // Words per super-block position of the staged activations: NT tokens x 8 sub-blocks of 8 int8 words, and of the terms
@@ -140,12 +139,7 @@ static __device__ __forceinline__ void dmt_stage_act(const dmt_args & p, uint32_
     for (int e = threadIdx.y * WARP_SIZE + threadIdx.x; e < NT * nab; e += nth) {
         const int j = e / nab;
         const int b = e - j * nab;
-        int jy = j;
-        if constexpr (type == GGML_TYPE_Q6_K) {
-            // the fault of the checks: each token takes the next token's activations
-            jy = p.fault ? (j + 1 < NT ? j + 1 : 0) : j;
-        }
-        const uint32_t * src = (const uint32_t *) (p.vy + jy * p.col_bytes_y + b * (int) sizeof(block_q8_1));
+        const uint32_t * src = (const uint32_t *) (p.vy + j * p.col_bytes_y + b * (int) sizeof(block_q8_1));
         uint32_t w[9];
 #pragma unroll
         for (int k = 0; k < 9; ++k) {
@@ -660,7 +654,7 @@ static int dmt_type_mode(const ggml_type type) {
     return type == GGML_TYPE_Q6_K ? dmt_q6k_mode() : dmt_mode();
 }
 
-// GGML_CUDA_MMVQ_PASCAL_Q6K_MT_FAULT=1, for the checks: each token of a Q6_K product takes the next token's activations
+// GGML_CUDA_MMVQ_PASCAL_Q6K_MT_FAULT=1, for the checks: every token of a Q6_K product stages the first token's activations
 static bool dmt_q6k_fault() {
     static const bool fault = dmt_env("GGML_CUDA_MMVQ_PASCAL_Q6K_MT_FAULT", 0) == 1;
     return fault;
@@ -783,11 +777,15 @@ static int dmt_pick_r(const ggml_type type, const int nt, const int nsb) {
 // 94.00 and 95.42 against 75.74 and 75.90, 10240 rows 153.56 and 151.83 against 117.74 and 118.73, 12288 rows 180.54 and
 // 180.89 against 135.00 and 136.04; at 3 and 4 tokens, at K = 6144 and at R = 2 it is faster, at Q4_K's 2 tokens at
 // K = 2560 within the spread). So since C758; GGML_CUDA_MMVQ_PASCAL_DMT_PF=1 keeps it there too, as C722 did. Q6_K's
-// products: with GGML_CUDA_MMVQ_PASCAL_Q6K_MT=1 always, =2 never.
+// products: with GGML_CUDA_MMVQ_PASCAL_Q6K_MT=1 at R = 1 (at R = 2 the two rows' prefetched segments pass the registers:
+// 255 and 24 bytes of stack at 4 tokens), =2 never.
 static bool dmt_pick_pf(const ggml_type type, const int nt, const int nsb, const int r) {
     static const bool pf_all = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_PF", 0) == 1;
     if (dmt_type_mode(type) == 2) {
         return false;
+    }
+    if (type == GGML_TYPE_Q6_K) {
+        return r == 1;
     }
     return pf_all || r != 1 || type != GGML_TYPE_IQ4_XS || nt != 2 || nsb != 10;
 }
@@ -795,7 +793,10 @@ static bool dmt_pick_pf(const ggml_type type, const int nt, const int nsb, const
 template <ggml_type type, int NT, int R>
 static void dmt_launch(const dmt_args & p, const dim3 grid, const dim3 block, const int smem, const bool pf,
                        cudaStream_t stream) {
-    if (pf) {
+    if constexpr (type == GGML_TYPE_Q6_K && R == 2) {
+        GGML_UNUSED(pf); // dmt_pick_pf: never
+        mul_mat_vec_q_pascal_dmt<type, NT, R, false><<<grid, block, smem, stream>>>(p);
+    } else if (pf) {
         mul_mat_vec_q_pascal_dmt<type, NT, R, true><<<grid, block, smem, stream>>>(p);
     } else {
         mul_mat_vec_q_pascal_dmt<type, NT, R, false><<<grid, block, smem, stream>>>(p);
@@ -872,14 +873,13 @@ bool ggml_cuda_mmvq_pascal_dmt(const ggml_type type, const void * vx, const void
     const int rpw    = (WARP_SIZE >> p.lpr_log2) * r; // rows per warp row block
     p.nwrb           = (int) ((nrows + rpw - 1) / rpw);
     p.seg_units      = (dmt_sb(type) << p.lpr_log2) / 16;
-    p.col_bytes_y    = (int) col_bytes_y;
+    p.col_bytes_y    = type == GGML_TYPE_Q6_K && dmt_q6k_fault() ? 0 : (int) col_bytes_y; // the fault: token 0's, for all
     p.stride_col_dst = (int) stride_col_dst;
     p.ds_off         = nsb * (64 * nt + 4);
     const int act    = dmt_act_bytes(type, nt, nsb);
     p.stage_off      = act;
     p.wstage         = dmt_wstage(type, r, p.lpr_log2);
     p.gstride        = dmt_gstride(dmt_sb(type), r, p.lpr_log2);
-    p.fault          = type == GGML_TYPE_Q6_K && dmt_q6k_fault();
     const int smem   = act + nw * p.wstage + dmt_tail(type);
 
     // a persistent grid: as many blocks as the SMs hold at once by shared memory and threads (the launch bounds keep the

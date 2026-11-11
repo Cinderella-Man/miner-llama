@@ -19,11 +19,12 @@
 // 1 to 3 at R = 2; fewer where the block's shared memory would pass 48 KB). GGML_CUDA_MMVQ_PASCAL_DMT_SKIP=q4_K: types
 // left to the k-column kernel. The kernels follow GGML_CUDA_MMVQ_PASCAL (0 off, 2 any NVIDIA GPU) and
 // GGML_CUDA_MMVQ_PASCAL_SKIP, as the one-token kernel does.
-// GGML_CUDA_MMVQ_PASCAL_Q6K_MT: Q6_K's products, apart from _DMT: 0 (default) off; 1 on, with the prefetch; 2 on without
-// it. They follow _DMT_R, _DMT_NW and _DMT_SKIP (q6_K) as the other types do, take rows of a multiple of 8 super-blocks
-// (K = 2048, 4096, 6144, ...; at K = 2560 the 2-byte-aligned segments of 2 lanes per row are left to the k-column
-// kernel), and leave products of one warp a block to the k-column kernel unless _DMT_NW=1.
-// GGML_CUDA_MMVQ_PASCAL_Q6K_MT_FAULT=1 (checks only): each token of those products takes the next token's activations.
+// GGML_CUDA_MMVQ_PASCAL_Q6K_MT: Q6_K's products, apart from _DMT: 0 (default) off; 1 on, with the prefetch at R = 1; 2 on
+// without it. They follow _DMT_R, _DMT_NW and _DMT_SKIP (q6_K) as the other types do, take rows of a multiple of 8
+// super-blocks (K = 2048, 4096, 6144, ...; at K = 2560 the 2-byte-aligned segments of 2 lanes per row are left to the
+// k-column kernel), and leave products of one warp a block to the k-column kernel unless _DMT_NW=1.
+// GGML_CUDA_MMVQ_PASCAL_Q6K_MT_FAULT=1 (checks only): every token of those products stages the first token's
+// activations.
 
 // Whether ggml_cuda_mmvq_pascal_dmt takes a product of ncols columns of a matrix of type with K weights per row, nrows
 // rows row_bytes apart from x, on the current device (the k-column kernels leave such products to it).
