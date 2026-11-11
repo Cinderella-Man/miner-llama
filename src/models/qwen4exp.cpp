@@ -1464,6 +1464,16 @@ void llama_model_qwen4exp::graph::build_qsa_kv(
 
     GGML_ASSERT(hparams.dsv4_compress_ratios[il] == kpool);
 
+    // the device's copy of the k-pool tables takes this graph's update as in build_qsa_sel, though no op here reads it:
+    // a graph that left it out would make the next ubatch rewrite every row (C748); the small inputs come from the same
+    // stage with LLAMA_QSA_KPOOL_STAGE, so the pass uploads one copy
+    if (inp_kpool->dev) {
+        ggml_tensor * pool_cells = nullptr;
+        ggml_tensor * pool_idxs  = nullptr;
+        build_kpool_dev(mctx_hyb, inp_kpool, il, &pool_cells, &pool_idxs);
+    }
+    const kpool_small ks = build_kpool_small(mctx_hyb, inp_kpool, il);
+
     // the ops of build_qsa_sel up to its scatter, in its order: the raw keys into the cache rows, then the blocks this
     // ubatch completes or regroups pooled from those rows into their slots
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
@@ -1471,11 +1481,11 @@ void llama_model_qwen4exp::graph::build_qsa_kv(
 
     ggml_tensor * pzero  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, idx_dim, n_tokens), 0.0f);
     ggml_tensor * packed = ggml_reshape_3d(ctx0, ggml_concat(ctx0, k_raw, pzero, 0), 2*idx_dim, 1, n_tokens);
-    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, packed, inp_kpool->k_idxs, il));
+    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, packed, ks.k_idxs, il));
 
     auto kpool_cache = mctx_hyb->get_kpool_access(ctx0, il, idx_dim);
 
-    ggml_tensor * rows = kpool_cache.gather_key_gate(inp_kpool->new_pool_flat);
+    ggml_tensor * rows = kpool_cache.gather_key_gate(ks.new_pool_flat);
     rows = ggml_reshape_3d(ctx0, rows, idx_dim, kpool, n_new);
 
     ggml_tensor * pooled_new = nullptr;
@@ -1487,11 +1497,11 @@ void llama_model_qwen4exp::graph::build_qsa_kv(
     pooled_new = build_norm(pooled_new, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
 
     pooled_new = ggml_reshape_3d(ctx0, pooled_new, idx_dim, 1, n_new);
-    pooled_new = build_rope(pooled_new, inp_kpool->new_pool_pos, il);
+    pooled_new = build_rope(pooled_new, ks.new_pool_pos, il);
     pooled_new = ggml_reshape_2d(ctx0, pooled_new, idx_dim, n_new);
     cb(pooled_new, "indexer_pool_k_new", il);
 
-    ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
+    ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, ks.new_pool_rep));
 }
 
 void llama_model_qwen4exp::graph::build_layer_attn_kv(

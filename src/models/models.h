@@ -2802,7 +2802,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inp_pos,
                             int   il);
 
-        // QSA: the cache writes of build_qsa_sel alone (the raw indexer keys and the fresh pooled keys)
+        // QSA: the cache writes of build_qsa_sel alone (the raw indexer keys and the fresh pooled keys), and with
+        // LLAMA_QSA_KPOOL_DEV its update of the device's k-pool tables (C748)
         void build_qsa_kv(
   const llama_memory_hybrid_idx_context * mctx_hyb,
           llm_graph_input_kpool * inp_kpool,
