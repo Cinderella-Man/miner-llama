@@ -1641,6 +1641,47 @@ struct llama_sampler * llama_sampler_init_top_k(int32_t k) {
     );
 }
 
+int32_t llama_sampler_chain_backend_top_k(const llama_sampler * sampler, size_t * i_next) {
+    GGML_ASSERT(sampler != nullptr && sampler->iface == &llama_sampler_chain_i);
+
+    const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+    GGML_ASSERT(chain->is_init);
+
+    // the empty samplers (a penalty, DRY or top-n-sigma that does nothing) add nothing to the graph
+    for (size_t i = 0; i < chain->samplers.size() && chain->samplers[i].is_backend; ++i) {
+        const llama_sampler * smpl = chain->samplers[i].ptr;
+        if (smpl->iface == &llama_sampler_empty_i || smpl->iface->backend_apply == nullptr) {
+            continue;
+        }
+        if (smpl->iface != &llama_sampler_top_k_i) {
+            return 0;
+        }
+        *i_next = i + 1;
+        return ((const llama_sampler_top_k *) smpl->ctx)->k;
+    }
+
+    return 0;
+}
+
+void llama_sampler_chain_backend_apply_from(
+        llama_sampler * sampler, ggml_context * ctx, ggml_cgraph * gf, llama_sampler_data * data, size_t i_first) {
+    GGML_ASSERT(sampler != nullptr && sampler->iface == &llama_sampler_chain_i);
+
+    auto * chain = (llama_sampler_chain *) sampler->ctx;
+    GGML_ASSERT(chain->is_init && "llama_sampler_chain_backend_init() not called");
+
+    for (size_t i = i_first; i < chain->samplers.size(); ++i) {
+        auto & smpl = chain->samplers[i];
+        if (!smpl.is_backend) {
+            break;
+        }
+
+        if (smpl.ptr->iface->backend_apply) {
+            smpl.ptr->iface->backend_apply(smpl.ptr, ctx, gf, data);
+        }
+    }
+}
+
 // top-p
 
 struct llama_sampler_top_p : public llama_sampler_backend {

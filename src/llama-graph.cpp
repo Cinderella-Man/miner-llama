@@ -5296,8 +5296,42 @@ void llm_graph_context::build_sampling() const {
     // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
 
+    // C691 (LLAMA_SAMPLING_TOP_K_ROWS=1): when every chain starts with a top-k on the backend, the top-k of all the rows
+    // in one op per k and one gather of their logits replace each chain's own top-k and gather, and each chain starts
+    // after its top-k with its row of the two. Each row's top-k is the op's per-row result, the same candidates and logits
+    // as the chain's own top-k of that row. Nothing after a top-k writes to the logits, so the chains need no padded copy:
+    // the padding row stays only for a ubatch without outputs
+    std::map<int32_t, std::pair<ggml_tensor *, ggml_tensor *>> top_k_rows; // k: candidates [k, rows], logits [1, k, rows]
+    std::map<llama_seq_id, std::pair<int32_t, size_t>> top_k_seq;          // the chain's k, its sampler after the top-k
+    if (cparams.sampling_top_k_rows && res->t_logits->type == GGML_TYPE_F32 && ggml_is_contiguous(res->t_logits)) {
+        for (const auto & [seq_id, sampler] : samplers) {
+            size_t i_next = 0;
+            const int32_t k = llama_sampler_chain_backend_top_k(sampler, &i_next);
+            if (k <= 0 || k > res->t_logits->ne[0]) {
+                top_k_rows.clear();
+                break;
+            }
+            top_k_rows[k] = { nullptr, nullptr };
+            top_k_seq[seq_id] = { k, i_next };
+        }
+    }
+
     // the padding row gives the chains without a row of the ubatch a valid input, even with no output at all
-    ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    ggml_tensor * logits_t = !top_k_rows.empty() && res->t_logits->ne[1] > 0 ? res->t_logits :
+        ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+
+    for (auto & [k, out] : top_k_rows) {
+        out.first = ggml_top_k(ctx0, logits_t, k);
+        ggml_set_name(out.first, "top_k");
+
+        ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, logits_t, 1, logits_t->ne[0], logits_t->ne[1]);
+        out.second = ggml_get_rows(ctx0, logits_rows, out.first);
+        ggml_set_name(out.second, "top_k_rows");
+
+        // a chain's candidates or logits may stay a view of these to its end, and be read as its outputs
+        ggml_set_output(out.first);
+        ggml_set_output(out.second);
+    }
 
     for (const auto & entry : samplers) {
         if (entry.second->iface->backend_reset) {
@@ -5318,18 +5352,33 @@ void llm_graph_context::build_sampling() const {
             const uint32_t row    = active ? rows[i] : 0;
             const int      i_out  = active ? 1       : 0;
 
-            ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row * logits_t->nb[1]);
-            ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
-
             struct llama_sampler_data data = {
-                /*.logits       =*/ logits_seq,
+                /*.logits       =*/ nullptr,
                 /*.probs        =*/ nullptr,
                 /*.sampled      =*/ nullptr,
                 /*.candidates   =*/ nullptr,
             };
 
-            assert(sampler->iface->backend_apply);
-            sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            if (!top_k_rows.empty()) {
+                // the chain's row of the candidates [k] and the logits [1, k], as its own top-k leaves them
+                const auto [k, i_next] = top_k_seq.at(seq_id);
+                const auto & [cand, logits] = top_k_rows.at(k);
+
+                data.candidates = ggml_view_1d(ctx0, cand, cand->ne[0], row * cand->nb[1]);
+                data.logits     = ggml_view_2d(ctx0, logits, 1, logits->ne[1], logits->nb[1], row * logits->nb[2]);
+                ggml_format_name(data.candidates, "top_k_%d_%u",      seq_id, i);
+                ggml_format_name(data.logits,     "top_k_rows_%d_%u", seq_id, i);
+
+                llama_sampler_chain_backend_apply_from(sampler, ctx0, gf, &data, i_next);
+            } else {
+                ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row * logits_t->nb[1]);
+                ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
+
+                data.logits = logits_seq;
+
+                assert(sampler->iface->backend_apply);
+                sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            }
 
             if (data.sampled != nullptr) {
                 if (active) {

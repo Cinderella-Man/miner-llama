@@ -8853,6 +8853,88 @@ struct test_top_k_inf : public test_top_k {
     }
 };
 
+// the backend samplers' top-k of all output rows in one op (C691, LLAMA_SAMPLING_TOP_K_ROWS) against the top-k of each
+// row on its own, on the tested backend: the output is each row's sorted indices of the one op minus the row's own
+// sorted indices, all zero when every row picks the same columns (with ties, the same tied columns). The reference is
+// zero too, so any difference fails the case
+struct test_top_k_rows : public test_case {
+    const std::array<int64_t, 2> ne; // {n_vocab, n_rows}
+    const int k;
+    const bool ties;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TOP_K_ROWS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, k, ties);
+    }
+
+    test_top_k_rows(std::array<int64_t, 2> ne = {248320, 4}, int k = 20, bool ties = false)
+        : ne(ne), k(k), ties(ties) {}
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            diff += std::fabs(a[i] - b[i]);
+        }
+        return diff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_set_name(a, "a");
+
+        // the indices of each row in ascending order, as F32 [1, k, rows]
+        auto sorted = [&](ggml_tensor * idx) {
+            ggml_tensor * f     = ggml_cast(ctx, idx, GGML_TYPE_F32);
+            ggml_tensor * order = ggml_argsort(ctx, f, GGML_SORT_ORDER_ASC);
+            return ggml_get_rows(ctx, ggml_reshape_3d(ctx, f, 1, f->ne[0], f->ne[1]), order);
+        };
+
+        ggml_tensor * all = sorted(ggml_top_k(ctx, a, k));
+        ggml_set_name(all, "all");
+
+        ggml_tensor * each = nullptr;
+        for (int64_t r = 0; r < ne[1]; r++) {
+            ggml_tensor * row = ggml_view_2d(ctx, a, ne[0], 1, a->nb[1], r*a->nb[1]);
+            ggml_tensor * s   = sorted(ggml_top_k(ctx, row, k));
+            each = each ? ggml_concat(ctx, each, s, 2) : s;
+        }
+        ggml_set_name(each, "each");
+
+        ggml_tensor * out = ggml_sub(ctx, all, each);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    // logits-like rows: distinct values of both signs, or (ties) runs of seven equal values, so that a run straddles the
+    // k-th place for k = 20 and 40 and the op must choose among tied columns
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<float> data(t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0]; i++) {
+                    const int64_t v = ties ? i / 7 : i;
+                    data[i] = (float) (v - t->ne[0]/2) * (1.0f/1024);
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+            }
+        }
+    }
+};
+
 // qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
 struct test_topk_qsa : public test_case {
     const int64_t n_blocks;
@@ -14778,6 +14860,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k_inf({4096, 2, 1, 1}, k));
         test_cases.emplace_back(new test_top_k_inf({248320, 1, 1, 1}, k));
     }
+    // the backend samplers' top-k of a verify pass's output rows in one op (C691): Flash-Next's and Flint's vocabularies,
+    // one to eight rows (the preset's four, more for several sequences), the presets' k and others, against the CPU and,
+    // as TOP_K_ROWS, against each row's own top-k on the tested backend
+    for (int64_t n_vocab : {248320, 151936}) {
+        for (int64_t n_rows : {1, 2, 3, 4, 5, 8}) {
+            for (int k : {1, 20, 40}) {
+                test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n_vocab, n_rows, 1, 1}, k));
+                test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n_vocab, n_rows, 1, 1}, k, true));
+                test_cases.emplace_back(new test_top_k_rows({n_vocab, n_rows}, k, false));
+                test_cases.emplace_back(new test_top_k_rows({n_vocab, n_rows}, k, true));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_top_k_rows({248320, 4}, 512, false));
+    test_cases.emplace_back(new test_top_k_rows({248320, 4}, 512, true));
+    // at 4,096 columns CUDA takes the top-k of one row by a sort and of several by the radix select: the same columns
+    // where the values are distinct (with ties at the k-th place the two may choose different tied columns)
+    test_cases.emplace_back(new test_top_k_rows({4096, 4}, 20, false));
     // a selection of the indexer of sparse attention, with more ties at the threshold than slots
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {1088, 2048, 1, 1}, 512, true));
 
@@ -16425,6 +16525,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (auto k : {20, 40}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {151936, 1, 1, 1}, k));
     }
+    // and a verify pass's rows of Flash-Next's vocab, one op for one to four rows (C691): four one-row ops against one
+    // four-row op; the padded copy of the four rows of logits the chains read without the switch
+    for (auto nrows : {1, 2, 4}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, nrows, 1, 1}, 20));
+    }
+    test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {248320, 4, 1, 1}, 0, 1));
 
     // short rows, many of them: MoE routing and group selection. The opposite corner from
     // the indexer, and the one where a work-group per row is the wasteful choice.
