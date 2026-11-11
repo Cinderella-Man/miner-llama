@@ -188,6 +188,22 @@ public:
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
 
+    // LLAMA_KV_SEQ_RM_BOUND=1 (C740, off by default; read when the cache is created): seq_rm visits only the cells it
+    // can change instead of every cell of the stream. For one sequence, the cells of its (pos, cell) index in [p0, p1),
+    // in cell order (sorted when a removal and a refill left them out of order; past 64 such cells, the used range
+    // instead); for every sequence (seq_id < 0), the cells from the first used one to the last. Each is visited by the
+    // same steps in the same order as without the switch, so the cells, head, the cells changed for the device copies
+    // and every table built from them are the same
+    bool get_seq_rm_bound() const { return seq_rm_bound; }
+
+    // with the switch on, since the cache was created: calls for one sequence, of them sorted, of them that scanned
+    // the used range, calls for every sequence, cells visited
+    void seq_rm_stats(uint64_t * out) const;
+
+    // appends the host state of the cache to out as raw bytes (each stream's head and cells, the device copies' change
+    // list), so that two caches in the same state give the same bytes; for tests (llama_memory_debug_state)
+    void debug_state(std::string & out) const;
+
     //
     // graph_build API
     //
@@ -401,6 +417,16 @@ private:
     bool kq_cells_track = true;
 
     void kq_cells_mark(uint32_t strm, uint32_t idx);
+
+    // LLAMA_KV_SEQ_RM_BOUND (see get_seq_rm_bound): the switch, the cells of one call and the counts of seq_rm_stats
+    bool seq_rm_bound  = false;
+    bool seq_rm_nosort = false; // LLAMA_KV_SEQ_RM_BOUND=2, a test hook: the cells in position order, unsorted
+    std::vector<uint32_t> seq_rm_idxs;
+    uint64_t seq_rm_n_seq    = 0;
+    uint64_t seq_rm_n_sorted = 0;
+    uint64_t seq_rm_n_scan   = 0;
+    uint64_t seq_rm_n_any    = 0;
+    uint64_t seq_rm_n_cells  = 0;
 
     std::vector<kv_layer> layers;
 

@@ -10,6 +10,7 @@
 #include "../src/llama-ext.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
@@ -183,6 +184,8 @@ static void usage(char ** argv) {
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
     LOG("  --mtp-kv-only            Check that LLAMA_MTP_KV_ONLY leaves the MTP draft's caches and drafts as they are (CPU only)\n");
     LOG("  --mtp-catchup-overlap    Check that LLAMA_MTP_CATCHUP_OVERLAP leaves the MTP draft's caches and drafts as they are (CPU only)\n");
+    LOG("  --kv-seq-rm              Check that LLAMA_KV_SEQ_RM_BOUND leaves every memory as it is over random sequence edits (CPU only)\n");
+    LOG("  --kv-seq-rm-time         Time one seq_rm call without and with LLAMA_KV_SEQ_RM_BOUND at 65,536 cells (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -2690,6 +2693,535 @@ static int test_mtp_catchup_overlap(const std::string & arch_filter, const size_
     return n_failed == 0 ? 0 : 1;
 }
 
+// --kv-seq-rm (C740): LLAMA_KV_SEQ_RM_BOUND=1 must leave every memory as it is without the switch. Two contexts of one
+// model, the switch off and on (each reads it when its caches are created), take the same random sequence of decodes and
+// memory edits: a speculative step's tail rollback after a decode, the server's checkpoint restore (models with a
+// recurrent memory), the removal of a range, of a whole sequence or of a range of every sequence, whole-sequence copies,
+// keeps and shifts. After every edit the return values and llama_memory_debug_state (each KV cache's heads, cells,
+// per-sequence indexes and the cells changed for the device copies; a QSA memory's pool staleness, layout and k-pool
+// tables) must be the same bytes, every decode's logits too, and the whole state write every 25 edits and at the end
+// (after every edit where llama_memory_debug_state does not cover the memory)
+struct kv_seq_rm_config {
+    const char * name;
+    uint32_t     n_seq;
+    bool         unified;
+    uint32_t     n_cells; // per stream
+};
+
+// the context with the switch takes LLAMA_KV_SEQ_RM_BOUND=1, or LLAMA_ARCHS_SEQ_RM_BOUND_ON's value (2: the switch's test
+// hook that leaves the cells unsorted, which the check must catch)
+static llama_context_ptr kv_seq_rm_ctx(llama_model * model, uint32_t n_ctx, uint32_t n_seq, bool unified, uint32_t n_batch, bool bound) {
+    const char * value_on = getenv("LLAMA_ARCHS_SEQ_RM_BOUND_ON");
+    test_setenv("LLAMA_KV_SEQ_RM_BOUND", bound ? (value_on ? value_on : "1") : nullptr);
+    llama_context_params p = llama_context_default_params();
+    p.n_ctx           = n_ctx;
+    p.n_batch         = n_batch;
+    p.n_ubatch        = n_batch;
+    p.n_seq_max       = n_seq;
+    p.kv_unified      = unified;
+    p.n_threads       = 4;
+    p.n_threads_batch = 4;
+    // recurrent snapshots, so that a tail rollback of up to 4 tokens right after a decode applies (a speculative step's)
+    p.n_rs_seq        = 4;
+    llama_context_ptr ctx(llama_init_from_model(model, p));
+    test_setenv("LLAMA_KV_SEQ_RM_BOUND", nullptr);
+    return ctx;
+}
+
+// the tokens of each part (a sequence and its tokens) at the sequence's next positions, every token an output; returns
+// llama_process's code, and the logits when it is 0
+static int32_t kv_seq_rm_decode(llama_context * ctx, const std::vector<std::pair<llama_seq_id, std::vector<llama_token>>> & parts,
+        std::vector<float> & logits) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    common_batch batch(ctx);
+    for (const auto & part : parts) {
+        const llama_pos p0 = llama_memory_seq_pos_max(mem, part.first) + 1;
+        for (size_t i = 0; i < part.second.size(); i++) {
+            batch.add(part.second[i], p0 + (llama_pos) i, part.first, true);
+        }
+    }
+    const int32_t ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+    logits.clear();
+    if (ret == 0) {
+        for (int32_t i = 0; i < batch.size(); i++) {
+            const float * l = llama_get_logits_ith(ctx, i);
+            if (l == nullptr) {
+                // no logits (an embedding model): the decode is compared by its code alone
+                logits.clear();
+                return -100;
+            }
+            logits.insert(logits.end(), l, l + n_vocab);
+        }
+    }
+    return ret;
+}
+
+static std::vector<uint8_t> kv_seq_rm_state(llama_context * ctx) {
+    std::vector<uint8_t> buf(llama_state_get_size(ctx));
+    buf.resize(llama_state_get_data(ctx, buf.data(), buf.size()));
+    return buf;
+}
+
+static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    // small caches, so that removals and refills leave holes and sequences whose cells are out of position order
+    const kv_seq_rm_config configs[] = {
+        { "1 seq",   1, true,  256 },
+        { "4 seq",   4, true,  256 },
+        { "4 split", 4, false, 128 },
+    };
+    const int n_ops = 400;
+
+    enum op_kind { OP_DECODE, OP_ROLLBACK, OP_CKPT, OP_RANGE, OP_SEQ, OP_ANY, OP_ANY_ALL, OP_CP, OP_KEEP, OP_ADD, OP_COUNT };
+    const char * op_names[OP_COUNT] = { "decode", "rollback", "checkpoint", "range", "sequence", "any range", "everything", "copy", "keep", "shift" };
+
+    size_t max_arch_name_length = 0;
+    for (const llm_arch & arch : llama_arch_all()) {
+        max_arch_name_length = std::max(max_arch_name_length, strlen(llama_arch_name(arch)));
+    }
+    const std::string template_row = "|%" + std::to_string(max_arch_name_length) + "s|%6s|%8s|%6s|%8s|%8s|%40s|%s\n";
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    uint64_t total[5] = { 0, 0, 0, 0, 0 };
+    common_log_flush(common_log_main());
+    LOG(template_row.c_str(), "Model arch.", "Config", "Cache", "Edits", "Decodes", "Refused",
+        "seq_rm on: one seq/sorted/scan, any; cells", "Status");
+
+    uint32_t i_arch = 0;
+    for (const llm_arch & arch : llama_arch_all()) {
+        i_arch++;
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !arch_supported(arch)) {
+            continue;
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+            continue;
+        }
+        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
+        if (encode) {
+            continue;
+        }
+        for (bool moe : {false, true}) {
+            if (moe && !moe_implemented(arch)) {
+                continue;
+            }
+            if (!moe && moe_mandatory(arch)) {
+                continue;
+            }
+            const char * moe_name = moe ? "MoE" : "Dense";
+
+            llama_model_ptr model;
+            try {
+                gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+                model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+            } catch (const std::exception & err) {
+                LOG(template_row.c_str(), llama_arch_name(arch), moe_name, "", "", "", "", "", "\033[1;31mERROR\033[0m (model load)");
+                n_tests++;
+                n_failed++;
+                continue;
+            }
+            const uint32_t n_vocab   = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+            const bool     recurrent = llama_model_is_recurrent(model.get()) || llama_model_is_hybrid(model.get());
+
+            for (size_t i_cfg = 0; i_cfg < sizeof(configs)/sizeof(configs[0]); i_cfg++) {
+                const kv_seq_rm_config & cfg = configs[i_cfg];
+                const std::string config_name = std::string(moe_name) + " " + cfg.name;
+                const uint32_t n_ctx = cfg.unified ? cfg.n_cells : cfg.n_cells*cfg.n_seq;
+
+                ud.verbosity = LOG_LEVEL_OUTPUT;
+                llama_context_ptr off = kv_seq_rm_ctx(model.get(), n_ctx, cfg.n_seq, cfg.unified, 64, false);
+                llama_context_ptr on  = kv_seq_rm_ctx(model.get(), n_ctx, cfg.n_seq, cfg.unified, 64, true);
+                ud.verbosity = verbosity;
+                if (!off || !on) {
+                    LOG(template_row.c_str(), llama_arch_name(arch), config_name.c_str(), "", "", "", "", "", "\033[1;33mSKIP\033[0m (context)");
+                    continue;
+                }
+                llama_memory_t mem_off = llama_get_memory(off.get());
+                llama_memory_t mem_on  = llama_get_memory(on.get());
+                if (mem_off == nullptr || mem_on == nullptr) {
+                    LOG(template_row.c_str(), llama_arch_name(arch), config_name.c_str(), "", "", "", "", "", "\033[1;33mSKIP\033[0m (no memory)");
+                    continue;
+                }
+                // "kv" alone: no KV cache (a recurrent memory), which the state write covers
+                const bool covered   = llama_memory_debug_state(mem_off).size() > 2;
+                const bool can_shift = llama_memory_can_shift(mem_off);
+
+                std::vector<double> weights(OP_COUNT, 0.0);
+                weights[OP_DECODE]   = 36;
+                weights[OP_ROLLBACK] = 16;
+                weights[OP_CKPT]     = recurrent ? 6 : 0;
+                weights[OP_RANGE]    = 10;
+                weights[OP_SEQ]      = 6;
+                weights[OP_ANY]      = 4;
+                weights[OP_ANY_ALL]  = 1;
+                weights[OP_CP]       = cfg.n_seq > 1 ? 7 : 0;
+                weights[OP_KEEP]     = cfg.n_seq > 1 ? 2 : 0;
+                weights[OP_ADD]      = can_shift ? 6 : 0;
+                std::discrete_distribution<int> pick_op(weights.begin(), weights.end());
+
+                std::mt19937 rng((uint32_t) (seed*1000003u + i_arch*101u + (moe ? 53u : 0u) + i_cfg));
+                auto rnd = [&rng](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
+                auto pick_seq = [&]() { return (llama_seq_id) rnd(0, (int) cfg.n_seq - 1); };
+                auto toks = [&](int n) {
+                    std::vector<llama_token> t(n);
+                    for (auto & x : t) {
+                        x = rnd(0, (int) n_vocab - 1);
+                    }
+                    return t;
+                };
+
+                n_tests++;
+                std::string diff;
+                int n_edits = 0;
+                int n_decodes = 0;
+                int n_decode_fail = 0;
+                int n_refused = 0;
+                std::vector<int> n_kind(OP_COUNT, 0);
+
+                // the same call in both contexts: its results must agree
+                auto rm = [&](llama_seq_id s, llama_pos p0, llama_pos p1) {
+                    const bool a = llama_memory_seq_rm(mem_off, s, p0, p1);
+                    const bool b = llama_memory_seq_rm(mem_on,  s, p0, p1);
+                    if (a != b && diff.empty()) {
+                        diff = "seq_rm(" + std::to_string(s) + ", " + std::to_string(p0) + ", " + std::to_string(p1) + ") returned " +
+                            std::to_string(a) + " without the switch, " + std::to_string(b) + " with it";
+                    }
+                    n_refused += a ? 0 : 1;
+                    return a;
+                };
+                auto decode = [&](const std::vector<std::pair<llama_seq_id, std::vector<llama_token>>> & parts) {
+                    std::vector<float> la;
+                    std::vector<float> lb;
+                    const int32_t ra = kv_seq_rm_decode(off.get(), parts, la);
+                    const int32_t rb = kv_seq_rm_decode(on.get(),  parts, lb);
+                    n_decodes++;
+                    if (diff.empty()) {
+                        if (ra != rb) {
+                            diff = "decode returned " + std::to_string(ra) + " without the switch, " + std::to_string(rb) + " with it";
+                        } else if (la.size() != lb.size() || (!la.empty() && memcmp(la.data(), lb.data(), la.size()*sizeof(float)) != 0)) {
+                            diff = "the logits differ";
+                        }
+                    }
+                    if (ra != 0) {
+                        n_decode_fail++;
+                    }
+                    return ra;
+                };
+                auto check_state = [&](int op) {
+                    if (diff.empty() && kv_seq_rm_state(off.get()) != kv_seq_rm_state(on.get())) {
+                        diff = "edit " + std::to_string(op) + ": the state write differs";
+                    }
+                };
+
+                llama_seq_id last_s = -1; // the sequence of the last decode with one sequence, and its count
+                int          last_n = 0;
+
+                try {
+                    for (int op = 0; op < n_ops && diff.empty(); op++) {
+                        const int kind = pick_op(rng);
+                        n_kind[kind]++;
+                        const llama_seq_id s = pick_seq();
+                        const llama_pos pmax = llama_memory_seq_pos_max(mem_off, s);
+                        if (pmax != llama_memory_seq_pos_max(mem_on, s)) {
+                            diff = "sequence " + std::to_string(s) + "'s last position differs";
+                            break;
+                        }
+                        const llama_seq_id prev_s = last_s;
+                        last_s = -1;
+                        switch (kind) {
+                            case OP_DECODE: {
+                                const int n = rnd(1, 8);
+                                std::vector<std::pair<llama_seq_id, std::vector<llama_token>>> parts = { { s, toks(n) } };
+                                if (cfg.n_seq > 1 && rnd(0, 3) == 0) {
+                                    parts.push_back({ (llama_seq_id) ((s + rnd(1, (int) cfg.n_seq - 1)) % (int) cfg.n_seq), toks(rnd(1, 4)) });
+                                }
+                                if (decode(parts) != 0) {
+                                    // the cache is full: free a sequence
+                                    rm(pick_seq(), -1, -1);
+                                } else if (parts.size() == 1) {
+                                    last_s = s;
+                                    last_n = n;
+                                }
+                            } break;
+                            case OP_ROLLBACK: {
+                                // after a decode, 0 to 4 of its tokens, the drafted tokens a verify step rejected
+                                const llama_seq_id t = prev_s >= 0 ? prev_s : s;
+                                const int k = prev_s >= 0 ? rnd(0, std::min(last_n, 4)) : rnd(1, 4);
+                                rm(t, llama_memory_seq_pos_max(mem_off, t) + 1 - k, -1);
+                            } break;
+                            case OP_CKPT: {
+                                // the server's checkpoint for a memory that cannot remove a tail: saved, a verify batch,
+                                // restored, then the positions past it removed
+                                if (pmax < 0) {
+                                    break;
+                                }
+                                const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+                                std::vector<uint8_t> ca(llama_state_seq_get_size_ext(off.get(), s, fl));
+                                std::vector<uint8_t> cb(llama_state_seq_get_size_ext(on.get(),  s, fl));
+                                ca.resize(llama_state_seq_get_data_ext(off.get(), ca.data(), ca.size(), s, fl));
+                                cb.resize(llama_state_seq_get_data_ext(on.get(),  cb.data(), cb.size(), s, fl));
+                                if (ca != cb) {
+                                    diff = "the checkpoints differ";
+                                    break;
+                                }
+                                decode({ { s, toks(rnd(1, 4)) } });
+                                const size_t ra = llama_state_seq_set_data_ext(off.get(), ca.data(), ca.size(), s, fl);
+                                const size_t rb = llama_state_seq_set_data_ext(on.get(),  cb.data(), cb.size(), s, fl);
+                                if (ra != rb && diff.empty()) {
+                                    diff = "the checkpoints' restores differ";
+                                }
+                                rm(s, pmax + 1, -1);
+                            } break;
+                            case OP_RANGE: {
+                                const llama_pos p0 = rnd(0, std::max(pmax, 0) + 1);
+                                rm(s, p0, p0 + rnd(1, 24));
+                            } break;
+                            case OP_SEQ: {
+                                rm(s, -1, -1);
+                            } break;
+                            case OP_ANY: {
+                                const llama_pos p0 = rnd(0, std::max(pmax, 0) + 1);
+                                rm(-1, p0, p0 + rnd(1, 24));
+                            } break;
+                            case OP_ANY_ALL: {
+                                rm(-1, -1, -1);
+                            } break;
+                            case OP_CP: {
+                                // as the server copies a slot: the destination cleared, then the whole source copied
+                                const llama_seq_id dst = (llama_seq_id) ((s + rnd(1, (int) cfg.n_seq - 1)) % (int) cfg.n_seq);
+                                rm(dst, -1, -1);
+                                llama_memory_seq_cp(mem_off, s, dst, -1, -1);
+                                llama_memory_seq_cp(mem_on,  s, dst, -1, -1);
+                            } break;
+                            case OP_KEEP: {
+                                llama_memory_seq_keep(mem_off, s);
+                                llama_memory_seq_keep(mem_on,  s);
+                            } break;
+                            case OP_ADD: {
+                                if (pmax < 1) {
+                                    break;
+                                }
+                                const llama_pos p0   = rnd(0, pmax);
+                                const llama_pos dabs = rnd(1, 3);
+                                const llama_pos d    = rnd(0, 1) ? dabs : -dabs;
+                                llama_memory_seq_add(mem_off, s, p0, -1, d);
+                                llama_memory_seq_add(mem_on,  s, p0, -1, d);
+                            } break;
+                        }
+                        n_edits++;
+                        if (!diff.empty()) {
+                            diff = "edit " + std::to_string(op) + " (" + op_names[kind] + "): " + diff;
+                            break;
+                        }
+                        if (covered) {
+                            if (llama_memory_debug_state(mem_off) != llama_memory_debug_state(mem_on)) {
+                                diff = "edit " + std::to_string(op) + " (" + op_names[kind] + "): the memory's host state differs";
+                                break;
+                            }
+                        }
+                        if (!covered || op % 25 == 24) {
+                            check_state(op);
+                        }
+                    }
+                    check_state(n_ops);
+                } catch (const std::exception & err) {
+                    diff = std::string("exception: ") + err.what();
+                }
+
+                uint64_t st_off[5];
+                uint64_t st_on[5];
+                llama_memory_seq_rm_stats(mem_off, st_off);
+                llama_memory_seq_rm_stats(mem_on,  st_on);
+                if (diff.empty() && (st_off[0] || st_off[3] || st_off[4])) {
+                    diff = "the context without the switch took the bounded path";
+                }
+                for (int j = 0; j < 5; j++) {
+                    total[j] += st_on[j];
+                }
+                char stats[96];
+                snprintf(stats, sizeof(stats), "%" PRIu64 "/%" PRIu64 "/%" PRIu64 ", %" PRIu64 "; %" PRIu64,
+                    st_on[0], st_on[1], st_on[2], st_on[3], st_on[4]);
+                char decodes[32];
+                snprintf(decodes, sizeof(decodes), "%d (%d)", n_decodes, n_decode_fail);
+
+                std::string status;
+                if (diff.empty()) {
+                    status = "\033[1;32mOK\033[0m";
+                } else {
+                    n_failed++;
+                    status = "\033[1;31mFAIL\033[0m " + diff;
+                }
+                if (verbosity >= LOG_LEVEL_INFO) {
+                    for (int j = 0; j < OP_COUNT; j++) {
+                        status += std::string(" ") + op_names[j] + "=" + std::to_string(n_kind[j]);
+                    }
+                }
+                LOG(template_row.c_str(), llama_arch_name(arch), config_name.c_str(), covered ? "host" : "state",
+                    std::to_string(n_edits).c_str(), decodes, std::to_string(n_refused).c_str(), stats, status.c_str());
+            }
+        }
+    }
+
+    LOG("seq_rm with the switch, all tests: %" PRIu64 " calls for one sequence (%" PRIu64 " sorted, %" PRIu64
+        " scanned the used range), %" PRIu64 " for every sequence, %" PRIu64 " cells visited\n", total[0], total[1], total[2], total[3], total[4]);
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
+// --kv-seq-rm-time (C740): the host time of one llama_memory_seq_rm call without and with LLAMA_KV_SEQ_RM_BOUND, as the
+// server makes it after each speculative step, in a context of 65,536 cells holding n tokens of one sequence: the
+// call that removes nothing (every drafted token accepted) and the call that removes the 3 tokens decoded just before
+// it (all rejected). llama (one KV cache) and qwen4exp (the recurrent memory, the attention cache and the QSA indexer
+// cache, as Qwen3.8-Flash-Next's target). A diagnostic of the CPU it runs on
+static int test_kv_seq_rm_time(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    const uint32_t n_ctx = 65536;
+    // R86's requests: the greedy one from 79 to 335 tokens, the first turn of the agent check from 2,760 to 3,015; and
+    // one deeper point of an agent session
+    const uint32_t fills[] = { 79, 335, 2760, 3015, 16384 };
+    const int n_none  = 2000;
+    const int n_three = 200;
+    const uint32_t n_chunk = 512;
+
+    // the fixture's trained context, so that 65,536 cells are within it
+    test_setenv("LLAMA_ARCHS_N_CTX", "65536");
+
+    common_log_flush(common_log_main());
+    LOG("arch\tcells\tused\tcall\tcalls\toff_median_us\toff_mean_us\ton_median_us\ton_mean_us\ton_cells_per_call\n");
+
+    size_t n_failed = 0;
+    for (const llm_arch arch : { LLM_ARCH_LLAMA, LLM_ARCH_QWEN4EXP }) {
+        if (!arch_matches(arch_filter, arch)) {
+            continue;
+        }
+        const bool moe = moe_mandatory(arch);
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+        llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+
+        ud.verbosity = LOG_LEVEL_OUTPUT;
+        llama_context_ptr off = kv_seq_rm_ctx(model.get(), n_ctx, 1, true, n_chunk, false);
+        llama_context_ptr on  = kv_seq_rm_ctx(model.get(), n_ctx, 1, true, n_chunk, true);
+        ud.verbosity = verbosity;
+        if (!off || !on) {
+            LOG_ERR("%s: %s: failed to create the contexts\n", __func__, llama_arch_name(arch));
+            n_failed++;
+            continue;
+        }
+        llama_memory_t mem_off = llama_get_memory(off.get());
+        llama_memory_t mem_on  = llama_get_memory(on.get());
+
+        const std::vector<llama_token> tokens = get_tokens(fills[sizeof(fills)/sizeof(fills[0]) - 1] + 8, n_vocab, seed);
+
+        for (const uint32_t n : fills) {
+            for (llama_context * ctx : { off.get(), on.get() }) {
+                llama_memory_clear(llama_get_memory(ctx), true);
+                for (uint32_t p = 0; p < n; p += n_chunk) {
+                    decode_range(ctx, tokens.data() + p, std::min(n_chunk, n - p), (llama_pos) p, 0, false);
+                }
+            }
+
+            for (const int n_rm : { 0, 3 }) {
+                const int n_calls = n_rm == 0 ? n_none : n_three;
+                std::vector<double> t_off;
+                std::vector<double> t_on;
+                uint64_t st0[5];
+                uint64_t st1[5];
+                llama_memory_seq_rm_stats(mem_on, st0);
+                bool ok = true;
+                for (int r = 0; r < n_calls; r++) {
+                    for (llama_context * ctx : { off.get(), on.get() }) {
+                        llama_memory_t mem = llama_get_memory(ctx);
+                        if (n_rm > 0) {
+                            decode_range(ctx, tokens.data() + n, n_rm, (llama_pos) n, 0, false);
+                        }
+                        const auto t0 = std::chrono::steady_clock::now();
+                        ok = llama_memory_seq_rm(mem, 0, (llama_pos) n, -1) && ok;
+                        const auto t1 = std::chrono::steady_clock::now();
+                        (ctx == off.get() ? t_off : t_on).push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+                    }
+                }
+                llama_memory_seq_rm_stats(mem_on, st1);
+                if (!ok || llama_memory_seq_pos_max(mem_off, 0) != (llama_pos) n - 1 ||
+                        llama_memory_debug_state(mem_off) != llama_memory_debug_state(mem_on)) {
+                    LOG_ERR("%s: %s, %u tokens, %d removed: the calls failed or the memories differ\n", __func__, llama_arch_name(arch), n, n_rm);
+                    n_failed++;
+                }
+                auto median = [](std::vector<double> v) {
+                    std::sort(v.begin(), v.end());
+                    return v.size() % 2 ? v[v.size()/2] : 0.5*(v[v.size()/2 - 1] + v[v.size()/2]);
+                };
+                auto mean = [](const std::vector<double> & v) {
+                    double s = 0.0;
+                    for (const double x : v) {
+                        s += x;
+                    }
+                    return s/v.size();
+                };
+                LOG("%s\t%u\t%u\t%s\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%.1f\n", llama_arch_name(arch), n_ctx, n,
+                    n_rm == 0 ? "removes 0" : "removes 3", n_calls, median(t_off), mean(t_off), median(t_on), mean(t_on),
+                    (double) (st1[4] - st0[4])/n_calls);
+            }
+        }
+    }
+    test_setenv("LLAMA_ARCHS_N_CTX", nullptr);
+
+    LOG("Summary: %s\n", n_failed == 0 ? "all timings ran, the memories the same" : "FAILED");
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -2706,6 +3238,8 @@ int main(int argc, char ** argv) {
     bool kv_shift = false;
     bool mtp_kv_only = false;
     bool mtp_catchup_overlap = false;
+    bool kv_seq_rm = false;
+    bool kv_seq_rm_time = false;
     bool save_mtp = false;
 
     int verbosity = LOG_LEVEL_ERROR;
@@ -2780,6 +3314,10 @@ int main(int argc, char ** argv) {
             mtp_kv_only = true;
         } else if (strcmp(argv[i], "--mtp-catchup-overlap") == 0) {
             mtp_catchup_overlap = true;
+        } else if (strcmp(argv[i], "--kv-seq-rm") == 0) {
+            kv_seq_rm = true;
+        } else if (strcmp(argv[i], "--kv-seq-rm-time") == 0) {
+            kv_seq_rm_time = true;
         } else if (strcmp(argv[i], "--mtp") == 0) {
             save_mtp = true;
         } else {
@@ -2808,6 +3346,12 @@ int main(int argc, char ** argv) {
         }
         if (mtp_catchup_overlap) {
             return test_mtp_catchup_overlap(arch_filter, seed, stdev, verbosity);
+        }
+        if (kv_seq_rm) {
+            return test_kv_seq_rm(arch_filter, seed, stdev, verbosity);
+        }
+        if (kv_seq_rm_time) {
+            return test_kv_seq_rm_time(arch_filter, seed, stdev, verbosity);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {

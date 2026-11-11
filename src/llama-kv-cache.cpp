@@ -171,6 +171,18 @@ llama_kv_cache::llama_kv_cache(
         v_cells[s].resize(kv_size);
     }
 
+    // LLAMA_KV_SEQ_RM_BOUND=1 (C740): seq_rm bounded by the cells it can change, see get_seq_rm_bound; read per cache,
+    // so that a test can compare a cache with the switch and one without in the same process
+    {
+        const char * env = getenv("LLAMA_KV_SEQ_RM_BOUND");
+        seq_rm_bound  = env != nullptr && atoi(env) != 0;
+        seq_rm_nosort = env != nullptr && atoi(env) == 2;
+        if (seq_rm_bound) {
+            LLAMA_LOG_INFO("%s: LLAMA_KV_SEQ_RM_BOUND: %sseq_rm visits only the cells it can change%s\n", __func__, name_tag,
+                seq_rm_nosort ? " (test hook 2: in position order, not sorted)" : "");
+        }
+    }
+
     // by default, all sequence ids are mapped to the 0th stream
     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
 
@@ -506,13 +518,14 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         uint32_t  pos_min_head = cells.size();
         llama_pos pos_min      = std::numeric_limits<llama_pos>::max();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
+        // the steps for cell i; the cells are visited in increasing order
+        auto rm_cell = [&](uint32_t i) {
             if (!cells.pos_in(i, p0, p1)) {
-                continue;
+                return;
             }
 
             if (!cells.seq_has(i, seq_id)) {
-                continue;
+                return;
             }
 
             const llama_pos pos_i = cells.pos_get(i);
@@ -527,6 +540,51 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                     pos_min      = pos_i;
                     pos_min_head = i;
                 }
+            }
+        };
+
+        if (!seq_rm_bound) {
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                rm_cell(i);
+            }
+        } else {
+            // LLAMA_KV_SEQ_RM_BOUND: the cells that hold seq_id at a position in [p0, p1) are exactly the entries of
+            // its (pos, cell) index in that range; every other cell fails the two checks of rm_cell. They are visited
+            // in cell order, so kq_cells_mark lists them in the same order and the first freed cell is the same
+            seq_rm_n_seq++;
+
+            const auto & sp = cells.seq_pos_get(seq_id);
+
+            seq_rm_idxs.clear();
+            for (auto it = sp.lower_bound({ p0, 0 }); it != sp.end() && it->first < p1; ++it) {
+                seq_rm_idxs.push_back(it->second);
+            }
+
+            bool scan = false;
+            if (!seq_rm_nosort && !std::is_sorted(seq_rm_idxs.begin(), seq_rm_idxs.end())) {
+                // a removal and a refill (or a wrap of the cache) put the cells out of position order
+                if (seq_rm_idxs.size() <= 64) {
+                    std::sort(seq_rm_idxs.begin(), seq_rm_idxs.end());
+                    seq_rm_n_sorted++;
+                } else {
+                    scan = true;
+                }
+            }
+
+            if (scan) {
+                // many cells out of order: the used range, where every cell the index names lies
+                seq_rm_n_scan++;
+                const uint32_t i0 = cells.used_min();
+                const uint32_t i1 = cells.used_max_p1();
+                for (uint32_t i = i0; i < i1; ++i) {
+                    rm_cell(i);
+                }
+                seq_rm_n_cells += i1 - i0;
+            } else {
+                for (const uint32_t i : seq_rm_idxs) {
+                    rm_cell(i);
+                }
+                seq_rm_n_cells += seq_rm_idxs.size();
             }
         }
 
@@ -556,7 +614,16 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
             uint32_t new_head = cells.size();
 
-            for (uint32_t i = 0; i < cells.size(); ++i) {
+            // LLAMA_KV_SEQ_RM_BOUND: from the first used cell to the last; the cells outside are empty, and an empty
+            // cell is in no range (p0 >= 0 here)
+            const uint32_t i0 = seq_rm_bound ? cells.used_min()    : 0;
+            const uint32_t i1 = seq_rm_bound ? cells.used_max_p1() : cells.size();
+            if (seq_rm_bound) {
+                seq_rm_n_any++;
+                seq_rm_n_cells += i1 - i0;
+            }
+
+            for (uint32_t i = i0; i < i1; ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
                 }
@@ -2138,6 +2205,33 @@ void llama_kv_cache::kq_cells_mark(uint32_t strm, uint32_t idx) {
     }
 
     kq_cells_changed.push_back(strm*get_size() + idx);
+}
+
+void llama_kv_cache::seq_rm_stats(uint64_t * out) const {
+    out[0] += seq_rm_n_seq;
+    out[1] += seq_rm_n_sorted;
+    out[2] += seq_rm_n_scan;
+    out[3] += seq_rm_n_any;
+    out[4] += seq_rm_n_cells;
+}
+
+void llama_kv_cache::debug_state(std::string & out) const {
+    auto put_u32 = [&out](uint32_t v) { out.append((const char *) &v, sizeof(v)); };
+
+    put_u32(other ? 1 : 0);
+    put_u32(n_stream);
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        put_u32(v_heads[s]);
+        v_cells[s].debug_state(out);
+    }
+
+    put_u32(kq_cells_stale ? 1 : 0);
+    put_u32(kq_cells_n_applied);
+    put_u32(kq_cells_track ? 1 : 0);
+    put_u32((uint32_t) kq_cells_changed.size());
+    for (const uint32_t c : kq_cells_changed) {
+        put_u32(c);
+    }
 }
 
 bool llama_kv_cache::get_kq_cells_resident() const {

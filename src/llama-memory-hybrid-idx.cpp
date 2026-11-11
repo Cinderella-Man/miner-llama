@@ -622,6 +622,63 @@ bool llama_memory_hybrid_idx::kpool_dev_stats(uint64_t * n_ubatch, uint64_t * n_
     return true;
 }
 
+void llama_memory_hybrid_idx::debug_state(std::string & out) const {
+    auto put = [&out](const void * p, size_t n) { out.append((const char *) p, n); };
+    auto put_u32 = [&put](uint32_t v) { put(&v, sizeof(v)); };
+    auto put_u64 = [&put](uint64_t v) { put(&v, sizeof(v)); };
+    auto put_vec = [&put, &put_u32](const auto & v) {
+        put_u32((uint32_t) v.size());
+        put(v.data(), v.size()*sizeof(v[0]));
+    };
+
+    put(mem_idx_stale.data(), mem_idx_stale.size()*sizeof(mem_idx_stale[0]));
+
+    put_u32(kpool_lay ? 1 : 0);
+    if (kpool_lay) {
+        const auto & lay = *kpool_lay;
+        put_u32(lay.n_pool_real);
+        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            const auto & sq = lay.seqs[s];
+            if (sq.cells.empty() && sq.pools.empty() && sq.j_next == 0 && sq.pos_min == 0 && sq.strm == 0) {
+                continue;
+            }
+            put_u32(s);
+            put(&sq.pos_min, sizeof(sq.pos_min));
+            put_u32(sq.strm);
+            put_vec(sq.cells);
+            put_vec(sq.pools);
+            put_u64(sq.j_next);
+        }
+    }
+
+    put_u32(kpool_dev ? 1 : 0);
+    if (kpool_dev) {
+        const auto & dv = *kpool_dev;
+        put_vec(dv.cells);
+        put_vec(dv.idxs);
+        put_u32(dv.n_valid);
+        put_u64(dv.host_gen);
+        put_vec(dv.rows);
+        put_vec(dv.sent);
+        put_u32(dv.n_valid_next);
+        put_u32(dv.pending ? 1 : 0);
+        put_u32(dv.staged  ? 1 : 0);
+        put_u32((uint32_t) dv.tables.size());
+        for (const auto & t : dv.tables) {
+            put_u64(t.gen);
+        }
+        put_u64(dv.n_ubatch);
+        put_u64(dv.n_full);
+        put_u64(dv.n_rows);
+        put_u64(dv.n_read);
+        put_u64(dv.n_checked);
+    }
+
+    put_u64(pool_mask_st.n_ubatch);
+    put_u64(pool_mask_st.n_checked);
+    put_u64(pool_mask_st.n_masks);
+}
+
 const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_layout_get() const {
     GGML_ASSERT(kpool_lay != nullptr);
 

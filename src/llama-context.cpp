@@ -9,7 +9,12 @@
 #include "llama-memory.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-idx.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-kv-cache-dsa.h"
+#include "llama-kv-cache-dsa-iswa.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-msa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -7465,6 +7470,73 @@ bool llama_pool_mask_dev_stats(const llama_context * ctx, uint64_t * n_ubatch, u
     if (n_checked) { *n_checked = st.n_checked; }
     if (n_masks)   { *n_masks   = st.n_masks;   }
     return true;
+}
+
+// the KV caches of a memory, and its QSA indexer memory if it is one; false for a kind not covered
+static bool llama_memory_kv_caches(const llama_memory_i * mem, std::vector<const llama_kv_cache *> & kvs,
+        const llama_memory_hybrid_idx ** mem_hidx) {
+    auto add_iswa = [&kvs](const llama_kv_cache_iswa * m) {
+        kvs.push_back(m->get_base());
+        kvs.push_back(m->get_swa());
+    };
+    auto add_dsa = [&kvs](const llama_kv_cache_dsa * m) {
+        kvs.push_back(m->get_mla());
+        kvs.push_back(m->get_lid());
+    };
+    if (const auto * m_hidx = dynamic_cast<const llama_memory_hybrid_idx *>(mem)) {
+        kvs.push_back(m_hidx->get_mem_attn());
+        kvs.push_back(m_hidx->get_mem_idx());
+        *mem_hidx = m_hidx;
+    } else if (const auto * m_hyb = dynamic_cast<const llama_memory_hybrid *>(mem)) {
+        kvs.push_back(m_hyb->get_mem_attn());
+    } else if (const auto * m_hiswa = dynamic_cast<const llama_memory_hybrid_iswa *>(mem)) {
+        add_iswa(m_hiswa->get_mem_attn());
+    } else if (const auto * m_iswa = dynamic_cast<const llama_kv_cache_iswa *>(mem)) {
+        add_iswa(m_iswa);
+    } else if (const auto * m_dsa_iswa = dynamic_cast<const llama_kv_cache_dsa_iswa *>(mem)) {
+        add_dsa(m_dsa_iswa->get_dsa());
+        kvs.push_back(m_dsa_iswa->get_swa());
+    } else if (const auto * m_dsa = dynamic_cast<const llama_kv_cache_dsa *>(mem)) {
+        add_dsa(m_dsa);
+    } else if (const auto * m_msa = dynamic_cast<const llama_kv_cache_msa *>(mem)) {
+        kvs.push_back(m_msa->get_base());
+        kvs.push_back(m_msa->get_idx());
+    } else if (const auto * m_kv = dynamic_cast<const llama_kv_cache *>(mem)) {
+        kvs.push_back(m_kv);
+    } else if (dynamic_cast<const llama_memory_recurrent *>(mem) == nullptr) {
+        return false;
+    }
+    kvs.erase(std::remove(kvs.begin(), kvs.end(), nullptr), kvs.end());
+    return true;
+}
+
+std::string llama_memory_debug_state(const llama_memory_t mem) {
+    std::vector<const llama_kv_cache *> kvs;
+    const llama_memory_hybrid_idx * mem_hidx = nullptr;
+    if (mem == nullptr || !llama_memory_kv_caches(mem, kvs, &mem_hidx)) {
+        return {};
+    }
+    std::string out = "kv";
+    for (const auto * kv : kvs) {
+        kv->debug_state(out);
+    }
+    if (mem_hidx) {
+        out += "idx";
+        mem_hidx->debug_state(out);
+    }
+    return out;
+}
+
+void llama_memory_seq_rm_stats(const llama_memory_t mem, uint64_t out[5]) {
+    std::fill(out, out + 5, 0);
+    std::vector<const llama_kv_cache *> kvs;
+    const llama_memory_hybrid_idx * mem_hidx = nullptr;
+    if (mem == nullptr || !llama_memory_kv_caches(mem, kvs, &mem_hidx)) {
+        return;
+    }
+    for (const auto * kv : kvs) {
+        kv->seq_rm_stats(out);
+    }
 }
 
 void llama_set_nextn_carry(llama_context * ctx, bool in, bool out) {
