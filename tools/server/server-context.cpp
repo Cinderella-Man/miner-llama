@@ -2178,6 +2178,9 @@ private:
     int     ckpt_incall_slot = -1;
     std::vector<ckpt_incall_job> ckpt_incall;
     std::vector<int32_t>         incall_cuts;
+    // C735: the in-call checkpoints whose draft part waits for the draft's catch-up of their call
+    // (LLAMA_MTP_CATCHUP_OVERLAP), see ckpt_incall_finish_dft
+    std::vector<const common_prompt_checkpoint *> ckpt_incall_dft_wait;
 
     // Q771: the target context's micro-batch taper: the server's (--ubatch-taper, else LLAMA_UBATCH_TAPER) and the one
     // set now (a request's "ubatch_taper" sets it for the batches of its prompt)
@@ -4274,14 +4277,17 @@ private:
     }
 
     // whether the slot's list still holds an in-call checkpoint (a later one of the same batch may have evicted it)
+    static bool ckpt_incall_listed(const server_slot & slot, const std::shared_ptr<common_prompt_checkpoint> & ck) {
+        return std::find(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(), ck) != slot.prompt.checkpoints.end();
+    }
     static bool ckpt_incall_listed(const server_slot & slot, const ckpt_incall_job & ic) {
-        return std::find(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(), ic.ck) != slot.prompt.checkpoints.end();
+        return ckpt_incall_listed(slot, ic.ck);
     }
 
     // before the decode call of the batch rows [off, off + n): its fills inside the call and its micro-batch cuts, as rows
     // of the call (cuts). The draft context gets the same fills for its part of each checkpoint (under the checkpoint's
-    // store id in that context), taken in its pass over the call
-    void ckpt_incall_begin(int32_t off, int32_t n, std::vector<uint32_t> & cuts) {
+    // store id in that context, fills_dft), taken in its pass over the call (common_speculative_set_cuts)
+    void ckpt_incall_begin(int32_t off, int32_t n, std::vector<uint32_t> & cuts, std::vector<common_speculative_store_at> & fills_dft) {
         for (const int32_t b : incall_cuts) {
             if (b > off && b < off + n) {
                 cuts.push_back((uint32_t) (b - off));
@@ -4298,13 +4304,15 @@ private:
             }
             llama_state_seq_store_at(ctx_tgt, slot->id, ic.ck->store, (uint32_t) (ic.i_batch - off), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             if (ctx_dft != nullptr) {
-                llama_state_seq_store_at(ctx_dft, slot->id, ic.ck->store, (uint32_t) (ic.i_batch - off), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                fills_dft.push_back({ slot->id, ic.ck->store, (uint32_t) (ic.i_batch - off), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY });
             }
         }
         llama_set_ubatch_cuts(ctx_tgt, cuts.data(), cuts.size());
     }
 
-    // after that call (and the draft's pass over it): the checkpoint's data, as create_checkpoint saves it
+    // after that call: the checkpoint's data, as create_checkpoint saves it. Its draft part once the draft's pass over the
+    // call has run (C735: with LLAMA_MTP_CATCHUP_OVERLAP that pass runs behind the next call), the rest now: the target's
+    // fills are read before its next call replaces them, and the stores move to the host as with the cut calls
     void ckpt_incall_finish(ckpt_incall_job & ic, int32_t off) {
         ic.done = true;
 
@@ -4328,28 +4336,21 @@ private:
             return;
         }
 
-        // the draft's part as update_dft takes it: its fill in the draft's pass, in the host format
-        if (ctx_dft != nullptr) {
-            std::vector<uint8_t> blob(llama_state_seq_store_at_get(ctx_dft, nullptr, 0, slot.id, cur.store, nullptr, nullptr));
-            const size_t n_host = blob.empty() ? 0 : llama_state_seq_store_get_size_host(ctx_dft, slot.id, cur.store);
-            cur.data_dft.resize(n_host);
-            if (n_host == 0 ||
-                llama_state_seq_store_at_get(ctx_dft, blob.data(), blob.size(), slot.id, cur.store, nullptr, nullptr) != blob.size() ||
-                llama_state_seq_store_get_data_host(ctx_dft, blob.data(), blob.size(), cur.data_dft.data(), n_host, slot.id, cur.store) != n_host) {
-                SLT_WRN(slot, "the draft's part of the context checkpoint at n_tokens = %" PRId64 " was not taken inside the call - erased, and checkpoints cut the calls again from now on\n",
-                        cur.n_tokens);
-                slot.prompt.checkpoints.remove(ic.ck);
-                ckpt_incall_on = false;
-                return;
-            }
-        }
-
         cur.data_tgt.resize(n);
         llama_state_seq_store_at_get(ctx_tgt, cur.data_tgt.data(), n, slot.id, cur.store, nullptr, nullptr);
         cur.update_pos(cur.n_tokens, pos_min, pos_max);
         cur.size_dev = llama_state_seq_store_get_size_host(ctx_tgt, slot.id, cur.store) - n;
-        // the draft's speculative state at the checkpoint, as the call that ended there would leave it
-        common_speculative_get_state_at(spec.get(), slot.id, ic.i_batch - off, cur.data_spec);
+
+        if (ctx_dft != nullptr) {
+            ckpt_incall_dft_wait.push_back(ic.ck.get());
+            common_speculative_after_catchup(spec.get(), [this, ck = ic.ck, id = slot.id, i_row = ic.i_batch - off]() {
+                ckpt_incall_finish_dft(ck, id, i_row);
+            });
+            // run at once without a catch-up waiting: a failed draft part has erased the checkpoint
+            if (!ckpt_incall_listed(slot, ic)) {
+                return;
+            }
+        }
 
         const int64_t t_save_us = ggml_time_us() - t_save_start;
 
@@ -4363,6 +4364,40 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, (float) cur.size_dev / 1024 / 1024, cur.store, t_save_us / 1000.0);
 
         ckpt_vram_trim(slot);
+    }
+
+    // the draft's part of an in-call checkpoint as update_dft takes it (its fill in the draft's pass, in the host format),
+    // and the draft's speculative state at the checkpoint, as the call that ended there would leave it; right after the
+    // draft's pass over the call, before its next pass replaces the fills
+    void ckpt_incall_finish_dft(const std::shared_ptr<common_prompt_checkpoint> & ck, int slot_id, int32_t i_row) {
+        ckpt_incall_dft_wait.erase(std::remove(ckpt_incall_dft_wait.begin(), ckpt_incall_dft_wait.end(), ck.get()), ckpt_incall_dft_wait.end());
+
+        server_slot * sp = slot_by_id(slot_id);
+        if (sp == nullptr || !ckpt_incall_listed(*sp, ck)) {
+            return;
+        }
+        server_slot & slot = *sp;
+        auto & cur = *ck;
+
+        std::vector<uint8_t> blob(llama_state_seq_store_at_get(ctx_dft, nullptr, 0, slot.id, cur.store, nullptr, nullptr));
+        const size_t n_host = blob.empty() ? 0 : llama_state_seq_store_get_size_host(ctx_dft, slot.id, cur.store);
+        cur.data_dft.resize(n_host);
+        if (n_host == 0 ||
+            llama_state_seq_store_at_get(ctx_dft, blob.data(), blob.size(), slot.id, cur.store, nullptr, nullptr) != blob.size() ||
+            llama_state_seq_store_get_data_host(ctx_dft, blob.data(), blob.size(), cur.data_dft.data(), n_host, slot.id, cur.store) != n_host) {
+            SLT_WRN(slot, "the draft's part of the context checkpoint at n_tokens = %" PRId64 " was not taken inside the call - erased, and checkpoints cut the calls again from now on\n",
+                    cur.n_tokens);
+            slot.prompt.checkpoints.remove(ck);
+            ckpt_incall_on = false;
+            return;
+        }
+
+        common_speculative_get_state_at(spec.get(), slot.id, i_row, cur.data_spec);
+    }
+
+    // C735: whether the checkpoint's draft part waits for the draft's catch-up of its call
+    bool ckpt_incall_dft_waits(const common_prompt_checkpoint * ck) const {
+        return std::find(ckpt_incall_dft_wait.begin(), ckpt_incall_dft_wait.end(), ck) != ckpt_incall_dft_wait.end();
     }
 
     // the end of a batch: checkpoints of it that no call filled leave their lists (a retried or failed call)
@@ -4528,6 +4563,17 @@ private:
                 [](const server_prompt_checkpoint_ptr & c) { return c->store >= 0; });
         if (ck == slot.prompt.checkpoints.end()) {
             return;
+        }
+
+        // C735: an in-call checkpoint whose draft part waits for the draft's catch-up gets it first, since its host
+        // version is a copy (the catch-up runs now, not behind the next call); a failed draft part erased it. A move
+        // that lands later (ckpt_spill_land) is of a checkpoint chosen here
+        if (ckpt_incall_dft_waits(ck->get())) {
+            const server_prompt_checkpoint_ptr p = *ck;
+            spec_flush();
+            if (std::find(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(), p) == slot.prompt.checkpoints.end()) {
+                return;
+            }
         }
 
         if (params_base.checkpoint_vram_sync) {
@@ -7105,9 +7151,10 @@ private:
 
         // C217: the checkpoints taken inside this call, and its micro-batch cuts where the calls it joins would end
         std::vector<uint32_t> incall_view_cuts;
+        std::vector<common_speculative_store_at> incall_dft_fills;
         const bool incall = !ckpt_incall.empty() || !incall_cuts.empty();
         if (incall) {
-            ckpt_incall_begin(off, batch.view.size(), incall_view_cuts);
+            ckpt_incall_begin(off, batch.view.size(), incall_view_cuts, incall_dft_fills);
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
@@ -7190,9 +7237,10 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
-            // C217: the draft's pass is cut as the target's call is
+            // C217: the draft's pass is cut as the target's call is and fills the draft's part of each checkpoint (C735:
+            // also when it waits for the next call)
             if (incall && ctx_dft != nullptr) {
-                llama_set_ubatch_cuts(ctx_dft, incall_view_cuts.data(), incall_view_cuts.size());
+                common_speculative_set_cuts(spec.get(), incall_view_cuts, incall_dft_fills);
             }
 
             bool ok = true;
@@ -7202,10 +7250,6 @@ private:
                 llama_step_trace_mark("s.cu.out");
             });
             llama_step_trace_mark("s.cu.end");
-
-            if (incall && ctx_dft != nullptr) {
-                llama_set_ubatch_cuts(ctx_dft, nullptr, 0);
-            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");

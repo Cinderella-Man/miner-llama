@@ -253,13 +253,28 @@ bool common_speculative_pending(const common_speculative * spec);
 bool common_speculative_flush(common_speculative * spec);
 void common_speculative_after_catchup(common_speculative * spec, std::function<void()> && fn);
 
-// C217: whether common_speculative_process of a target batch cut with llama_set_ubatch_cuts (the same cuts set on the
-// draft context) leaves what separate calls cut there leave, with common_speculative_get_state_at for the state at a
-// cut; true without speculation
+// C217: whether common_speculative_process of a target batch cut with llama_set_ubatch_cuts (the same cuts given to
+// common_speculative_set_cuts) leaves what separate calls cut there leave, with common_speculative_get_state_at for the
+// state at a cut; true without speculation
 bool common_speculative_incall_ok(const common_speculative * spec);
 
 // C217: what common_speculative_get_state would return had the last processed batch ended before its row i_row
 bool common_speculative_get_state_at(common_speculative * spec, llama_seq_id seq_id, int32_t i_row, std::vector<uint8_t> & data);
+
+// C735: a device-store fill of the draft context inside its pass, as llama_state_seq_store_at takes it
+struct common_speculative_store_at {
+    llama_seq_id          seq_id;
+    int32_t               store;
+    uint32_t              i_end;
+    llama_state_seq_flags flags;
+};
+
+// C735: the micro-batch cuts (llama_set_ubatch_cuts) and the device-store fills (llama_state_seq_store_at) of the draft
+// context's pass over the batch given to the next common_speculative_process, in rows of that batch: the pass takes
+// them when it runs, also once it waits for the target's next call (LLAMA_MTP_CATCHUP_OVERLAP), and a fill's result is
+// read with llama_state_seq_store_at_get(ctx_dft, ...) behind it (common_speculative_after_catchup)
+void common_speculative_set_cuts(common_speculative * spec, const std::vector<uint32_t> & cuts,
+        const std::vector<common_speculative_store_at> & fills);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
