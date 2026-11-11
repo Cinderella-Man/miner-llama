@@ -14260,6 +14260,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // Q6_K's products of 2 to 4 tokens in C722's kernel (mmvq-pascal-dmt.cu, GGML_CUDA_MMVQ_PASCAL_Q6K_MT=1, C727):
+    // Qwen3.8-Flash-Next's attn_output and ssm_out (6144 -> 2560), each lane-group size the kernel takes (8 to 32 lanes per
+    // row at 2048 to 8192 weights), a partial last row block, rows that are views of wider rows (6720 bytes apart, still
+    // 16-byte aligned), K = 8192 (left to the k-column kernel at 4 tokens) and K = 12288 (at 3 and 4), and rows it leaves
+    // to the k-column kernel: the shared expert's 2560 -> 640 and 1024-wide rows (2 and 4 lanes per row, 2-byte-aligned
+    // segments) and views of 6400-wide rows (not 16-byte aligned); 5 tokens, left to the k-column kernel.
+    {
+        struct q6k_case { int64_t m, k, k_v; };
+        for (const q6k_case & c : std::vector<q6k_case>{
+                { 2560, 6144, 0 }, { 4097, 2048, 0 }, { 200, 2048, 0 }, { 77, 4096, 0 }, { 64, 8192, 0 },
+                { 96, 12288, 0 }, { 257, 6144, 8192 }, { 640, 2560, 0 }, { 129, 1024, 0 }, { 33, 6144, 6400 } }) {
+            for (int64_t n = 1; n <= 5; ++n) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, c.m, n, c.k, { 1, 1 }, { 1, 1 },
+                                                         { 0, 1, 2, 3 }, c.k_v));
+            }
+        }
+    }
     // A gate and an up product and their SWIGLU, gate and up of their own types (mmvq-pascal-glu.cu,
     // GGML_CUDA_MMVQ_PASCAL_GLU_MT=1, C757): the 17 type pairs of Qwen3.8-Flash-Next's shared experts (Swift GSQ-RCO
     // Q2_0, 2560 -> 640; the Q6_K pairs are left to the separate products) at 1 to 8 tokens, then every ordered pair of
@@ -16226,7 +16243,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // the Q4_K attn_qkv and attn_gate (2560 -> 10240 and 6144) complete, and with GGML_CUDA_MMVQ_PASCAL_Q3K_MT (C726)
     // Q3_K's kernel of 2 to 8 tokens, whose shapes the Q3_K ssm_out (6144 -> 2560) and the shared expert's Q3_K 2560 -> 640
     // complete; the Q5_K attn_output and ssm_out (6144 -> 2560) and attn_k and attn_v (2560 -> 512) for
-    // GGML_CUDA_MMVQ_PASCAL_Q5K_1R (C767), the one-token products
+    // GGML_CUDA_MMVQ_PASCAL_Q5K_1R (C767), the one-token products; the Q6_K attn_output and ssm_out (6144 -> 2560) for
+    // GGML_CUDA_MMVQ_PASCAL_Q6K_MT (C727)
     for (int64_t n = 1; n <= 8; ++n) {
         for (auto [type, m, k] : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{
                 { GGML_TYPE_Q8_0, 10240, 320 }, { GGML_TYPE_Q8_0, 320, 10240 },
@@ -16237,7 +16255,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 { GGML_TYPE_Q4_K, 2560, 6144 }, { GGML_TYPE_Q2_0, 2560, 640 },
                 { GGML_TYPE_Q4_0, 2560, 640 }, { GGML_TYPE_Q5_0, 2560, 640 }, { GGML_TYPE_IQ4_NL, 2560, 640 },
                 { GGML_TYPE_Q5_K, 248320, 2560 }, { GGML_TYPE_Q6_K, 248320, 2560 }, { GGML_TYPE_Q5_K, 2560, 6144 },
-                { GGML_TYPE_Q5_K, 512, 2560 } }) {
+                { GGML_TYPE_Q5_K, 512, 2560 }, { GGML_TYPE_Q6_K, 2560, 6144 } }) {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
         }
     }

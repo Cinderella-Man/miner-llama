@@ -1758,7 +1758,7 @@ void ggml_cuda_mul_mat_vec_q(
         return;
     }
     // ... and of a plain IQ4_XS or Q4_K product with GGML_CUDA_MMVQ_PASCAL_DMT (the attention and recurrent projections
-    // of a verify), the same way
+    // of a verify), the same way, and of a Q6_K product with GGML_CUDA_MMVQ_PASCAL_Q6K_MT (C727)
     if (!ids && !fusion && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmvq_pascal_dmt(src0->type, src0->data, src1_q8, dst_d, ne00, ne01, ne11, nb01, s11, s1, stream)) {
         return;
