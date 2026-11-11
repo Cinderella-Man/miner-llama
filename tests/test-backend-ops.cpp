@@ -9856,6 +9856,55 @@ struct test_mul_mat_vec_fusion_overlap : public test_mul_mat_vec_fusion {
     }
 };
 
+// A gate and an up MUL_MAT of their own weight types and their SWIGLU, 2-D: a dense FFN, or the shared expert of a MoE
+// layer, whose gate and up types often differ in a mixed-precision file (GGML_CUDA_MMVQ_PASCAL_GLU_MT, C757). m rows of
+// k weights, n tokens; for k_v > k the weights and activations are views of rows of k_v (rows at other alignments).
+struct test_mul_mat_glu : public test_case {
+    const ggml_type type_gate;
+    const ggml_type type_up;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int64_t k_v;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_gate, type_up, m, n, k, k_v);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_GLU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-3;
+    }
+
+    test_mul_mat_glu(ggml_type type_gate, ggml_type type_up, int64_t m, int64_t n, int64_t k, int64_t k_v = 0)
+        : type_gate(type_gate), type_up(type_up), m(m), n(n), k(k), k_v(k_v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t kp = k_v == 0 ? k : k_v;
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, type_gate, kp, m);
+        ggml_tensor * up   = ggml_new_tensor_2d(ctx, type_up,   kp, m);
+        ggml_tensor * cur  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kp, n);
+        if (k_v != 0) {
+            GGML_ASSERT(k_v > k);
+            gate = ggml_view_2d(ctx, gate, k, m, gate->nb[1], 0);
+            up   = ggml_view_2d(ctx, up,   k, m, up->nb[1],   0);
+            cur  = ggml_view_2d(ctx, cur,  k, n, cur->nb[1],  0);
+        }
+        ggml_set_name(gate, "gate");
+        ggml_set_name(up, "up");
+        ggml_set_name(cur, "cur");
+        ggml_tensor * out = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, gate, cur), ggml_mul_mat(ctx, up, cur));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -14209,6 +14258,40 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // A gate and an up product and their SWIGLU, gate and up of their own types (mmvq-pascal-glu.cu,
+    // GGML_CUDA_MMVQ_PASCAL_GLU_MT=1, C757): the 17 type pairs of Qwen3.8-Flash-Next's shared experts (Swift GSQ-RCO
+    // Q2_0, 2560 -> 640; the Q6_K pairs are left to the separate products) at 1 to 8 tokens, then every ordered pair of
+    // the kernel's types (Q2_0, Q3_K, Q4_K, Q5_K, IQ4_XS) at 2, 4, 5 and 8 tokens: a partial last row block (77 x 1024:
+    // 4 and 8 lanes per row), 32 lanes per row (33 x 8192), 512-wide rows (200 x 512), rows that are views of 2816-wide
+    // rows (129 x 2560: Q3_K's 2-byte-aligned, IQ4_XS's 8-byte-aligned rows, left to the separate products), and 768-wide
+    // rows (an odd number of super-blocks: one lane per row, IQ4_XS left to the separate products).
+    {
+        const std::vector<std::pair<ggml_type, ggml_type>> fn_pairs = {
+            { GGML_TYPE_Q2_0, GGML_TYPE_Q3_K },   { GGML_TYPE_Q3_K, GGML_TYPE_Q3_K },   { GGML_TYPE_Q2_0, GGML_TYPE_Q2_0 },
+            { GGML_TYPE_Q3_K, GGML_TYPE_Q2_0 },   { GGML_TYPE_Q2_0, GGML_TYPE_Q4_K },   { GGML_TYPE_Q2_0, GGML_TYPE_IQ4_XS },
+            { GGML_TYPE_IQ4_XS, GGML_TYPE_Q3_K }, { GGML_TYPE_Q4_K, GGML_TYPE_Q4_K },   { GGML_TYPE_Q4_K, GGML_TYPE_Q3_K },
+            { GGML_TYPE_Q4_K, GGML_TYPE_Q2_0 },   { GGML_TYPE_Q3_K, GGML_TYPE_IQ4_XS }, { GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0 },
+            { GGML_TYPE_Q6_K, GGML_TYPE_Q3_K },   { GGML_TYPE_Q5_K, GGML_TYPE_Q3_K },   { GGML_TYPE_Q3_K, GGML_TYPE_Q5_K },
+            { GGML_TYPE_Q2_0, GGML_TYPE_Q6_K },   { GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K },
+        };
+        for (const auto & [tg, tu] : fn_pairs) {
+            for (int64_t n = 1; n <= 8; ++n) {
+                test_cases.emplace_back(new test_mul_mat_glu(tg, tu, 640, n, 2560));
+            }
+        }
+        const ggml_type glu_types[] = { GGML_TYPE_Q2_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS };
+        struct glu_shape { int64_t m, k, k_v; };
+        for (ggml_type tg : glu_types) {
+            for (ggml_type tu : glu_types) {
+                for (const glu_shape & s : std::vector<glu_shape>{
+                        { 77, 1024, 0 }, { 33, 8192, 0 }, { 200, 512, 0 }, { 129, 2560, 2816 }, { 96, 768, 0 } }) {
+                    for (int64_t n : { 2, 4, 5, 8 }) {
+                        test_cases.emplace_back(new test_mul_mat_glu(tg, tu, s.m, n, s.k, s.k_v));
+                    }
+                }
+            }
+        }
+    }
     // all 512 experts, as the file has them
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q2_0, GGML_GLU_OP_SWIGLU, 1, 640, 2560, true, 512, 10,
                                                         true));
@@ -16152,6 +16235,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 { GGML_TYPE_Q4_0, 2560, 640 }, { GGML_TYPE_Q5_0, 2560, 640 }, { GGML_TYPE_IQ4_NL, 2560, 640 },
                 { GGML_TYPE_Q5_K, 248320, 2560 }, { GGML_TYPE_Q6_K, 248320, 2560 } }) {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
+    // Qwen3.8-Flash-Next's shared expert at 1 to 8 tokens: gate, up and SWIGLU (2560 -> 640) of the 16 type pairs of the
+    // 41 layers whose gate and up are not fused with the routed experts (Swift GSQ-RCO Q2_0), the most frequent first;
+    // compare the separate launches with GGML_CUDA_MMVQ_PASCAL_GLU_MT's one launch (C757)
+    for (int64_t n = 1; n <= 8; ++n) {
+        for (auto [tg, tu] : std::vector<std::pair<ggml_type, ggml_type>>{
+                { GGML_TYPE_Q2_0, GGML_TYPE_Q3_K },   { GGML_TYPE_Q3_K, GGML_TYPE_Q3_K },   { GGML_TYPE_Q3_K, GGML_TYPE_Q2_0 },
+                { GGML_TYPE_Q2_0, GGML_TYPE_Q4_K },   { GGML_TYPE_Q2_0, GGML_TYPE_IQ4_XS }, { GGML_TYPE_IQ4_XS, GGML_TYPE_Q3_K },
+                { GGML_TYPE_Q4_K, GGML_TYPE_Q4_K },   { GGML_TYPE_Q4_K, GGML_TYPE_Q3_K },   { GGML_TYPE_Q4_K, GGML_TYPE_Q2_0 },
+                { GGML_TYPE_Q3_K, GGML_TYPE_IQ4_XS }, { GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0 }, { GGML_TYPE_Q6_K, GGML_TYPE_Q3_K },
+                { GGML_TYPE_Q5_K, GGML_TYPE_Q3_K },   { GGML_TYPE_Q3_K, GGML_TYPE_Q5_K },   { GGML_TYPE_Q2_0, GGML_TYPE_Q6_K },
+                { GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K } }) {
+            test_cases.emplace_back(new test_mul_mat_glu(tg, tu, 640, n, 2560));
         }
     }
 

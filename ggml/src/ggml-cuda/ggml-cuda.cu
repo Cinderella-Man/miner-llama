@@ -38,6 +38,7 @@
 #include "ggml-cuda/mmvf-pascal.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-pascal.cuh"
+#include "ggml-cuda/mmvq-pascal-glu.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -5109,6 +5110,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion.shared_dst = shared;
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, up->src[0], up->src[1], up->src[2], routed, &fusion);
             return 5;
+        }
+    }
+
+    // a gate and an up product of 2 to 8 tokens and their SWIGLU as one launch on compute 6.1, gate and up of the same
+    // or different types (GGML_CUDA_MMVQ_PASCAL_GLU_MT, C757: the shared expert of a verify pass); either product first
+    if (node->op == GGML_OP_MUL_MAT && i + 2 < cgraph->n_nodes && ggml_cuda_mmvq_pascal_glu_mt_on() &&
+            cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT && cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
+        ggml_tensor * a   = cgraph->nodes[i];
+        ggml_tensor * b   = cgraph->nodes[i + 1];
+        ggml_tensor * glu = cgraph->nodes[i + 2];
+        ggml_tensor * gate = glu->src[0] == a && glu->src[1] == b ? a : glu->src[0] == b && glu->src[1] == a ? b : nullptr;
+        if (gate != nullptr) {
+            ggml_tensor * up = gate == a ? b : a;
+            const int out[] = { i + 2 };
+            // the kernel reads the activations' Q8_1 copy only, so the GLU output may reuse their memory (as a fused
+            // mul_mat_vec_q's, unless GGML_CUDA_GLU_ALIAS_FUSE=0)
+            if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { i + 2 }) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out, 1, false,
+                                                         ggml_cuda_glu_alias_fuse_enabled() ? up->src[1] : nullptr) &&
+                    ggml_cuda_mmvq_pascal_glu_mt(*cuda_ctx, gate, up, glu)) {
+                return 2;
+            }
         }
     }
 
