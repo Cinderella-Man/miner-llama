@@ -14019,11 +14019,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // projections 320 -> 10240, 10240 -> 320 and 10240 -> 4, the indexer's 2560 -> 512, the recurrent layers'
     // 2560 -> 48), an odd row count, rows of 125 and 9 chunks of 8 weights, and a row width that is no multiple of 8
     // (left to mul_mat_vec_f); these reach every lane-group size of the Pascal BF16 kernel (mmvf-pascal.cu;
-    // GGML_CUDA_MMVF_PASCAL=2 runs it on any GPU, GGML_CUDA_MMVF_PASCAL_NSM=5 with the P106-090's launch shapes)
+    // GGML_CUDA_MMVF_PASCAL=2 runs it on any GPU, GGML_CUDA_MMVF_PASCAL_NSM=5 with the P106-090's launch shapes). Rows of
+    // 513, 549 and 592 chunks (K = 4104, 4392, 4736) take 32 lanes at 3-4 tokens and 128 at one on 5 SMs, as 10240 -> 320,
+    // and leave the lanes of GGML_CUDA_MMVF_PASCAL_EXACT's 32-lane kernel 1, 2 or 3 chunks after their last 4
     for (int64_t n = 1; n <= 8; ++n) {
         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
                 { 10240, 320 }, { 320, 10240 }, { 4, 10240 }, { 512, 2560 }, { 48, 2560 }, { 10241, 320 },
-                { 333, 1000 }, { 5, 72 }, { 64, 100 } }) {
+                { 333, 1000 }, { 5, 72 }, { 64, 100 }, { 320, 4104 }, { 320, 4392 }, { 333, 4736 } }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
         }
         // rows that are views of wider rows: 16-byte aligned (672 bytes apart) and not (648 bytes apart)
