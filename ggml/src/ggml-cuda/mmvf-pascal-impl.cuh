@@ -15,6 +15,16 @@
 #else
 #define MMVF_PASCAL_BOUNDS __launch_bounds__(MMVF_PASCAL_NT)
 #endif
+// MMVF_PASCAL_X4_MIN_BLOCKS: the same for mul_mat_vec_bf16_pascal_x4 (default 4: at most 128 registers a thread, so the
+// 20 blocks of a 10,240 x 320 product run in one wave on a 5-SM P106-090); 0: no limit
+#ifndef MMVF_PASCAL_X4_MIN_BLOCKS
+#define MMVF_PASCAL_X4_MIN_BLOCKS 4
+#endif
+#if MMVF_PASCAL_X4_MIN_BLOCKS > 0
+#define MMVF_PASCAL_X4_BOUNDS __launch_bounds__(MMVF_PASCAL_NT, MMVF_PASCAL_X4_MIN_BLOCKS)
+#else
+#define MMVF_PASCAL_X4_BOUNDS __launch_bounds__(MMVF_PASCAL_NT)
+#endif
 
 // 8 BF16 weights (one 16-byte load) times 8 FP32 activations, added to acc one weight at a time in column order. A
 // BF16 value is the upper half of an FP32 one, so moving it into place converts it exactly.
@@ -144,6 +154,117 @@ static __global__ void mul_mat_vec_bf16_pascal(
                 v += bias[t * stride_col_dst + row];
             }
             dst[t * stride_col_dst + row] = v;
+        }
+    }
+}
+
+// The 128-lane kernel's sums with 32 lanes (C750): mul_mat_vec_bf16_pascal<128, R', T'>'s bits for every output, for any
+// R' and T', with the loads of mul_mat_vec_bf16_pascal<32, R, T>. Lane j of a 32-lane group takes the 32-lane kernel's
+// chunks j, j + 32, j + 64, ...; its n-th chunk, j + 32 n, is chunk n / 4 of the 128-lane kernel's lane j + 32 (n % 4),
+// so it keeps four accumulators per output, acc[v] for lane j + 32 v, and adds each chunk to acc[n % 4] with the same
+// FMAs. Each acc[v] is then reduced over the warp with the 128-lane kernel's butterfly within its warp v, and the four
+// sums are added 0 + 1 + 2 + 3, as there warp 0 adds warps 1, 2 and 3. 4 T R accumulators a lane, 4 times the
+// butterflies of the 32-lane kernel; no shared memory. fault (checks only, GGML_CUDA_MMVF_PASCAL_EXACT_FAULT=1) leaves
+// acc[3] out of the sum, a quarter of the terms, which every check of the product must catch.
+template <int R, int T, bool fault>
+MMVF_PASCAL_X4_BOUNDS
+static __global__ void mul_mat_vec_bf16_pascal_x4(
+        const uint4 * __restrict__ x, const float4 * __restrict__ y, float * __restrict__ dst,
+        const int nrows, const int nchunks, const int stride_row, const int stride_col_y4, const int stride_col_dst) {
+    constexpr int warp = 32;
+    constexpr int V    = 4; // the 128-lane kernel's warps
+
+    const int tid  = threadIdx.x;
+    const int lg   = tid % warp;
+    const int row0 = (blockIdx.x * (MMVF_PASCAL_NT / warp) + tid / warp) * R;
+
+    const uint4 * xr[R];
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+        xr[i] = x + (int64_t) min(row0 + i, nrows - 1) * stride_row + lg;
+    }
+    const float4 * yp = y + 2 * lg;
+
+    float acc[V][T][R];
+#pragma unroll
+    for (int v = 0; v < V; ++v) {
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                acc[v][t][i] = 0.0f;
+            }
+        }
+    }
+
+    // chunk c + 32 v into acc[v]
+    auto step = [&](const int v) {
+        uint4 w[R];
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            w[i] = __ldg(xr[i] + v * warp);
+        }
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            const float4 a = __ldg(yp + 2 * v * warp + t * stride_col_y4);
+            const float4 b = __ldg(yp + 2 * v * warp + t * stride_col_y4 + 1);
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                acc[v][t][i] = mmvfp_dot8(w[i], a, b, acc[v][t][i]);
+            }
+        }
+    };
+
+    int c = lg;
+#pragma unroll 1
+    for (; c + (V - 1) * warp < nchunks; c += V * warp) {
+#pragma unroll
+        for (int v = 0; v < V; ++v) {
+            step(v);
+        }
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            xr[i] += V * warp;
+        }
+        yp += 2 * V * warp;
+    }
+    // at most V - 1 chunks left, into acc[0], acc[1], ...
+#pragma unroll
+    for (int v = 0; v < V - 1; ++v) {
+        if (c + v * warp < nchunks) {
+            step(v);
+        }
+    }
+
+#pragma unroll
+    for (int v = 0; v < V; ++v) {
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+#pragma unroll
+                for (int off = warp / 2; off > 0; off >>= 1) {
+                    acc[v][t][i] += __shfl_xor_sync(0xFFFFFFFF, acc[v][t][i], off, warp);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            const int row = row0 + i;
+            if ((t * R + i) % warp != lg || row >= nrows) {
+                continue;
+            }
+            float s = acc[0][t][i];
+            s += acc[1][t][i];
+            s += acc[2][t][i];
+            if constexpr (!fault) {
+                s += acc[3][t][i];
+            }
+            dst[t * stride_col_dst + row] = s;
         }
     }
 }

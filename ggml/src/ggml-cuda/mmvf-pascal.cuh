@@ -13,7 +13,8 @@
 // GGML_CUDA_MMVF_PASCAL: 0 off, 1 compute capability 6.1 only (default), 2 any NVIDIA GPU (for testing).
 // GGML_CUDA_MMVF_PASCAL_NSM=n: choose the launch shape as for a card of n SMs (e.g. 5, to run the P106-090's shapes on
 // another GPU). GGML_CUDA_MMVF_PASCAL_SHAPE=G,R: force G lanes per row group (8, 32, 128) and R rows per group
-// (1, 2, 4, 8) for testing and tuning.
+// (1, 2, 4, 8) for testing and tuning. GGML_CUDA_MMVF_PASCAL_EXACT=1: products of 2 to 4 tokens add each row in the
+// order of one token (mmvf-pascal.cu).
 
 // Whether the kernels run on a device of compute capability cc under GGML_CUDA_MMVF_PASCAL.
 bool ggml_cuda_mmvf_pascal_active(int cc);
