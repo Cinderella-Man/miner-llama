@@ -127,6 +127,36 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+// LLAMA_TENSOR_HASH (C762, checks): the scheduler's eval callback; asks for the nodes whose names start with a prefix,
+// then hashes each one's bytes and logs it with its type, shape and the buffer that holds it
+static bool llama_tensor_hash_eval(ggml_tensor * t, bool ask, void * user_data) {
+    auto * th = (llama_tensor_hash *) user_data;
+    bool want = false;
+    for (const auto & p : th->prefixes) {
+        if (strncmp(t->name, p.c_str(), p.size()) == 0) {
+            want = true;
+            break;
+        }
+    }
+    if (ask || !want) {
+        return ask ? want : true;
+    }
+    uint64_t h = 0xcbf29ce484222325ULL;
+    const bool readable = t->buffer != nullptr && ggml_is_contiguous(t);
+    if (readable) {
+        std::vector<uint8_t> bytes(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, bytes.data(), 0, bytes.size());
+        for (const uint8_t b : bytes) {
+            h ^= b;
+            h *= 0x100000001b3ULL;
+        }
+    }
+    LLAMA_LOG_INFO("tensor-hash: %c %" PRIu64 " %s %s [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] %s %016" PRIx64 "%s\n",
+            th->role, th->n++, t->name, ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+            t->buffer ? ggml_backend_buffer_name(t->buffer) : "none", readable ? h : 0, readable ? "" : " (not read)");
+    return true;
+}
+
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -255,6 +285,25 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    // LLAMA_TENSOR_HASH=<prefix>[,<prefix>...] (C762, checks): the named nodes hashed once computed, unless the caller
+    // has an eval callback of its own
+    if (const char * s = getenv("LLAMA_TENSOR_HASH"); s != nullptr && *s != '\0' && cparams.cb_eval == nullptr) {
+        std::stringstream ss(s);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            if (!item.empty()) {
+                tensor_hash.prefixes.push_back(item);
+            }
+        }
+        if (!tensor_hash.prefixes.empty()) {
+            tensor_hash.role          = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? 'd' : 'v';
+            cparams.cb_eval           = llama_tensor_hash_eval;
+            cparams.cb_eval_user_data = &tensor_hash;
+            LLAMA_LOG_INFO("%s: LLAMA_TENSOR_HASH: %zu name prefixes hashed after each evaluation\n", __func__,
+                    tensor_hash.prefixes.size());
+        }
+    }
 
     cparams.ctx_other = nullptr;
 
