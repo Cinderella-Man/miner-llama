@@ -3,6 +3,7 @@
 #include "mmvq-pascal-kcol.cuh"
 #include "mmvq-pascal-mtok.cuh"
 #include "mmvq-pascal-q5k.cuh"
+#include "mmvq-pascal-dmt.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1753,6 +1754,12 @@ void ggml_cuda_mul_mat_vec_q(
     // decoded once for all tokens, each token's sums those of the one-token kernel
     if (!ids && !fusion && src0->type == GGML_TYPE_Q5_K && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmvq_pascal_q5k_mt(src0->data, src1_q8, dst_d, ne00, ne01, ne11, nb01, s11, s1, stream)) {
+        return;
+    }
+    // ... and of a plain IQ4_XS or Q4_K product with GGML_CUDA_MMVQ_PASCAL_DMT (the attention and recurrent projections
+    // of a verify), the same way
+    if (!ids && !fusion && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_cuda_mmvq_pascal_dmt(src0->type, src0->data, src1_q8, dst_d, ne00, ne01, ne11, nb01, s11, s1, stream)) {
         return;
     }
 

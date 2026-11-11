@@ -1,6 +1,7 @@
 #include "mmvq-pascal-kcol.cuh"
 #include "mmvq-pascal.cuh"
 #include "mmvq-pascal-q5k.cuh"
+#include "mmvq-pascal-dmt.cuh"
 
 #include <algorithm>
 #include <climits>
@@ -219,6 +220,10 @@ bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tens
     // GGML_CUDA_MMVQ_PASCAL_Q5K_MT: Q5_K's products of 2 to 4 columns go to mmvq-pascal-q5k.cu (each token's sums those
     // of the one-token kernel)
     if (src0->type == GGML_TYPE_Q5_K && ggml_cuda_mmvq_pascal_q5k_mt_takes(K, nrows, ncols, src0->nb[1], src0->data)) {
+        return false;
+    }
+    // GGML_CUDA_MMVQ_PASCAL_DMT: IQ4_XS's and Q4_K's products of 2 to 4 columns go to mmvq-pascal-dmt.cu (the same)
+    if (ggml_cuda_mmvq_pascal_dmt_takes(src0->type, K, nrows, ncols, src0->nb[1], src0->data)) {
         return false;
     }
     if (ncols == 1 && mode == 1) {
