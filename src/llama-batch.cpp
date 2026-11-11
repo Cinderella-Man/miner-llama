@@ -835,8 +835,31 @@ uint32_t llama_batch_allocr::plan_cap(uint32_t n_ubatch) const {
     return n_ubatch;
 }
 
+void llama_batch_allocr::set_ubatch_cuts(std::vector<uint32_t> cuts) {
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+    ubatch_cuts = std::move(cuts);
+}
+
+bool llama_batch_allocr::is_one_seq() const {
+    return batch.n_tokens > 0 && seq_id_unq.size() == 1 && !has_cpl;
+}
+
+uint32_t llama_batch_allocr::cut_next() const {
+    // as the plan: the cuts are set for batches of one sequence, whose splits take the tokens in order
+    for (const uint32_t cut : ubatch_cuts) {
+        if (cut > n_used) {
+            return cut;
+        }
+    }
+    return UINT32_MAX;
+}
+
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     n_ubatch = plan_cap(n_ubatch);
+    if (const uint32_t cut = cut_next(); cut != UINT32_MAX) {
+        n_ubatch = std::min(n_ubatch, cut - n_used);
+    }
 
     // find the first unused token
     uint32_t cur_idx = 0;
@@ -883,6 +906,9 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
         return {};
     }
+
+    // C217: the sequence's tokens end at the next cut for this split (one sequence: its token list is the batch)
+    const size_t n_cut = cut_next();
 
     std::vector<seq_set_t> cur_seq_set;
 
@@ -946,7 +972,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         bool can_expand = true;
 
         for (uint32_t s = 0; s < n_seqs; ++s) {
-            if (cur_idx[s] >= (int32_t) seq_set_map[cur_seq_set[s]].size()) {
+            if (cur_idx[s] >= (int32_t) std::min(seq_set_map[cur_seq_set[s]].size(), n_cut)) {
                 can_expand = false;
                 break;
             }
@@ -979,7 +1005,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         GGML_ASSERT(n_ubatch > n_keep_tail);
 
         auto n_remaining = [&](uint32_t s) {
-            return (uint32_t) (seq_set_map[cur_seq_set[s]].size() - cur_idx[s]);
+            return (uint32_t) (std::min(seq_set_map[cur_seq_set[s]].size(), n_cut) - cur_idx[s]);
         };
 
         // keep the longest prefix of seqs that satisfy the constraint, to preserve sequential seq ids
@@ -1050,6 +1076,9 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
     n_ubatch = plan_cap(n_ubatch);
+    if (const uint32_t cut = cut_next(); cut != UINT32_MAX) {
+        n_ubatch = std::min(n_ubatch, cut - n_used);
+    }
 
     // find the first unused token
     uint32_t cur_idx = 0;
@@ -1126,6 +1155,7 @@ void llama_batch_allocr::clear() {
     std::fill(seq_idx.begin(), seq_idx.end(), -1);
 
     ubatch_plan.clear();
+    ubatch_cuts.clear();
 }
 
 llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs) {

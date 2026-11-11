@@ -4105,6 +4105,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     taper_next_head = -1;
     taper_next_tail = -1;
 
+    // C217: the device-store fills requested for this call; their results stay until the next call
+    store_at_last = std::move(store_at_next);
+    store_at_next.clear();
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -4196,6 +4200,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+
+    // C217: the micro-batch cuts of this call, the caller's and the fills' (a batch of one sequence)
+    if ((!ubatch_cuts.empty() || !store_at_last.empty()) && balloc->is_one_seq()) {
+        const llama_seq_id seq_id = balloc->get_batch().seq_id[0][0];
+
+        std::vector<uint32_t> cuts;
+        for (const uint32_t c : ubatch_cuts) {
+            if (c > 0 && c < n_tokens_all) {
+                cuts.push_back(c);
+            }
+        }
+        for (const auto & r : store_at_last) {
+            if (r.seq_id == seq_id && r.i_end > 0 && r.i_end < n_tokens_all) {
+                cuts.push_back(r.i_end);
+            }
+        }
+        balloc->set_ubatch_cuts(std::move(cuts));
+    }
 
     if (output_all) {
         // require that all tokens are output
@@ -4430,6 +4452,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // the staircase drafter commits this micro-batch's positions of its sequence
         if (pipe_drafter) {
             pipe_drafter->on_ubatch(ubatch, res, sched_res());
+        }
+
+        // C217: device-store fills where this micro-batch ends, the state as a call that ended here leaves it
+        for (auto & r : store_at_last) {
+            if (!r.done && r.i_end == n_tokens_prev + ubatch.n_tokens && ubatch.n_seqs_unq == 1 && ubatch.seq_id_unq[0] == r.seq_id) {
+                if (!state_seq_fill_store_at(r)) {
+                    LLAMA_LOG_WARN("%s: store %d of seq %d could not be filled inside the call\n", __func__, r.store, r.seq_id);
+                }
+            }
         }
 
         // plot the computation graph in dot format (for debugging purposes)
@@ -5985,7 +6016,25 @@ public:
         return size_written;
     }
 
+    // the copies into a store wait for the devices (llama_state_seq_get_data_store)
     bool commit() {
+        ggml_context_ptr ctx_views;
+        std::vector<const ggml_tensor *> srcs;
+        std::vector<ggml_tensor *>       dsts;
+        if (!prepare(ctx_views, srcs, dsts)) {
+            return false;
+        }
+
+        ggml_backend_tensor_copy_n(srcs.data(), dsts.data(), srcs.size());
+
+        store.fences.clear();
+
+        return true;
+    }
+
+    // allocates the store's buffers where needed, records the blob, and lists the copies: views of the state's rows
+    // (in ctx_views) and the store's tensors; false if the buffers could not be allocated
+    bool prepare(ggml_context_ptr & ctx_views, std::vector<const ggml_tensor *> & srcs, std::vector<ggml_tensor *> & dsts) {
         // a store keeps its buffers while the state's tensors keep their types, sizes and devices
         bool same = store.pieces.size() == winfos.size();
         for (size_t i = 0; same && i < winfos.size(); ++i) {
@@ -6042,10 +6091,10 @@ public:
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
-        ggml_context_ptr ctx_views(ggml_init(params));
+        ctx_views.reset(ggml_init(params));
 
-        std::vector<const ggml_tensor *> srcs;
-        std::vector<ggml_tensor *>       dsts;
+        srcs.clear();
+        dsts.clear();
 
         store.size_data = 0;
         for (size_t i = 0; i < winfos.size(); ++i) {
@@ -6060,8 +6109,6 @@ public:
             store.pieces[i].second = w.meta_off;
             store.size_data += w.size;
         }
-
-        ggml_backend_tensor_copy_n(srcs.data(), dsts.data(), srcs.size());
 
         store.size_meta = size_written;
         store.meta.assign(ptr - size_written, ptr);
@@ -6386,6 +6433,7 @@ size_t llama_context::state_seq_store_get_size_host(llama_seq_id seq_id, int32_t
 
 size_t llama_context::state_seq_store_get_data_host(llama_seq_id seq_id, int32_t store_id, const uint8_t * src, size_t src_size, uint8_t * dst, size_t dst_size) {
     std::vector<std::pair<ggml_tensor *, size_t>> pieces;
+    std::vector<ggml_backend_event_t> fences;
 
     size_t size_meta = 0;
     size_t size_data = 0;
@@ -6397,12 +6445,20 @@ size_t llama_context::state_seq_store_get_data_host(llama_seq_id seq_id, int32_t
             pieces    = it->second.pieces;
             size_meta = it->second.size_meta;
             size_data = it->second.size_data;
+            for (const auto & ev : it->second.fences) {
+                fences.push_back(ev.get());
+            }
         }
     }
 
     if (size_meta == 0 || dst_size < size_meta + size_data) {
         LLAMA_LOG_ERROR("%s: store %d of seq %d does not hold this state, or dst is too small\n", __func__, store_id, seq_id);
         return 0;
+    }
+
+    // a fill inside a decode (C217): its copies first
+    for (auto * ev : fences) {
+        ggml_backend_event_synchronize(ev);
     }
 
     // the blob's bytes, with each copy's bytes put back where the state wrote them
@@ -6426,6 +6482,107 @@ void llama_context::state_seq_store_free(llama_seq_id seq_id, int32_t store_id) 
     std::lock_guard<std::mutex> lock(state_stores_mtx);
 
     state_stores.erase({seq_id, store_id});
+}
+
+void llama_context::set_ubatch_cuts(const uint32_t * cuts, size_t n) {
+    ubatch_cuts.assign(cuts, cuts + n);
+}
+
+void llama_context::state_seq_store_at(llama_seq_id seq_id, int32_t store, uint32_t i_end, llama_state_seq_flags flags) {
+    store_at_req r;
+    r.seq_id = seq_id;
+    r.store  = store;
+    r.i_end  = i_end;
+    r.flags  = flags | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+
+    store_at_next.push_back(std::move(r));
+}
+
+size_t llama_context::state_seq_store_at_get(llama_seq_id seq_id, int32_t store, uint8_t * dst, size_t size, llama_pos * pos_min, llama_pos * pos_max) const {
+    for (const auto & r : store_at_last) {
+        if (!r.done || r.seq_id != seq_id || r.store != store) {
+            continue;
+        }
+        if (dst != nullptr) {
+            if (size < r.blob.size()) {
+                return 0;
+            }
+            memcpy(dst, r.blob.data(), r.blob.size());
+        }
+        if (pos_min) {
+            *pos_min = r.pos_min;
+        }
+        if (pos_max) {
+            *pos_max = r.pos_max;
+        }
+        return r.blob.size();
+    }
+
+    return 0;
+}
+
+bool llama_context::state_seq_fill_store_at(store_at_req & r) {
+    r.blob.resize(state_seq_get_size(r.seq_id, r.flags));
+    if (r.blob.empty()) {
+        return false;
+    }
+
+    llama_state_store * store = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state_stores_mtx);
+        store = &state_stores[{r.seq_id, r.store}];
+    }
+
+    llama_io_write_store io(r.blob.data(), r.blob.size(), *store);
+
+    ggml_context_ptr ctx_views;
+    std::vector<const ggml_tensor *> srcs;
+    std::vector<ggml_tensor *>       dsts;
+
+    try {
+        io.write(&io_magic,   sizeof(io_magic));
+        io.write(&r.seq_id,   sizeof(r.seq_id));
+
+        if (state_seq_write_data(io, r.seq_id, r.flags) != r.blob.size() || !io.prepare(ctx_views, srcs, dsts)) {
+            r.blob.clear();
+            return false;
+        }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        r.blob.clear();
+        return false;
+    }
+
+    // each row copied on the stream of the backend whose device holds it: behind this micro-batch's writes to it, ahead
+    // of the next one's
+    std::vector<ggml_backend_t> used;
+    for (size_t i = 0; i < srcs.size(); ++i) {
+        ggml_backend_t backend = backend_from_dev(ggml_backend_buft_get_device(llama_tensor_buft(srcs[i])));
+        if (backend == nullptr) {
+            synchronize();
+            ggml_backend_tensor_copy(srcs[i], dsts[i]);
+            continue;
+        }
+        ggml_backend_tensor_copy_async(backend, backend, srcs[i], dsts[i]);
+        if (std::find(used.begin(), used.end(), backend) == used.end()) {
+            used.push_back(backend);
+        }
+    }
+
+    store->fences.clear();
+    for (ggml_backend_t backend : used) {
+        ggml_backend_event_t ev = ggml_backend_event_new(ggml_backend_get_device(backend));
+        if (ev != nullptr) {
+            ggml_backend_event_record(ev, backend);
+            store->fences.emplace_back(ev);
+        }
+    }
+
+    r.pos_min = memory->seq_pos_min(r.seq_id);
+    r.pos_max = memory->seq_pos_max(r.seq_id);
+    r.done    = true;
+
+    return true;
 }
 
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
@@ -7727,6 +7884,18 @@ size_t llama_state_seq_store_get_data_host(llama_context * ctx, const uint8_t * 
 
 void llama_state_seq_store_free(llama_context * ctx, llama_seq_id seq_id, int32_t store) {
     ctx->state_seq_store_free(seq_id, store);
+}
+
+void llama_set_ubatch_cuts(llama_context * ctx, const uint32_t * cuts, size_t n) {
+    ctx->set_ubatch_cuts(cuts, n);
+}
+
+void llama_state_seq_store_at(llama_context * ctx, llama_seq_id seq_id, int32_t store, uint32_t i_end, llama_state_seq_flags flags) {
+    ctx->state_seq_store_at(seq_id, store, i_end, flags);
+}
+
+size_t llama_state_seq_store_at_get(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, int32_t store, llama_pos * pos_min, llama_pos * pos_max) {
+    return ctx->state_seq_store_at_get(seq_id, store, dst, size, pos_min, pos_max);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

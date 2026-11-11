@@ -253,6 +253,14 @@ bool common_speculative_pending(const common_speculative * spec);
 bool common_speculative_flush(common_speculative * spec);
 void common_speculative_after_catchup(common_speculative * spec, std::function<void()> && fn);
 
+// C217: whether common_speculative_process of a target batch cut with llama_set_ubatch_cuts (the same cuts set on the
+// draft context) leaves what separate calls cut there leave, with common_speculative_get_state_at for the state at a
+// cut; true without speculation
+bool common_speculative_incall_ok(const common_speculative * spec);
+
+// C217: what common_speculative_get_state would return had the last processed batch ended before its row i_row
+bool common_speculative_get_state_at(common_speculative * spec, llama_seq_id seq_id, int32_t i_row, std::vector<uint8_t> & data);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 

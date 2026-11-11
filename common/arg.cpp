@@ -1807,6 +1807,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_VRAM_SYNC").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--ctx-checkpoints-incall"},
+        "take a context checkpoint inside a prompt's decode call instead of cutting the call there: the state goes into "
+        "its device store (--ctx-checkpoints-vram) by copies queued behind the micro-batch that ends at it, so the "
+        "devices do not wait; calls are joined only where the joined call holds the micro-batches the cut calls would, "
+        "so the checkpoints and every number stay the same (one slot's batch, no speculation or an MTP draft; default: off)",
+        [](common_params & params) {
+            params.checkpoint_incall = true;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_INCALL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--ctx-checkpoints-spread"}, "N",
         string_format("context checkpoints at most N tokens apart inside a prompt: at the first message start N/2 or "
             "more tokens after the previous checkpoint, or N tokens after it if no message starts, and a full list "

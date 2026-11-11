@@ -2165,6 +2165,20 @@ private:
     int32_t ckpt_vram_stores = 0;
     std::map<int, ckpt_spill_job> ckpt_spills; // by slot id
 
+    // --ctx-checkpoints-incall (C217): checkpoints taken inside a prompt's decode call. While a batch is built and run,
+    // ckpt_incall holds its checkpoints until the call has filled their stores, incall_cuts the batch rows where the
+    // calls it joins would have ended, and ckpt_incall_slot the slot whose batch it is (no other slot joins it)
+    struct ckpt_incall_job {
+        std::shared_ptr<common_prompt_checkpoint> ck;
+        int     slot_id;
+        int32_t i_batch;
+        bool    done = false;
+    };
+    bool    ckpt_incall_on   = false;
+    int     ckpt_incall_slot = -1;
+    std::vector<ckpt_incall_job> ckpt_incall;
+    std::vector<int32_t>         incall_cuts;
+
     // Q771: the target context's micro-batch taper: the server's (--ubatch-taper, else LLAMA_UBATCH_TAPER) and the one
     // set now (a request's "ubatch_taper" sets it for the batches of its prompt)
     std::string taper_default = "off";
@@ -2792,6 +2806,26 @@ private:
             SRV_INF("context checkpoints on the devices: the newest %d of each slot, older ones move to the host %s\n",
                     ckpt_vram_n, params_base.checkpoint_vram_sync ? "at once" : "in the background");
         }
+        // C217: checkpoints inside a prompt's calls go into device stores, need a model without sliding-window layers
+        // (whose checkpoints hold a ring of cells), and a speculative decoder whose pass over a call follows its cuts
+        ckpt_incall_on = false;
+        if (params_base.checkpoint_incall) {
+            const char * why = nullptr;
+            if (ckpt_vram_n <= 0) {
+                why = "it needs --ctx-checkpoints-vram";
+            } else if (n_swa > 0) {
+                why = "not with sliding-window layers";
+            } else if (!common_speculative_incall_ok(spec.get())) {
+                why = "not with this speculative decoding";
+            }
+            if (why != nullptr) {
+                SRV_WRN("--ctx-checkpoints-incall: %s - off\n", why);
+            } else {
+                ckpt_incall_on = true;
+                SRV_INF("%s", "context checkpoints inside a prompt's decode calls, into their device stores without a wait\n");
+            }
+        }
+
         if (params_base.checkpoint_spread > 0 && params_base.n_ctx_checkpoints > 0) {
             SRV_INF("context checkpoints inside prompts every %d tokens, evicted by the smallest gap\n", params_base.checkpoint_spread);
         }
@@ -4071,19 +4105,8 @@ private:
         create_checkpoint(slot, 0, pos_min, pos_max);
     }
 
-    // n_tokens_cur: the number of tokens added to the batch for the current slot
-    // a sliding-window model's checkpoints hold the whole ring (ckpt_trim): a restore then occupies the cells that
-    // processing the prompt again does, so attention sums over the same cells, and one cut back to an earlier divergence
-    // still has a complete window
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        const bool ring = ckpt_trim && ckpt_ring;
-
-        const int id_task = slot.task->id;
-
-        slot.stats.n_ckpt_created++;
-
-        const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
-
+    // the room a new checkpoint at n_tokens_new takes in the slot's list (create_checkpoint)
+    void ckpt_make_room(server_slot & slot, const int id_task, const int64_t n_tokens_new) {
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -4132,6 +4155,22 @@ private:
                 slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             ckpt_evict_smallest_gap(slot, n_tokens_new);
         }
+    }
+
+    // n_tokens_cur: the number of tokens added to the batch for the current slot
+    // a sliding-window model's checkpoints hold the whole ring (ckpt_trim): a restore then occupies the cells that
+    // processing the prompt again does, so attention sums over the same cells, and one cut back to an earlier divergence
+    // still has a complete window
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        const bool ring = ckpt_trim && ckpt_ring;
+
+        const int id_task = slot.task->id;
+
+        slot.stats.n_ckpt_created++;
+
+        const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+
+        ckpt_make_room(slot, id_task, n_tokens_new);
 
         // filled in place: until this function returns, only the slot's list holds it
         auto ckpt = std::make_shared<common_prompt_checkpoint>();
@@ -4184,6 +4223,161 @@ private:
         if (on_dev) {
             ckpt_vram_trim(slot);
         }
+    }
+
+    // --ctx-checkpoints-incall (C217): the checkpoint at batch row i_batch, where the call the batch joins there would
+    // have started (n_tokens_cur tokens of it in the batch): its place in the list and its device store now, as
+    // create_checkpoint takes them, its data once the decode call has filled the store (ckpt_incall_finish)
+    void create_checkpoint_incall(server_slot & slot, const int64_t n_tokens_cur, int32_t i_batch) {
+        slot.stats.n_ckpt_created++;
+
+        const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+
+        ckpt_make_room(slot, slot.task->id, n_tokens_new);
+
+        const int32_t store = ckpt_store_free(slot);
+        if (store < 0) {
+            SLT_WRN(slot, "no free device store for the context checkpoint at n_tokens = %" PRId64 " inside the call - none taken\n", n_tokens_new);
+            return;
+        }
+
+        auto ckpt = std::make_shared<common_prompt_checkpoint>();
+        slot.prompt.checkpoints.push_back(ckpt);
+
+        ckpt->id_task = slot.task->id;
+        ckpt->update_pos(n_tokens_new, -1, -1);
+        ckpt->store   = store;
+
+        ckpt_incall.push_back({ ckpt, slot.id, i_batch });
+
+        // a later checkpoint of the same batch may evict it before the call fills it: then it costs no copy at all
+        SLT_TRC(slot, "context checkpoint at n_tokens = %" PRId64 " goes inside the call (store %d)\n", n_tokens_new, store);
+    }
+
+    // whether create_checkpoint_incall will find a free device store: one is free now, or every checkpoint of the list
+    // can sit in a store (--ctx-checkpoints-vram covers --ctx-checkpoints), so that all being taken means a full list
+    // of them, of which making room drops one
+    bool ckpt_incall_store_ok(server_slot & slot) {
+        return ckpt_vram_n >= params_base.n_ctx_checkpoints || ckpt_store_free(slot) >= 0;
+    }
+
+    server_slot * slot_by_id(int id) {
+        for (auto & slot : slots) {
+            if (slot.id == id) {
+                return &slot;
+            }
+        }
+        return nullptr;
+    }
+
+    // whether the slot's list still holds an in-call checkpoint (a later one of the same batch may have evicted it)
+    static bool ckpt_incall_listed(const server_slot & slot, const ckpt_incall_job & ic) {
+        return std::find(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(), ic.ck) != slot.prompt.checkpoints.end();
+    }
+
+    // before the decode call of the batch rows [off, off + n): its fills inside the call and its micro-batch cuts, as rows
+    // of the call (cuts). The draft context gets the same fills for its part of each checkpoint (under the checkpoint's
+    // store id in that context), taken in its pass over the call
+    void ckpt_incall_begin(int32_t off, int32_t n, std::vector<uint32_t> & cuts) {
+        for (const int32_t b : incall_cuts) {
+            if (b > off && b < off + n) {
+                cuts.push_back((uint32_t) (b - off));
+            }
+        }
+        for (auto & ic : ckpt_incall) {
+            if (ic.done || ic.i_batch <= off || ic.i_batch >= off + n) {
+                continue;
+            }
+            server_slot * slot = slot_by_id(ic.slot_id);
+            if (slot == nullptr || !ckpt_incall_listed(*slot, ic)) {
+                ic.done = true;
+                continue;
+            }
+            llama_state_seq_store_at(ctx_tgt, slot->id, ic.ck->store, (uint32_t) (ic.i_batch - off), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (ctx_dft != nullptr) {
+                llama_state_seq_store_at(ctx_dft, slot->id, ic.ck->store, (uint32_t) (ic.i_batch - off), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+        }
+        llama_set_ubatch_cuts(ctx_tgt, cuts.data(), cuts.size());
+    }
+
+    // after that call (and the draft's pass over it): the checkpoint's data, as create_checkpoint saves it
+    void ckpt_incall_finish(ckpt_incall_job & ic, int32_t off) {
+        ic.done = true;
+
+        server_slot * sp = slot_by_id(ic.slot_id);
+        if (sp == nullptr || !ckpt_incall_listed(*sp, ic)) {
+            return;
+        }
+        server_slot & slot = *sp;
+        auto & cur = *ic.ck;
+
+        const int64_t t_save_start = ggml_time_us();
+
+        llama_pos pos_min = -1;
+        llama_pos pos_max = -1;
+        const size_t n = llama_state_seq_store_at_get(ctx_tgt, nullptr, 0, slot.id, cur.store, &pos_min, &pos_max);
+        if (n == 0) {
+            SLT_WRN(slot, "the context checkpoint at n_tokens = %" PRId64 " was not taken inside the call (store %d) - erased, and checkpoints cut the calls again from now on\n",
+                    cur.n_tokens, cur.store);
+            slot.prompt.checkpoints.remove(ic.ck);
+            ckpt_incall_on = false;
+            return;
+        }
+
+        // the draft's part as update_dft takes it: its fill in the draft's pass, in the host format
+        if (ctx_dft != nullptr) {
+            std::vector<uint8_t> blob(llama_state_seq_store_at_get(ctx_dft, nullptr, 0, slot.id, cur.store, nullptr, nullptr));
+            const size_t n_host = blob.empty() ? 0 : llama_state_seq_store_get_size_host(ctx_dft, slot.id, cur.store);
+            cur.data_dft.resize(n_host);
+            if (n_host == 0 ||
+                llama_state_seq_store_at_get(ctx_dft, blob.data(), blob.size(), slot.id, cur.store, nullptr, nullptr) != blob.size() ||
+                llama_state_seq_store_get_data_host(ctx_dft, blob.data(), blob.size(), cur.data_dft.data(), n_host, slot.id, cur.store) != n_host) {
+                SLT_WRN(slot, "the draft's part of the context checkpoint at n_tokens = %" PRId64 " was not taken inside the call - erased, and checkpoints cut the calls again from now on\n",
+                        cur.n_tokens);
+                slot.prompt.checkpoints.remove(ic.ck);
+                ckpt_incall_on = false;
+                return;
+            }
+        }
+
+        cur.data_tgt.resize(n);
+        llama_state_seq_store_at_get(ctx_tgt, cur.data_tgt.data(), n, slot.id, cur.store, nullptr, nullptr);
+        cur.update_pos(cur.n_tokens, pos_min, pos_max);
+        cur.size_dev = llama_state_seq_store_get_size_host(ctx_tgt, slot.id, cur.store) - n;
+        // the draft's speculative state at the checkpoint, as the call that ended there would leave it
+        common_speculative_get_state_at(spec.get(), slot.id, ic.i_batch - off, cur.data_spec);
+
+        const int64_t t_save_us = ggml_time_us() - t_save_start;
+
+        slot.stats.t_ckpt_save_us += t_save_us;
+        slot.stats.n_ckpt_dev++;
+        slot.stats.n_ckpt_incall++;
+
+        SLT_TRC(slot,
+                "created context checkpoint %d of %d inside the call (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, on the devices %.3f MiB, store %d, %.1f ms)\n",
+                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, (float) cur.size_dev / 1024 / 1024, cur.store, t_save_us / 1000.0);
+
+        ckpt_vram_trim(slot);
+    }
+
+    // the end of a batch: checkpoints of it that no call filled leave their lists (a retried or failed call)
+    void ckpt_incall_drop(const char * why) {
+        for (auto & ic : ckpt_incall) {
+            if (ic.done) {
+                continue;
+            }
+            ic.done = true;
+            server_slot * slot = slot_by_id(ic.slot_id);
+            if (slot != nullptr && ckpt_incall_listed(*slot, ic)) {
+                SLT_WRN(*slot, "context checkpoint at n_tokens = %" PRId64 " erased: %s\n", ic.ck->n_tokens, why);
+                slot->prompt.checkpoints.remove(ic.ck);
+            }
+        }
+        ckpt_incall.clear();
+        incall_cuts.clear();
+        ckpt_incall_slot = -1;
     }
 
     // --ctx-checkpoints-spread (C28): erases the checkpoint whose removal leaves the smallest gap between its neighbours:
@@ -5607,6 +5801,8 @@ private:
                 break; // stop any further processing
             }
         }
+
+        ckpt_incall_drop("its decode call failed");
     }
 
     // realtime conversations (SERVER_TASK_TYPE_REALTIME) drive their own decode loop, see server_realtime_slot
@@ -5770,6 +5966,7 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+        ckpt_incall_drop("its batch was not decoded");
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -5950,6 +6147,11 @@ private:
             iterate(slots, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
+                }
+
+                // C217: a batch with checkpoints inside its call holds one slot's prompt
+                if (ckpt_incall_slot >= 0) {
+                    return;
                 }
 
                 if (!slot.is_processing() || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
@@ -6501,179 +6703,227 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
-                    // --ctx-checkpoints-spread: this batch starts where the last one stopped for a checkpoint inside the
-                    // prompt; the next such checkpoint is spread tokens after the last one, or after this batch's start
-                    // where it takes one
-                    const int64_t n_batch_start = slot.prompt.n_tokens();
-                    const bool    spread_start  = n_batch_start == slot.ckpt_spread_pos;
-                    int64_t ckpt_spread_ref = slot.prompt.checkpoints.empty() ? 0 : slot.prompt.checkpoints.back()->n_tokens;
-                    if (spread_start || spans.is_user_start(n_batch_start)) {
-                        ckpt_spread_ref = std::max(ckpt_spread_ref, n_batch_start);
-                    }
-                    slot.ckpt_spread_pos = -1;
+                    // C217 (--ctx-checkpoints-incall): the batch may go on past a break for a checkpoint, in parts: each
+                    // part is the call that would have followed without the switch, joined only where it fits whole, and
+                    // the decode call cuts its micro-batches where those calls end, so every number stays the same
+                    const bool do_checkpoint_all = do_checkpoint;
+                    const bool incall_slot = n_tokens_prev == 0 && do_checkpoint_all && !input_tokens.has_mtmd && !prefix_break &&
+                            !wait_shared && alora_scale <= 0.0f && slot.task->decision.order.empty() && !use_mixed_batch();
+                    for (int part = 0; ; ++part) {
+                        do_checkpoint = do_checkpoint_all;
 
-                    // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
-                        // get next token to process
-                        llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
-                        if (cur_tok == LLAMA_TOKEN_NULL) {
-                            break; // end of text chunk
+                        const int32_t n_part_prev     = part == 0 ? (int32_t) n_tokens_prev : batch.size();
+                        const int64_t n_part_tok      = slot.prompt.n_tokens();
+                        const int64_t spread_pos_prev = slot.ckpt_spread_pos;
+
+                        // --ctx-checkpoints-spread: this batch starts where the last one stopped for a checkpoint inside the
+                        // prompt; the next such checkpoint is spread tokens after the last one, or after this batch's start
+                        // where it takes one
+                        const int64_t n_batch_start = slot.prompt.n_tokens();
+                        const bool    spread_start  = n_batch_start == slot.ckpt_spread_pos;
+                        int64_t ckpt_spread_ref = slot.prompt.checkpoints.empty() ? 0 : slot.prompt.checkpoints.back()->n_tokens;
+                        if (spread_start || spans.is_user_start(n_batch_start)) {
+                            ckpt_spread_ref = std::max(ckpt_spread_ref, n_batch_start);
                         }
+                        slot.ckpt_spread_pos = -1;
 
-                        // stop at the end of the shared prefix, the children are started from this state
-                        if (wait_shared && slot.prompt.n_tokens() == slot.task->n_tokens_shared) {
-                            break;
-                        }
+                        // add prompt tokens for processing in the current batch
+                        bool part_break      = false; // the loop stopped at a break below
+                        bool part_ckpt_break = false; // at one for a checkpoint at the next batch's start
+                        while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                            // get next token to process
+                            llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
+                            if (cur_tok == LLAMA_TOKEN_NULL) {
+                                part_break = true;
+                                break; // end of text chunk
+                            }
 
-                        // the outputs of a decision are read from one batch, do not split them
-                        if (slot.prompt.n_tokens() == n_decision_first && batch.size() + slot.task->n_tokens() - n_decision_first > n_batch) {
-                            break;
-                        }
-
-                        // if this is an alora request with pre-invocation
-                        // tokens that are not cached, we need to stop filling
-                        // this batch at those pre-invocation tokens.
-                        if (alora_scale > 0 && slot.prompt.n_tokens() == slot.alora_invocation_start - 1) {
-                            SLT_DBG(slot, "stop prompt batch filling at (n_tokens = %d, alora_invocation_start = %d)\n", slot.prompt.n_tokens(), slot.alora_invocation_start);
-                            break;
-                        }
-
-                        // embedding requires all tokens in the batch to be output;
-                        // MTP also wants logits at every prompt position so the
-                        // streaming hook can mirror t_h_nextn into ctx_dft.
-                        add_ok &= batch.add(slot.id,
-                            cur_tok,
-                            /* pos       = */ slot.prompt.tokens.pos_next(),
-                            /* output    = */ slot.need_embd(),
-                            /* is_prompt = */ true);
-                        if (!slot.task->decision.order.empty()) {
-                            batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
-                        }
-                        slot.prompt.tokens.push_back(cur_tok);
-
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
-                            const auto pos = slot.prompt.n_tokens();
-                            const auto & checkpoints = slot.prompt.checkpoints;
-
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) {
+                            // stop at the end of the shared prefix, the children are started from this state
+                            if (wait_shared && slot.prompt.n_tokens() == slot.task->n_tokens_shared) {
+                                part_break = true;
                                 break;
                             }
-                        }
 
-                        if (do_checkpoint && ckpt_spread_at(slot, slot.prompt.n_tokens(), ckpt_spread_ref)) {
-                            slot.ckpt_spread_pos = slot.prompt.n_tokens();
-                            break;
-                        }
+                            // the outputs of a decision are read from one batch, do not split them
+                            if (slot.prompt.n_tokens() == n_decision_first && batch.size() + slot.task->n_tokens() - n_decision_first > n_batch) {
+                                part_break = true;
+                                break;
+                            }
 
-                        if (prefix_break && (int32_t) slot.prompt.n_tokens() == first_user_pos) {
-                            break;
-                        }
+                            // if this is an alora request with pre-invocation
+                            // tokens that are not cached, we need to stop filling
+                            // this batch at those pre-invocation tokens.
+                            if (alora_scale > 0 && slot.prompt.n_tokens() == slot.alora_invocation_start - 1) {
+                                SLT_DBG(slot, "stop prompt batch filling at (n_tokens = %d, alora_invocation_start = %d)\n", slot.prompt.n_tokens(), slot.alora_invocation_start);
+                                part_break = true;
+                                break;
+                            }
 
-                        // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
-                        // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch
-                        //  - 4
-                        // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        // a sliding-window model needs only the second, taken with its whole ring of n_swa + n_ubatch cells:
-                        // it serves every restore the first would (ckpt_trim); --checkpoint-tail2 takes both, as stock
-                        if (do_tail_checkpoint) {
-                            const bool tail2 = !ckpt_trim || params_base.checkpoint_tail2;
-                            const int checkpoint_offsets[] = {tail2 ? 4 + n_ubatch : 4, 4};
+                            // embedding requires all tokens in the batch to be output;
+                            // MTP also wants logits at every prompt position so the
+                            // streaming hook can mirror t_h_nextn into ctx_dft.
+                            add_ok &= batch.add(slot.id,
+                                cur_tok,
+                                /* pos       = */ slot.prompt.tokens.pos_next(),
+                                /* output    = */ slot.need_embd(),
+                                /* is_prompt = */ true);
+                            if (!slot.task->decision.order.empty()) {
+                                batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
+                            }
+                            slot.prompt.tokens.push_back(cur_tok);
 
-                            bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
-                                const int n_last = std::min(n_batch, offset);
-                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
-                                    should_break = true;
+                            // break at the last user message, or at user messages at least min step past the last checkpoint
+                            if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                                const auto pos = slot.prompt.n_tokens();
+                                const auto & checkpoints = slot.prompt.checkpoints;
+
+                                if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) {
+                                    part_break = part_ckpt_break = true;
                                     break;
                                 }
                             }
-                            if (should_break) {
+
+                            if (do_checkpoint && ckpt_spread_at(slot, slot.prompt.n_tokens(), ckpt_spread_ref)) {
+                                slot.ckpt_spread_pos = slot.prompt.n_tokens();
+                                part_break = part_ckpt_break = true;
                                 break;
                             }
+
+                            if (prefix_break && (int32_t) slot.prompt.n_tokens() == first_user_pos) {
+                                part_break = true;
+                                break;
+                            }
+
+                            // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
+                            // create checkpoints that many tokens before the end of the prompt:
+                            //  - 4 + n_ubatch
+                            //  - 4
+                            // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+                            // a sliding-window model needs only the second, taken with its whole ring of n_swa + n_ubatch cells:
+                            // it serves every restore the first would (ckpt_trim); --checkpoint-tail2 takes both, as stock
+                            if (do_tail_checkpoint) {
+                                const bool tail2 = !ckpt_trim || params_base.checkpoint_tail2;
+                                const int checkpoint_offsets[] = {tail2 ? 4 + n_ubatch : 4, 4};
+
+                                bool should_break = false;
+                                for (int offset : checkpoint_offsets) {
+                                    const int n_last = std::min(n_batch, offset);
+                                    if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                        should_break = true;
+                                        break;
+                                    }
+                                }
+                                if (should_break) {
+                                    part_break = part_ckpt_break = true;
+                                    break;
+                                }
+                            }
                         }
-                    }
 
-                    // the number of tokens added to the batch for the current slot
-                    const auto n_tokens_cur = batch.size() - n_tokens_prev;
-
-                    const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
-
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
-
-                    const bool is_user_start = spans.is_user_start(n_tokens_start);
-                    const bool is_last_user_message = n_tokens_start == last_user_pos;
-
-                    // one tail checkpoint with the whole sliding-window ring instead of two (--checkpoint-tail2): it serves
-                    // the restores of both
-                    const bool tail1 = ckpt_trim && !params_base.checkpoint_tail2;
-
-                    // spaced end-of-prompt checkpoints (LLAMA_SERVER_TAIL_CKPT_MIN): none this time; user messages and
-                    // --ctx-checkpoints-spread keep theirs
-                    if (!do_tail_checkpoint && near_prompt_end && !is_user_start && !spread_start) {
-                        do_checkpoint = false;
-                    }
-
-                    // entire prompt has been processed
-                    if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
-                        slot.state = SLOT_STATE_DONE_PROMPT;
-
-                        GGML_ASSERT(batch.size() > 0);
-
-                        // extract the logits only for the last token
-                        batch.set_output(batch.size() - 1, true);
-
-                        slot.stats.n_gen = 0;
-                        slot.i_batch     = batch.size() - 1;
-
-                        slot.init_sampler();
-
-                        if (slot.pipe_draws) {
-                            llama_sampler_set_pos(common_sampler_get(slot.smpl.get()), slot.prompt.tokens.pos_next() - 1);
+                        // C217: a later part that the batch's room cut short would have gone on in its own call: it is
+                        // taken back, and the next batch starts where it started, as without the switch
+                        if (part > 0 && !part_break && slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                            batch.truncate(n_part_prev);
+                            slot.prompt.tokens.keep_first(n_part_tok);
+                            slot.ckpt_spread_pos = spread_pos_prev;
+                            break;
                         }
-                    } else {
-                        // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        // (one tail checkpoint: only the last batch, 4 tokens before the end, takes it)
-                        // (--ctx-checkpoints-spread: or the last batch stopped for one inside the prompt)
-                        if (!is_user_start && !spread_start && (!near_prompt_end || tail1)) {
+                        if (part > 0) {
+                            ckpt_incall_slot = slot.id;
+                            incall_cuts.push_back(n_part_prev);
+                        }
+
+                        // the number of tokens added to the batch for the current slot
+                        const auto n_tokens_cur = batch.size() - n_part_prev;
+
+                        const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
+
+                        const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+
+                        const bool is_user_start = spans.is_user_start(n_tokens_start);
+                        const bool is_last_user_message = n_tokens_start == last_user_pos;
+
+                        // one tail checkpoint with the whole sliding-window ring instead of two (--checkpoint-tail2): it serves
+                        // the restores of both
+                        const bool tail1 = ckpt_trim && !params_base.checkpoint_tail2;
+
+                        // spaced end-of-prompt checkpoints (LLAMA_SERVER_TAIL_CKPT_MIN): none this time; user messages and
+                        // --ctx-checkpoints-spread keep theirs
+                        if (!do_tail_checkpoint && near_prompt_end && !is_user_start && !spread_start) {
                             do_checkpoint = false;
                         }
-                    }
 
-                    // a batch that took no tokens leaves the checkpoint inside the prompt to the next one
-                    if (spread_start && n_tokens_cur == 0) {
-                        slot.ckpt_spread_pos = n_batch_start;
-                    }
+                        // entire prompt has been processed
+                        if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
+                            slot.state = SLOT_STATE_DONE_PROMPT;
 
-                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                            GGML_ASSERT(batch.size() > 0);
 
-                    // nothing to checkpoint yet
-                    // TODO: is this check needed?
-                    if (do_checkpoint && pos_min < 0) {
-                        do_checkpoint = false;
-                    }
+                            // extract the logits only for the last token
+                            batch.set_output(batch.size() - 1, true);
 
-                    // do not checkpoint after mtmd chunks
-                    do_checkpoint = do_checkpoint && !has_mtmd;
+                            slot.stats.n_gen = 0;
+                            slot.i_batch     = batch.size() - 1;
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
-                    do_checkpoint = do_checkpoint && (
-                            slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end || spread_start ||
-                            n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
-                    SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
+                            slot.init_sampler();
 
-                    // note: we create the checkpoint before calling llama_decode(), so the current batch is not
-                    //       yet processed and therefore it is not part of the checkpoint.
-                    if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
-                    }
+                            if (slot.pipe_draws) {
+                                llama_sampler_set_pos(common_sampler_get(slot.smpl.get()), slot.prompt.tokens.pos_next() - 1);
+                            }
+                        } else {
+                            // skip ordinary mid-prompt checkpoints, unless the batch starts a user
+                            // message or we are near the end of the prompt
+                            // (one tail checkpoint: only the last batch, 4 tokens before the end, takes it)
+                            // (--ctx-checkpoints-spread: or the last batch stopped for one inside the prompt)
+                            if (!is_user_start && !spread_start && (!near_prompt_end || tail1)) {
+                                do_checkpoint = false;
+                            }
+                        }
 
-                    if (prefix_break && !has_mtmd) {
-                        prefix_maybe_save(slot, n_tokens_start, first_user_pos);
+                        // a batch that took no tokens leaves the checkpoint inside the prompt to the next one
+                        if (spread_start && n_tokens_cur == 0) {
+                            slot.ckpt_spread_pos = n_batch_start;
+                        }
+
+                        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+
+                        // nothing to checkpoint yet
+                        // TODO: is this check needed?
+                        if (do_checkpoint && part == 0 && pos_min < 0) {
+                            do_checkpoint = false;
+                        }
+
+                        // do not checkpoint after mtmd chunks
+                        do_checkpoint = do_checkpoint && !has_mtmd;
+
+                        // no need to create checkpoints that are too close together, unless it's the last user message
+                        do_checkpoint = do_checkpoint && (
+                                slot.prompt.checkpoints.empty() ||
+                                is_last_user_message || near_prompt_end || spread_start ||
+                                n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
+                        SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
+
+                        // note: we create the checkpoint before calling llama_decode(), so the current batch is not
+                        //       yet processed and therefore it is not part of the checkpoint.
+                        if (do_checkpoint) {
+                            if (part == 0) {
+                                create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                            } else {
+                                create_checkpoint_incall(slot, n_tokens_cur, n_part_prev);
+                            }
+                        }
+
+                        if (prefix_break && !has_mtmd) {
+                            prefix_maybe_save(slot, n_tokens_start, first_user_pos);
+                        }
+
+                        // C217: on into the next part when this one stopped for a checkpoint at the next one's start and a
+                        // device store will be free for it
+                        if (!(incall_slot && ckpt_incall_on && ckpt_vram_n > 0 && part_ckpt_break && batch.size() < n_batch &&
+                              slot.prompt.n_tokens() < slot.task->n_tokens() && ckpt_incall_store_ok(slot))) {
+                            break;
+                        }
                     }
                 }
 
@@ -6811,6 +7061,13 @@ private:
         // (for a checkpoint, a user message or the prompt's end); a full prompt batch is followed by the next one at once
         llama_set_ubatch_taper_next(ctx_tgt, -1, (has_output || (int32_t) batch.view.size() < (int32_t) llama_n_batch(ctx_tgt)) ? 1 : 0);
 
+        // C217: the checkpoints taken inside this call, and its micro-batch cuts where the calls it joins would end
+        std::vector<uint32_t> incall_view_cuts;
+        const bool incall = !ckpt_incall.empty() || !incall_cuts.empty();
+        if (incall) {
+            ckpt_incall_begin(off, batch.view.size(), incall_view_cuts);
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -6820,6 +7077,10 @@ private:
                 llama_synchronize(ctx_tgt);
             }
         });
+
+        if (incall) {
+            llama_set_ubatch_cuts(ctx_tgt, nullptr, 0);
+        }
 
         if (ret != 0) {
             {
@@ -6866,6 +7127,9 @@ private:
                 n_batch /= 2;
             }
 
+            // C217: the smaller calls are cut elsewhere
+            ckpt_incall_drop("its decode call was retried with a smaller batch");
+
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
 
             return false; // retry with the updated n_batch
@@ -6878,16 +7142,34 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
+            // C217: the draft's pass is cut as the target's call is
+            if (incall && ctx_dft != nullptr) {
+                llama_set_ubatch_cuts(ctx_dft, incall_view_cuts.data(), incall_view_cuts.size());
+            }
+
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
             });
+
+            if (incall && ctx_dft != nullptr) {
+                llama_set_ubatch_cuts(ctx_dft, nullptr, 0);
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
 
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
+            }
+        }
+
+        // C217: the checkpoints this call took inside it
+        if (incall) {
+            for (auto & ic : ckpt_incall) {
+                if (!ic.done && ic.i_batch > off && ic.i_batch < off + (int32_t) batch.view.size()) {
+                    ckpt_incall_finish(ic, off);
+                }
             }
         }
 

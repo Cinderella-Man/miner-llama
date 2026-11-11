@@ -705,6 +705,7 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t checkpoint_vram     = 0;     // newest context checkpoints of a slot kept in device memory; 0 = all on the host
     bool    checkpoint_vram_sync = false; // move an older one to the host at once, not in the background
+    bool    checkpoint_incall    = false; // C217: checkpoints in device stores taken inside a prompt's decode call
     int32_t checkpoint_spread   = 0;     // context checkpoints at most N tokens apart inside a prompt, evicted by the smallest gap; 0 = off
     bool    checkpoint_share    = false; // a slot, its prompt-cache entries and child slots share host checkpoints instead of copying them (#30137)
     bool    checkpoint_tail2    = false; // two checkpoints at a prompt's end (4 + n_ubatch and 4 tokens before it), as stock

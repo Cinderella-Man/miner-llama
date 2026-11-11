@@ -789,6 +789,177 @@ struct case_one_slot_no_swap : ctx_test {
     }
 };
 
+// C217: a state saved into a device store inside a decode call (llama_state_seq_store_at), at the end of the micro-batch
+// that ends where a call would have been cut, is the state of the calls cut there, byte for byte: the call cuts its
+// micro-batches as those calls are cut (llama_set_ubatch_cuts, n_keep_tail of the rollback snapshots too), so it computes
+// what they compute. Prompt [0, 60) in micro-batches of 16; the cut calls end at 17 and 34. Without rollback snapshots
+// they take the one-token micro-batches [16, 17) and [33, 34), which round a recurrent state differently from longer
+// ones; with snapshots for 3 drafted tokens they take 13 + 4 and 13 + 4 tokens (a call's last 4 kept together), where the
+// cuts alone, without that rule, would take one-token micro-batches again. The controls report whether one call without
+// cuts, and with snapshots the cuts without the rule (cuts at 16, 17, 33, 34), end elsewhere
+struct case_store_at : ctx_test {
+    explicit case_store_at(bool partial_) : partial(partial_) {}
+
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return partial ? "store_at_p" : "store_at"; }
+
+    const char * description() const override {
+        return partial ? "a partial state stored inside a call at a cut is the cut calls' state, byte for byte"
+                       : "a whole state stored inside a call at a cut is the cut calls' state, byte for byte";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_pos n_prompt = 60;
+        const std::vector<llama_pos> cuts = { 17, 34 };
+
+        const llama_state_seq_flags flags = partial ? LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY : LLAMA_STATE_SEQ_FLAGS_NONE;
+
+        llama_tokens tokens;
+        for (llama_pos pos = 0; pos < n_prompt; ++pos) {
+            tokens.push_back(gen_token(n_vocab, 0, pos));
+        }
+
+        std::string report;
+
+        // without and with rollback snapshots (n_keep_tail = 4 cuts the cut calls' micro-batches differently)
+        for (const uint32_t n_rs : { 0u, 3u }) {
+            ctx_opts opts;
+            opts.n_ctx     = 256;
+            opts.n_batch   = 64;
+            opts.n_ubatch  = 16;
+            opts.n_seq_max = 1;
+            opts.n_rs_seq  = n_rs;
+
+            auto ctx_ref  = mr.ctx(opts);
+            auto ctx_at   = mr.ctx(opts);
+            auto ctx_cut  = mr.ctx(opts);
+            auto ctx_one  = mr.ctx(opts);
+            auto ctx_rule = mr.ctx(opts);
+            if (!ctx_ref || !ctx_at || !ctx_cut || !ctx_one || !ctx_rule) {
+                return case_result::fail();
+            }
+            if (n_rs > 0 && llama_n_rs_seq(ctx_ref.get()) < n_rs) {
+                report += " n_rs_seq " + std::to_string(n_rs) + " off;";
+                continue;
+            }
+            const std::string tag = "n_rs_seq " + std::to_string(n_rs) + ": ";
+
+            const auto pos_range = [](llama_context * ctx) {
+                llama_memory_t mem = llama_get_memory(ctx);
+                return std::make_pair(llama_memory_seq_pos_min(mem, 0), llama_memory_seq_pos_max(mem, 0));
+            };
+
+            // the reference: calls cut at each cut, the state and positions after each, the end state and last logits
+            std::vector<std::vector<uint8_t>> host;
+            std::vector<std::pair<llama_pos, llama_pos>> ranges;
+            {
+                llama_pos p0 = 0;
+                for (const llama_pos c : cuts) {
+                    CTX_REQUIRE(decode_seq(ctx_ref.get(), tokens, p0, c, 0, false), tag + "reference decode failed");
+                    host.emplace_back();
+                    CTX_REQUIRE(get_seq_state(ctx_ref.get(), 0, flags, host.back()), tag + "reference save failed");
+                    ranges.push_back(pos_range(ctx_ref.get()));
+                    p0 = c;
+                }
+                CTX_REQUIRE(decode_seq(ctx_ref.get(), tokens, p0, n_prompt, 0, true), tag + "reference decode failed");
+            }
+            std::vector<uint8_t> host_end;
+            std::vector<float>   logits_end;
+            CTX_REQUIRE(get_seq_state(ctx_ref.get(), 0, flags, host_end), tag + "reference save failed");
+            CTX_REQUIRE(get_current_logits(ctx_ref.get(), logits_end), tag + "reference logits missing");
+
+            // the reference again from its state at the first cut, restored from the host as the server restores a
+            // checkpoint (the cells after a restore can sit elsewhere than in the unbroken run, so a restore is compared
+            // with a restore)
+            std::vector<uint8_t> host_rst;
+            std::vector<float>   logits_rst;
+            CTX_REQUIRE(set_seq_state(ctx_ref.get(), 0, flags, host[0]) && llama_memory_seq_rm(llama_get_memory(ctx_ref.get()), 0, cuts[0], -1),
+                        tag + "the reference's restore failed");
+            CTX_REQUIRE(decode_seq(ctx_ref.get(), tokens, cuts[0], cuts[1], 0, false) && decode_seq(ctx_ref.get(), tokens, cuts[1], n_prompt, 0, true),
+                        tag + "the reference's decode after its restore failed");
+            CTX_REQUIRE(get_seq_state(ctx_ref.get(), 0, flags, host_rst) && get_current_logits(ctx_ref.get(), logits_rst),
+                        tag + "the reference's state after its restore was not read");
+
+            const auto same_as = [&](llama_context * ctx, const std::vector<uint8_t> & want_state, const std::vector<float> & want_logits) {
+                std::vector<uint8_t> state;
+                std::vector<float>   logits;
+                return get_seq_state(ctx, 0, flags, state) && get_current_logits(ctx, logits) &&
+                    state == want_state && logits.size() == want_logits.size() &&
+                    memcmp(logits.data(), want_logits.data(), logits.size()*sizeof(float)) == 0;
+            };
+            const auto same_end = [&](llama_context * ctx) {
+                return same_as(ctx, host_end, logits_end);
+            };
+
+            // one call with a store fill at each cut
+            llama_context * lctx = ctx_at.get();
+            for (size_t k = 0; k < cuts.size(); ++k) {
+                llama_state_seq_store_at(lctx, 0, (int32_t) k, (uint32_t) cuts[k], flags);
+            }
+            CTX_REQUIRE(decode_seq(lctx, tokens, 0, n_prompt, 0, true), tag + "the call with fills failed");
+
+            CTX_REQUIRE(same_end(lctx), tag + "the call with fills ends in another state or other logits than the cut calls");
+
+            std::vector<std::vector<uint8_t>> blobs(cuts.size());
+            for (size_t k = 0; k < cuts.size(); ++k) {
+                llama_pos pmin = -2;
+                llama_pos pmax = -2;
+                const size_t n = llama_state_seq_store_at_get(lctx, nullptr, 0, 0, (int32_t) k, &pmin, &pmax);
+                CTX_REQUIRE(n > 0, tag + "no fill at " + std::to_string(cuts[k]));
+                blobs[k].resize(n);
+                CTX_REQUIRE(llama_state_seq_store_at_get(lctx, blobs[k].data(), n, 0, (int32_t) k, nullptr, nullptr) == n, tag + "the blob did not copy");
+                CTX_REQUIRE(pmin == ranges[k].first && pmax == ranges[k].second,
+                        tag + "positions at " + std::to_string(cuts[k]) + ": " + std::to_string(pmin) + ".." + std::to_string(pmax) +
+                        " against " + std::to_string(ranges[k].first) + ".." + std::to_string(ranges[k].second));
+
+                std::vector<uint8_t> copy(llama_state_seq_store_get_size_host(lctx, 0, (int32_t) k));
+                CTX_REQUIRE(!copy.empty() &&
+                        llama_state_seq_store_get_data_host(lctx, blobs[k].data(), n, copy.data(), copy.size(), 0, (int32_t) k) == copy.size(),
+                        tag + "the host copy of the fill at " + std::to_string(cuts[k]) + " failed");
+                CTX_REQUIRE(blobs_equal(copy, host[k]), tag + "the fill at " + std::to_string(cuts[k]) + " is not the cut calls' state");
+            }
+
+            // the first fill restores, and the cut calls from there end as the reference does
+            CTX_REQUIRE(llama_state_seq_set_data_store(lctx, blobs[0].data(), blobs[0].size(), 0, 0, flags) == blobs[0].size() &&
+                        llama_memory_seq_rm(llama_get_memory(lctx), 0, cuts[0], -1), tag + "the restore of the first fill failed");
+            CTX_REQUIRE(decode_seq(lctx, tokens, cuts[0], cuts[1], 0, false) && decode_seq(lctx, tokens, cuts[1], n_prompt, 0, true),
+                        tag + "the decode after the restore failed");
+            CTX_REQUIRE(same_as(lctx, host_rst, logits_rst), tag + "the restored fill does not continue as the reference's restored state");
+
+            // a request the next call cannot take leaves no result, and nothing is left for the call after
+            CTX_REQUIRE(llama_state_seq_store_at_get(lctx, nullptr, 0, 0, 0, nullptr, nullptr) == 0, tag + "a fill result outlived its call");
+
+            // the cuts alone: the same micro-batches, the same end
+            const uint32_t ucuts[] = { (uint32_t) cuts[0], (uint32_t) cuts[1] };
+            llama_set_ubatch_cuts(ctx_cut.get(), ucuts, 2);
+            CTX_REQUIRE(decode_seq(ctx_cut.get(), tokens, 0, n_prompt, 0, true), tag + "the cut call failed");
+            llama_set_ubatch_cuts(ctx_cut.get(), nullptr, 0);
+            CTX_REQUIRE(same_end(ctx_cut.get()), tag + "the call with cuts ends in another state than the cut calls");
+
+            // the control: one call without cuts takes other micro-batches (reported, not required)
+            CTX_REQUIRE(decode_seq(ctx_one.get(), tokens, 0, n_prompt, 0, true), tag + "the control call failed");
+            report += " " + tag + (same_end(ctx_one.get()) ? "an uncut call ends the same;" : "an uncut call ends elsewhere;");
+            if (n_rs > 0) {
+                const uint32_t rcuts[] = { 16, 17, 33, 34 };
+                llama_set_ubatch_cuts(ctx_rule.get(), rcuts, 4);
+                CTX_REQUIRE(decode_seq(ctx_rule.get(), tokens, 0, n_prompt, 0, true), tag + "the control call without the rule failed");
+                llama_set_ubatch_cuts(ctx_rule.get(), nullptr, 0);
+                report += std::string(" cuts without the rule end ") + (same_end(ctx_rule.get()) ? "the same;" : "elsewhere;");
+            }
+        }
+
+        TLOG_INF("%s:%s\n", name(), report.c_str());
+
+        return case_result::pass();
+    }
+
+private:
+    bool partial;
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -800,6 +971,8 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_state_store>(false));
     cases.push_back(std::make_unique<case_state_store>(true));
     cases.push_back(std::make_unique<case_one_slot_no_swap>());
+    cases.push_back(std::make_unique<case_store_at>(false));
+    cases.push_back(std::make_unique<case_store_at>(true));
 
     return cases;
 }
