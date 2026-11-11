@@ -814,6 +814,58 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+// GGML_CUDA_MMVF_F32_MT (C754, Q1330): llama.cpp takes F32 weights on mul_mat_vec_f only up to 3 tokens on NVIDIA cards
+// (below), so on compute 6.1 cuBLAS computes them at 4 to 8 tokens, in its own order. mul_mat_vec_f picks its block size
+// from the row width alone and adds each token's sum in its own chain (a thread's FMAs over its pairs of weights, then
+// the warps' butterflies), so at 4 to 8 tokens it gives each token the one-token kernel's sums bit for bit, reading each
+// weight once. 1: on compute 6.1, 2: on any NVIDIA GPU (tests); for a 2-D matrix outside the graph's compute buffers
+// (weights), times 4 to 8 contiguous columns, that mul_mat_vec_f takes at one token.
+// GGML_CUDA_MMVF_F32_MT_FAULT=1 (checks only): those products add the first half of each row only.
+static int mmvf_env_int(const char * name, const int def) {
+    const char * env = getenv(name);
+    return env ? atoi(env) : def;
+}
+
+bool ggml_cuda_mul_mat_vec_f_f32_mt(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    static const int mode  = mmvf_env_int("GGML_CUDA_MMVF_F32_MT", 0);
+    static const int fault = mmvf_env_int("GGML_CUDA_MMVF_F32_MT_FAULT", 0);
+    if (mode == 0) {
+        return false;
+    }
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || (mode == 1 && cc != GGML_CUDA_CC_DP4A)) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src1->ne[1] < 4 || src1->ne[1] > MMVF_MAX_BATCH_SIZE) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            (src0->buffer && ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE)) {
+        return false;
+    }
+    if (src1->nb[0] != sizeof(float) || src1->nb[1] % (2*sizeof(float)) != 0 || dst->nb[0] != sizeof(float) ||
+            (uintptr_t) src0->data % (2*sizeof(float)) != 0 || (uintptr_t) src1->data % (2*sizeof(float)) != 0) {
+        return false;
+    }
+    if (!ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, /*ne11 =*/ 1)) {
+        return false;
+    }
+    if (fault) {
+        ggml_tensor x = *src0;
+        ggml_tensor y = *src1;
+        x.ne[0] = (src0->ne[0] / 2) & ~int64_t(1);
+        y.ne[0] = x.ne[0];
+        ggml_cuda_mul_mat_vec_f(ctx, &x, &y, nullptr, dst);
+        return true;
+    }
+    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+    return true;
+}
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;

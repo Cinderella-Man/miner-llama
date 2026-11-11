@@ -14034,6 +14034,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 256, n, 320, { 1, 1 }, { 1, 1 },
                                                  { 0, 1, 2, 3 }, 324));
     }
+    // F32 products of 1 to 8 tokens at the shapes of Qwen3.8-Flash-Next's F32 tensors (the shared expert's gate
+    // 2560 -> 1, the router 2560 -> 512), at row widths that take mul_mat_vec_f's other block sizes (64: 32 threads,
+    // 100: 64, 300: 160) and a wide row (6144), an odd row width (left to cuBLAS), and rows that are views of wider rows
+    // (an even stride, and an odd one, left to cuBLAS); GGML_CUDA_MMVF_F32_MT=1 sends 4-8 tokens to mul_mat_vec_f on
+    // compute 6.1 (=2: on any NVIDIA GPU)
+    for (int64_t n = 1; n <= 8; ++n) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                { 1, 2560 }, { 512, 2560 }, { 48, 64 }, { 33, 100 }, { 129, 300 }, { 7, 6144 }, { 5, 2561 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 256, n, 320, { 1, 1 }, { 1, 1 },
+                                                 { 0, 1, 2, 3 }, 336));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 256, n, 320, { 1, 1 }, { 1, 1 },
+                                                 { 0, 1, 2, 3 }, 325));
+    }
+
     // one token with a fused bias (the Pascal kernel adds it), with a gate and with both (left to mul_mat_vec_f)
     for (auto [bias, gate] : std::vector<std::pair<bool, bool>>{ { true, false }, { false, true }, { true, true } }) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_BF16, GGML_GLU_OP_SWIGLU, 1, 10240, 320, false, 1, 1,
@@ -15977,6 +15993,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
                 { 10240, 320 }, { 320, 10240 }, { 4, 10240 }, { 512, 2560 }, { 48, 2560 } }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
+    // Qwen3.8-Flash-Next's F32 products (the shared expert's gate 2560 -> 1, the router 2560 -> 512) at 1 to 8 tokens;
+    // compare mul_mat_vec_f (GGML_CUDA_MMVF_F32_MT=1 at 4-8 tokens) with cuBLAS
+    for (int64_t n = 1; n <= 8; ++n) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 1, 2560 }, { 512, 2560 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
         }
     }
 
