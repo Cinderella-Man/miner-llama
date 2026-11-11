@@ -1096,6 +1096,10 @@ public:
     // return true if the graph was updated and can be reused
     bool can_reuse(const llm_graph_params & params);
 
+    // why the last can_reuse said no, for LLAMA_UBATCH_TRACE: "params", or the type name of the first input that
+    // rejected; nullptr after a yes
+    const char * reuse_reject = nullptr;
+
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
     void add_fused_node(llm_graph_fused_node result);
