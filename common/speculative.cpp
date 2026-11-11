@@ -2160,7 +2160,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (overlap) {
                 SPC_INF("%s", "LLAMA_MTP_CATCHUP_OVERLAP: a prompt call's catch-up runs once the target has the next call queued\n");
             } else {
-                SPC_WRN("%s", "LLAMA_MTP_CATCHUP_OVERLAP: needs the target's h rows on the device (not shared memory, not chained heads): off\n");
+                SPC_WRN("%s", "LLAMA_MTP_CATCHUP_OVERLAP: needs the target's h rows on the device (not shared memory, not chained heads, not LLAMA_MTP_H_DEV=0): off\n");
             }
         }
 

@@ -445,6 +445,11 @@ llama_context::llama_context(
         }
     }
 
+    // LLAMA_MTP_H_DEV (C693): where the h_nextn rows that an MTP draft reads go, see h_nextn_dev_mode
+    if (const char * LLAMA_MTP_H_DEV = getenv("LLAMA_MTP_H_DEV")) {
+        h_nextn_dev_mode = atoi(LLAMA_MTP_H_DEV);
+    }
+
     // screened output head: LLAMA_SCREEN_HEAD=1 enables it for models with an output_screen tensor,
     // LLAMA_SCREEN_HEAD_M=<M> overrides the model's number of candidates
     {
@@ -1962,9 +1967,10 @@ bool llama_context::h_nextn_dev_alloc() {
             ev_h_nextn_written[h].reset(ggml_backend_event_new(h_nextn_dev_dev));
             ev_h_nextn_read[h].reset(ggml_backend_event_new(h_nextn_dev_dev));
         }
-        // C703: the CPU computes a decode before it returns, so two halves there need no events (the CPU check)
+        // C703: the CPU computes a decode before it returns, so two halves there need no events (the CPU check);
+        // C693: LLAMA_MTP_H_DEV=2 takes one half there too (the host rows' check)
         const bool cpu = ggml_backend_dev_type(h_nextn_dev_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        if ((!ev_h_nextn_written[h] || !ev_h_nextn_read[h]) && !(h_nextn_halves > 1 && cpu)) {
+        if ((!ev_h_nextn_written[h] || !ev_h_nextn_read[h]) && !((h_nextn_halves > 1 || h_nextn_dev_mode == 2) && cpu)) {
             return fail("the device has no events");
         }
     }
@@ -1981,6 +1987,12 @@ bool llama_context::set_embeddings_nextn_dev(bool value) {
 
     // the device rows are batch rows, so the extraction must not be masked
     if (value && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
+        return false;
+    }
+
+    // C693: the rows stay on the host, as before upstream #31927
+    if (value && h_nextn_dev_mode == 0) {
+        LLAMA_LOG_INFO("%s: LLAMA_MTP_H_DEV=0, extracting the h_nextn rows to host memory\n", __func__);
         return false;
     }
 

@@ -1292,6 +1292,7 @@ struct ggml_backend_sched {
     int64_t trace_wait_us;  // the host blocked in the scheduler's waits since the evaluation's start
     int64_t trace_t_dev0;   // ggml_time_us() at the launch of the last evaluation's first split off the CPU, 0 if none
     int     trace_n_replan; // re-plans of this scheduler
+    int64_t trace_n_prefetch; // inputs this scheduler fetched before the split that computes them ran (C693)
 
     // GGML_SCHED_CTX_PER_GRAPH=0: one context buffer for the largest graph, made at creation, and the allocation
     // dependencies' views in it, as before the scratch was sized per graph (default 1)
@@ -1304,6 +1305,9 @@ struct ggml_backend_sched {
     int n_prefetched;
     int prefetch_split;     // the split that reads the prefetched inputs
     int prefetch_backend_id; // the backend that copies them
+    // GGML_SCHED_PREFETCH=0 (C693): no early fetch, each split's inputs are copied when it runs, as before upstream
+    // #30966 (default 1)
+    bool prefetch;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2403,7 +2407,7 @@ static bool ggml_backend_sched_input_packed(ggml_backend_sched_t sched, int spli
 // e.g. a CPU split runs while a GPU split computes, if it reads only the results of the earlier splits
 static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int split_id) {
     sched->n_prefetched = 0;
-    if (split_id + 1 >= sched->n_splits) {
+    if (!sched->prefetch || split_id + 1 >= sched->n_splits) {
         return;
     }
     struct ggml_backend_sched_split * split = &sched->splits[split_id];
@@ -2451,6 +2455,14 @@ static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int s
         sched->prefetch_split      = split_id + 1;
         sched->prefetch_backend_id = backend_id;
         ggml_backend_event_record(sched->prefetch_events[backend_id], backend);
+
+        // LLAMA_UBATCH_TRACE (C693): the scheduler's first early fetch, and the count when it is freed
+        if (sched->trace && sched->trace_n_prefetch == 0) {
+            GGML_LOG_WARN("sched-trace: prefetch: split %d (%s) fetches %d input(s) of split %d (%s) before it runs, first: %s\n",
+                    split_id, ggml_backend_name(backend), sched->n_prefetched, split_id + 1,
+                    ggml_backend_name(sched->backends[next->backend_id]), sched->prefetched[0]->name);
+        }
+        sched->trace_n_prefetch += sched->n_prefetched;
     }
 }
 
@@ -2650,6 +2662,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->context_buffer = (char *) malloc(sched->context_buffer_size);
     }
 
+    const char * GGML_SCHED_PREFETCH = getenv("GGML_SCHED_PREFETCH");
+    sched->prefetch = GGML_SCHED_PREFETCH == nullptr || atoi(GGML_SCHED_PREFETCH) != 0;
+
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
     sched->splits_capacity = initial_splits_capacity;
@@ -2680,6 +2695,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->trace && sched->trace_n_prefetch > 0) {
+        GGML_LOG_WARN("sched-trace: prefetch: %lld input(s) fetched early by this scheduler\n", (long long) sched->trace_n_prefetch);
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
