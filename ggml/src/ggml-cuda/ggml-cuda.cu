@@ -80,6 +80,7 @@
 #include "ggml-cuda/moe-persistent.cuh"
 #include "ggml-cuda/hop-mailbox.cuh"
 #include "ggml-cuda/keepalive.cuh"
+#include "ggml-cuda/graph-force.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -3309,6 +3310,28 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 static bool ggml_cuda_graph_debug_enabled() {
     static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_GRAPH_DEBUG");
     return enabled;
+}
+
+// GGML_CUDA_GRAPHS_FORCE=1 (C702, graph-force.h): a batched graph is captured whenever its properties change, without
+// the warm-up of two unchanged calls. Off by default
+static bool ggml_cuda_graphs_force() {
+    static const bool enabled = [] {
+        const bool on = ggml_cuda_env_flag("GGML_CUDA_GRAPHS_FORCE");
+        if (on) {
+            GGML_LOG_INFO("%s: GGML_CUDA_GRAPHS_FORCE: batched graphs are captured at every change (devices with VMM)\n", __func__);
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+// GGML_CUDA_GRAPHS_FORCE: whether this graph is captured at every change instead of after the warm-up (graph-force.h).
+// Not on a device without VMM, whose legacy pool on a failed allocation synchronizes the device and drops every
+// captured graph, which no capture survives; not with concurrent streams (GGML_CUDA_GRAPH_OPT), whose pools and cuBLAS
+// handles are made per stream
+static bool ggml_cuda_graph_force_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    return ggml_cuda_info().devices[cuda_ctx->device].vmm && cuda_ctx->stream_context().concurrent_events.empty() &&
+           ggml_cuda_graph_force_eligible(cgraph->nodes, cgraph->n_nodes, MMVQ_MAX_BATCH_SIZE);
 }
 
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
@@ -6701,7 +6724,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
-            if (!graph->warmup_complete) {
+            if (ggml_cuda_graphs_force() && ggml_cuda_graph_force_capture(cuda_ctx, cgraph)) {
+                const ggml_cuda_graph_force_plan plan = ggml_cuda_graph_force_next(cuda_ctx->graphs_force_warm,
+                    graph->warmup_complete, graph->capture_gen, properties_changed, graph->instances.empty(),
+                    [graph](uint64_t gen) { return graph->profile_phases.stale(gen); });
+                use_cuda_graph             = plan.use_graph;
+                cuda_graph_update_required = plan.capture;
+            } else if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;
