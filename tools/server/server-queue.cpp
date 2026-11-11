@@ -3,6 +3,8 @@
 
 #include "log.h"
 
+#include "../../src/llama-ext.h" // staging API: llama_step_trace_count (C405), the yields' counts on a step's line (C741)
+
 #include <algorithm>
 #include <chrono>
 #include <thread>
@@ -25,6 +27,16 @@ static bool task_resets_idle_timer(server_task_type type) {
     return type != SERVER_TASK_TYPE_METRICS;
 }
 
+// C741: with LLAMA_STEP_TRACE, a completion ("q.cmpl") or a read of the server state ("q.read") posted while a step runs
+// is marked on the step's line (posted between steps, the mark is dropped: the loop takes the task at once)
+static void trace_post(server_task_type type) {
+    if (type == SERVER_TASK_TYPE_COMPLETION) {
+        llama_step_trace_mark("q.cmpl");
+    } else if (type == SERVER_TASK_TYPE_METRICS || type == SERVER_TASK_TYPE_SLOT_GET) {
+        llama_step_trace_mark("q.read");
+    }
+}
+
 int server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     GGML_ASSERT(task.id != -1);
@@ -32,8 +44,10 @@ int server_queue::post(server_task && task, bool front) {
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
     }
+    trace_post(task.type);
     const int  task_id     = task.id;
     const bool reset_timer = task_resets_idle_timer(task.type);
+    const bool for_yield   = lazy_wake && yield_takes(task.type);
     QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
     if (front) {
         queue_tasks.push_front(std::move(task));
@@ -44,12 +58,16 @@ int server_queue::post(server_task && task, bool front) {
         time_last_task = ggml_time_ms();
     }
     condition_tasks.notify_one();
+    if (for_yield && lazy_wake_locked()) {
+        worker.cv.notify_one();
+    }
     return task_id;
 }
 
 int server_queue::post(std::vector<server_task> && tasks, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     bool reset_timer = false;
+    bool for_yield   = false;
     for (auto & task : tasks) {
         if (task.id == -1) {
             task.id = id++;
@@ -59,6 +77,8 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
             cleanup_pending_task(task.id_target);
         }
         reset_timer |= task_resets_idle_timer(task.type);
+        for_yield   |= lazy_wake && yield_takes(task.type);
+        trace_post(task.type);
         QUE_DBG("new task, id = %d/%d, front = %d\n", task.id, (int) tasks.size(), front);
         if (front) {
             queue_tasks.push_front(std::move(task));
@@ -70,6 +90,9 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
         time_last_task = ggml_time_ms();
     }
     condition_tasks.notify_one();
+    if (for_yield && lazy_wake_locked()) {
+        worker.cv.notify_one();
+    }
     return 0;
 }
 
@@ -110,6 +133,9 @@ void server_queue::pop_deferred_task(int id_slot) {
     }
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
+    if (lazy_wake && !queue_tasks.empty() && yield_takes(queue_tasks.front().type) && lazy_wake_locked()) {
+        worker.cv.notify_one();
+    }
 }
 
 void server_queue::wait_until_no_sleep() {
@@ -156,6 +182,9 @@ bool server_queue::process_new_tasks(bool is_yielding) {
             QUE_DBG("task declined, id = %d\n", task.id);
             lock.lock();
             queue_tasks_unhandled.push_back(std::move(task));
+        } else if (is_yielding) {
+            // C741: a task the worker answered during a yield, on the step's trace line
+            llama_step_trace_mark("q.take");
         }
     }
 }
@@ -206,6 +235,16 @@ void server_queue::worker_loop() {
     }
 }
 
+bool server_queue::lazy_wake_locked() {
+    if (!lazy_wake || !worker.yielding || worker.busy) {
+        return false;
+    }
+    worker.busy = true;
+    n_wake++;
+    llama_step_trace_count("wake", 1);
+    return true;
+}
+
 void server_queue::worker_stop() {
     if (!worker.thread.joinable()) {
         return;
@@ -224,13 +263,25 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
 
     QUE_DBG("%s", "yielding to queue\n");
 
+    // C741: with lazy_wake the worker sleeps through a yield that no task it can take meets (post() wakes it for one that
+    // comes); a task it would decline (the loop's own NEXT_RESPONSE, a completion) waits in the queue for the loop
+    bool wake = true;
     {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         GGML_ASSERT(!worker.busy && "yield_to_queue() cannot be nested");
-        worker.busy     = true;
+        wake = !lazy_wake || std::any_of(queue_tasks.begin(), queue_tasks.end(), [&](const server_task & t) {
+            return yield_takes(t.type);
+        });
+        worker.busy     = wake;
         worker.yielding = true;
+        n_yield++;
+        n_wake += wake ? 1 : 0;
     }
-    worker.cv.notify_one();
+    llama_step_trace_count("yld", 1);
+    if (wake) {
+        llama_step_trace_count("wake", 1);
+        worker.cv.notify_one();
+    }
 
     // run the work on the current thread, so that all ggml compute stays on the same thread
     std::exception_ptr exception;
@@ -243,12 +294,15 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
     {
         std::unique_lock<std::mutex> lock(mutex_tasks);
 
-        // the yield is over, wait for the worker to finish its current task
+        // the yield is over, wait for the worker to finish its current task (C741: with lazy_wake, only a worker that a
+        // task woke)
         worker.yielding = false;
-        condition_tasks.notify_all();
-        condition_tasks.wait(lock, [&]{
-            return !worker.busy;
-        });
+        if (!lazy_wake || worker.busy) {
+            condition_tasks.notify_all();
+            condition_tasks.wait(lock, [&]{
+                return !worker.busy;
+            });
+        }
 
         // put the declined tasks back, keeping their order
         while (!queue_tasks_unhandled.empty()) {

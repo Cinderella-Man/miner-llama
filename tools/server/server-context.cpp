@@ -1970,6 +1970,32 @@ static uint32_t server_tail_ckpt_min() {
     return n_min;
 }
 
+// LLAMA_SERVER_YIELD (C741): the yields to the task queue (server_queue::yield_to_queue), which let the queue's worker
+// thread answer metrics and slot reads while the server computes. Each one wakes the worker and at its end waits for it
+// to stop: on a two-core host ~0.1 ms, three times a speculative step (the draft, the verify pass, the catch-up).
+//   0 (the default): as upstream.
+//   1: a generation step's draft and catch-up run without a yield; the verify pass (its decode and the wait for its
+//      outputs) keeps its yield, as do a prompt batch's decode and catch-up and the image encodes. A metrics or slot read
+//      that comes during the draft or the catch-up is answered at the verify pass's yield or when the step ends.
+//   2: as 1, and a yield wakes the worker only for a read: one waiting when the yield starts, or one that comes during it.
+//      Upstream's worker wakes at every yield, finds the loop's own NEXT_RESPONSE task (posted at every busy step's start),
+//      declines it and puts it back.
+// Completions, cancels and every other task that changes a slot are never taken during a yield (process_single_task
+// declines them): they wait for the step's end either way. The work runs on the server's own thread with or without a
+// yield, so every output is the same.
+static int server_yield_mode() {
+    static const int mode = [] {
+        const char * env = getenv("LLAMA_SERVER_YIELD");
+        return env ? std::clamp(atoi(env), 0, 2) : 0;
+    }();
+    return mode;
+}
+
+// the tasks the queue's worker takes during a yield (process_single_task declines every other): reads of the server state
+static bool server_task_yield_takes(server_task_type type) {
+    return type == SERVER_TASK_TYPE_METRICS || type == SERVER_TASK_TYPE_SLOT_GET;
+}
+
 // After the first token that differs (n), the longest stretch over which the cached tokens and the prompt spell the
 // same bytes, cut at the last byte offset where a token ends in both: the prompt's tokens up to there are replaced by
 // the cached ones, so the prompt's text is unchanged. Returns the number of cached tokens taken past n.
@@ -2941,6 +2967,14 @@ private:
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
+
+        // C741: LLAMA_SERVER_YIELD
+        queue_tasks.on_yield_takes(server_task_yield_takes);
+        queue_tasks.set_lazy_wake(server_yield_mode() >= 2);
+        if (server_yield_mode() > 0) {
+            SRV_INF("LLAMA_SERVER_YIELD=%d: a generation step's draft and catch-up without a yield to the task queue%s\n",
+                    server_yield_mode(), server_yield_mode() >= 2 ? "; a yield wakes the queue's worker only for a read" : "");
+        }
 
         metrics.init();
 
@@ -4859,7 +4893,7 @@ private:
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
-        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+        if (is_yielding && !server_task_yield_takes(task.type)) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
         }
@@ -6145,11 +6179,17 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             llama_step_trace_mark("s.drf");
-            queue_tasks.yield_to_queue([&]() {
+            auto run_draft = [&]() {
                 llama_step_trace_mark("s.drf.in");
                 common_speculative_draft(spec.get());
                 llama_step_trace_mark("s.drf.out");
-            });
+            };
+            // C741: LLAMA_SERVER_YIELD >= 1 drafts without a yield
+            if (server_yield_mode() >= 1) {
+                run_draft();
+            } else {
+                queue_tasks.yield_to_queue(run_draft);
+            }
             llama_step_trace_mark("s.drf.end");
 
             // C738: a prepared verify pass holds the draft it was prepared for (the drafter called last_pass only for a pass
@@ -7368,11 +7408,25 @@ private:
             }
 
             bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
+            auto run_catch_up = [&]() {
                 llama_step_trace_mark("s.cu.in");
                 ok = common_speculative_process(spec.get(), batch.view);
                 llama_step_trace_mark("s.cu.out");
-            });
+            };
+            // C741: LLAMA_SERVER_YIELD >= 1 runs a generation step's catch-up (no prompt token in the call) without a
+            // yield; a prompt batch's catch-up keeps it
+            bool yield_cu = true;
+            if (server_yield_mode() >= 1) {
+                yield_cu = false;
+                for (int i = off; i < off + batch.view.size(); ++i) {
+                    yield_cu = yield_cu || batch.tokens[i].is_prompt;
+                }
+            }
+            if (yield_cu) {
+                queue_tasks.yield_to_queue(run_catch_up);
+            } else {
+                run_catch_up();
+            }
             llama_step_trace_mark("s.cu.end");
 
             if (!ok) {
