@@ -699,7 +699,11 @@ static __global__ void mul_mat_vec_q_pascal_dmt_kt(const dmt_args p, const int n
         for (int k = 0; k < DMT_KT_EU; ++k) {
             const int u = tid + k * nth;
             if (u < nru) {
-                const int j = u / tunits;
+                int j = 0; // the token: u / tunits
+#pragma unroll
+                for (int jj = 1; jj < NT; ++jj) {
+                    j += u >= jj * tunits;
+                }
                 ru[k] = __ldg((const uint4 *) (p.vy + j * p.col_bytes_y + ts * tbytes) + (u - j * tunits));
             }
         }
