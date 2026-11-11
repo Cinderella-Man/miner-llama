@@ -458,9 +458,9 @@ llama_context::llama_context(
         const bool pf_stats = (LLAMA_NGRAM_PREFETCH_STATS && atoi(LLAMA_NGRAM_PREFETCH_STATS) != 0) || llama_ubatch_trace() > 0;
         const double pf_mb  = LLAMA_NGRAM_PREFETCH_MB ? atof(LLAMA_NGRAM_PREFETCH_MB) : 48.0;
         const ggml_tensor * table = model.per_layer_tok_embd;
+        // (with M-RoPE the batch's first n_tokens positions are the temporal ones, which the n-gram input reads)
         const bool pf_model = model.arch == LLM_ARCH_QWEN4EXP && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && table != nullptr &&
-            model.can_prefetch.count(table) > 0 && hparams.ple_n_heads > 0 && hparams.ple_ngram_size >= 2 &&
-            hparams.n_pos_per_embd() == 1;
+            model.can_prefetch.count(table) > 0 && hparams.ple_n_heads > 0 && hparams.ple_ngram_size >= 2;
         if ((pf_on || pf_stats) && pf_model) {
             const uint64_t cap = (uint64_t) (std::max(0.0, pf_mb) * 1024.0 * 1024.0);
             ngram_pf = std::make_unique<llama_ngram_prefetch>(hparams, table, pf_on, cap, pf_stats);
