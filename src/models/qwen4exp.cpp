@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-draft-prefetch.h"
 #include "llama-embd-cache.h"
 #include "llama-head-shortlist.h"
 #include "llama-impl.h"
@@ -1843,6 +1844,9 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+
+    // LLAMA_DRAFT_PREFETCH (C615): how many of these rows a drafter issued ahead; a new window of its prefetches
+    llama_draft_prefetch_on_rows(mctx->get_kv(), model, idx.data(), idx.size(), (uint32_t) n_tokens);
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.

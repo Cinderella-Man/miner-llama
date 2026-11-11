@@ -6,6 +6,7 @@
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-draft-prefetch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-memory-hybrid.h"
@@ -1037,6 +1038,9 @@ llama_context::~llama_context() {
         head_bound_finish_row();
         head_bound->log(__func__);
     }
+
+    // LLAMA_DRAFT_PREFETCH (C615): the context's closing line, its state dropped
+    llama_draft_prefetch_release(memory.get());
 
     pipe_drain();
     for (auto & slot : pipe_slots) {
