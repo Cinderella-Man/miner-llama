@@ -28,10 +28,18 @@
 // GGML_CUDA_FATTN_SPARSE_PASCAL_PROMPT_MIN_RATIO: cells per n_kv_max from which mode 1 takes a prompt call (default
 // 1.0: below n_kv_max cells the mask keeps them all and the kernel reads no fewer than the dense kernels).
 // GGML_CUDA_FATTN_SPARSE_PASCAL_PROMPT_NQ: most query tokens per sequence of a prompt call (default 128).
+// GGML_CUDA_FATTN_SPARSE_PASCAL_UNION: 0 off (default), 1 a call of two or more query tokens goes to the union kernel: a
+// block takes up to 12 warps' worth of consecutive query tokens (Flash-Next's 12 heads per KV head: 4 tokens) and reads
+// one list, the union of theirs, so each kept cell is read once per block instead of once per query token. Each token's
+// output equals the per-token kernel's to rounding. Mode 1 then takes a decode or verify call from _UNION_MIN_RATIO x
+// n_kv_max cells per union list (a verify of up to 4 tokens: per call) instead of per query token; prompt calls keep
+// their rule.
+// GGML_CUDA_FATTN_SPARSE_PASCAL_UNION_MIN_RATIO: cells per n_kv_max and union list from which mode 1 takes a decode or
+// verify call with _UNION (default 1.5).
 // GGML_CUDA_FATTN_SPARSE_PASCAL_SPLITS: splits per list (default: about 4 blocks per SM, at least 64 cells a split).
 // GGML_CUDA_FATTN_SPARSE_PASCAL_NSM: SM count the splits assume (default: the device's; 5 emulates a P106-090).
 // GGML_CUDA_FATTN_SPARSE_PASCAL_FAULT (testing the tests): 1 output x 1.01, 2 mask values ignored, 3 every split's last
-// list entry dropped.
+// list entry dropped, 4 (union kernel) each query token scored with the next token's mask row.
 
 // Runs the node and returns true if the path takes it; returns false (and does nothing) otherwise.
 bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
