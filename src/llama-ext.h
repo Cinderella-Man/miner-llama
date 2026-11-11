@@ -7,6 +7,7 @@
 #include "llama.h"
 #include "llama-arch.h"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -217,6 +218,17 @@ LLAMA_API bool llama_kpool_dev_stats(const struct llama_context * ctx, uint64_t 
 // compared with the host mask, and the masks it compared (one per device); false while the switch is off.
 LLAMA_API bool llama_pool_mask_dev_stats(const struct llama_context * ctx, uint64_t * n_ubatch, uint64_t * n_checked,
                                          uint64_t * n_masks);
+
+// The n-gram table's row prefetch (LLAMA_NGRAM_PREFETCH, C761): since the context was created, whether the helper is on,
+// the cap and page size in bytes, the calls it planned, the rows it issued, the rows the n-gram input issued itself, the
+// rows whose helper copy differed, and the most bytes the helper had issued ahead; with LLAMA_NGRAM_PREFETCH_STATS=1 (or
+// LLAMA_UBATCH_TRACE) also each decode call's rows, distinct pages and row digest, the switch off too (the last 4096
+// calls, oldest first: n_tokens, n_ubatch, planned, rows, rows_helper, rows_inline, rows_mismatch, pages, madv_bytes,
+// digest, window_max). False when the context has neither the switch nor the counts.
+LLAMA_API bool llama_ngram_prefetch_stats(const struct llama_context * ctx, bool * on, uint64_t * cap, uint64_t * page,
+                                          uint64_t * calls_planned, uint64_t * rows_helper, uint64_t * rows_inline,
+                                          uint64_t * rows_mismatch, uint64_t * window_max,
+                                          std::vector<std::array<uint64_t, 11>> * calls);
 
 // Host timestamps along the server's steps (C405), with LLAMA_STEP_TRACE=<file> set: the marks of a step (a name and
 // the steady clock's time) are kept until llama_step_trace_end writes them as one JSON line, if a context marked a stage

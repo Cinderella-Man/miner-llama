@@ -11,6 +11,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-ngram-prefetch.h"
 #include "llama-pipe-drafter.h"
 
 #include "ggml-cpp.h"
@@ -664,6 +665,21 @@ private:
     // that runs the graphs reading them
     std::unique_ptr<llama_embd_cache> embd_cache;
     ggml_backend_t                    embd_cache_backend = nullptr;
+
+    // LLAMA_NGRAM_PREFETCH (C761): the n-gram rows of a call's later micro-batches prefetched by a helper thread, or
+    // only counted (LLAMA_UBATCH_TRACE, LLAMA_NGRAM_PREFETCH_STATS); nullptr when neither is set or the model has no
+    // mapped n-gram table. ngram_pf_begin plans a decode call (the batch, the first micro-batch's size and the tokens
+    // before the call from the attention cells)
+    std::unique_ptr<llama_ngram_prefetch> ngram_pf;
+    void ngram_pf_begin(uint32_t n_tokens_all, uint32_t n_first);
+
+    // LLAMA_UBATCH_TRACE: the last micro-batch's input times (C761)
+    std::vector<llm_graph_result::input_time> trace_inputs;
+
+public:
+    const llama_ngram_prefetch * get_ngram_pf() const { return ngram_pf.get(); }
+
+private:
 
     // the exact bound and the full-head fallback for the main model's shortlist head (head_bound_init); requested with
     // set_head_bound, used by the decodes with one output

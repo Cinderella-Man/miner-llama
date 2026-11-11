@@ -1815,9 +1815,35 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
-void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+void llm_graph_result::set_inputs(const llama_ubatch * ubatch, std::vector<input_time> * times) {
+    if (times == nullptr) {
+        for (auto & input : inputs) {
+            input->set_input(ubatch);
+        }
+        return;
+    }
+
+    // LLAMA_UBATCH_TRACE (C761): the time of each input type [TAG_UBATCH_TRACE]
+    times->clear();
     for (auto & input : inputs) {
+        const int64_t t0 = ggml_time_us();
         input->set_input(ubatch);
+        const int64_t dt = ggml_time_us() - t0;
+
+        const char * name = typeid(*input).name();
+        while (*name >= '0' && *name <= '9') {
+            name++; // a type name from typeid starts with its length
+        }
+        if (strncmp(name, "llm_graph_input_", 16) == 0) {
+            name += 16;
+        }
+        auto it = std::find_if(times->begin(), times->end(), [&](const input_time & t) { return strcmp(t.name, name) == 0; });
+        if (it == times->end()) {
+            times->push_back({ name, dt, 1 });
+        } else {
+            it->us += dt;
+            it->n++;
+        }
     }
 }
 
@@ -2003,6 +2029,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
     h_nextn_row0     (params.h_nextn_row0),
+    ngram_pf         (params.ngram_pf),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),

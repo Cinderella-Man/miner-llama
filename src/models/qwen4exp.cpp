@@ -4,6 +4,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-ngram-prefetch.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1767,7 +1768,8 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override {
-        mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+        mctx     = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+        ngram_pf = params.ngram_pf;
         return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
@@ -1777,6 +1779,9 @@ public:
 
     // the predecessor tokens live in the attention KV cells (ext.tok)
     const llama_kv_cache_context * mctx;
+
+    // LLAMA_NGRAM_PREFETCH (C761): the context's row prefetch, which issues the rows the helper has not; nullptr: inline
+    llama_ngram_prefetch * ngram_pf = nullptr;
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
@@ -1799,8 +1804,6 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t n_gram   = hparams.ple_ngram_size;
     const int64_t n_heads  = hparams.ple_n_heads;
-    const int64_t per_gram = hparams.ple_heads_per_ngram;
-    const int64_t eos      = hparams.ple_eos_token_id;
     const int64_t n_prev   = n_gram - 1;
 
     std::vector<int32_t> idx(n_heads * n_tokens);
@@ -1816,34 +1819,15 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
     for (int64_t i = 0; i < n_tokens; ++i) {
-        // an EOS in the window resets everything at or before it
-        // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
-        // the EOS of the token itself does not cut its own context, as in the reference
-        std::vector<int64_t> ctx(n_gram);
-        ctx[0] = tok_of(i);
-        bool cut = false;
-        for (int64_t s = 1; s < n_gram; ++s) {
-            // predecessor s positions back; prev[] is oldest-first, missing entries are LLAMA_TOKEN_NULL
-            const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[i*n_prev + (n_prev - s)];
-            cut = cut || t < 0 || t == eos;
-            ctx[s] = cut ? eos : t;
-        }
-
-        for (int64_t n = 2; n <= n_gram; ++n) {
-            uint64_t mixed = (uint64_t) ctx[0] * hparams.ple_layer_multipliers[0];
-            for (int64_t j = 1; j < n; ++j) {
-                mixed ^= (uint64_t) ctx[j] * hparams.ple_layer_multipliers[j];
-            }
-            const int64_t base = (n - 2) * per_gram;
-            for (int64_t g = 0; g < per_gram; ++g) {
-                const int64_t h_i = base + g;
-                idx[i * n_heads + h_i] =
-                    (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
-            }
-        }
+        // the token's n-gram rows; the prefetch helper (C761) computes its rows with the same function
+        llama_ngram_prefetch::token_rows(hparams, tok_of(i), prev.data() + i*n_prev, idx.data() + i*n_heads);
     }
 
-    {
+    if (ngram_pf) {
+        // LLAMA_NGRAM_PREFETCH (C761) or its counts: the rows the helper has not issued yet, issued here
+        ngram_pf->attach();
+        ngram_pf->on_rows(*ubatch, idx.data(), idx.size());
+    } else {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
         const bool prefetch = model.can_prefetch.count(ple);
@@ -1954,6 +1938,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
+    ple_inp->ngram_pf = ngram_pf;
 
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
