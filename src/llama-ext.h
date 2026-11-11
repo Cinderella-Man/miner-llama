@@ -335,3 +335,21 @@ LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
 
 // each sequence is paired with an unconditional one at n_seq_max / 2 + seq_id, in a unified KV cache
 LLAMA_API bool llama_model_classifier_free_guidance(const struct llama_model * model);
+
+//
+// LLAMA_DRAFT_PREFETCH (C615): a drafted token's n-gram rows read ahead
+//
+
+// Issue now the reads of the rows that a later decode of ctx will take from its model's mapped n-gram table for tokens
+// it has not seen (madvise(MADV_WILLNEED) through llama_prefetch_rows), e.g. each token a drafter samples, so that the
+// reads from the disk run while the drafter works instead of when the verify pass's n-gram input sets its rows.
+// tokens[0, n_tokens) are the tokens the decode will put at positions pos0, pos0 + 1, ... of seq_id; the rows of
+// tokens[i_first, n_tokens) are issued, the earlier ones only serve as predecessors; the predecessors before pos0 are
+// the context's cells, as the n-gram input reads them. Rows issued since the context's last evaluation of the table's
+// rows are not issued again, and at most LLAMA_DRAFT_PREFETCH_KB (default 1024) KiB of pages are issued between two
+// such evaluations. The rows read stay the same bytes: only when the reads are issued changes. Supported by qwen4exp
+// with its n-gram table mapped (lazy); llama_draft_prefetch_enabled is false otherwise or while LLAMA_DRAFT_PREFETCH is
+// unset, and llama_draft_prefetch then does nothing. Returns the rows issued.
+LLAMA_API bool    llama_draft_prefetch_enabled(const struct llama_context * ctx);
+LLAMA_API int32_t llama_draft_prefetch(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos0,
+                                       const llama_token * tokens, int32_t n_tokens, int32_t i_first);

@@ -556,6 +556,10 @@ struct common_speculative_impl {
     // TODO: track performance of most recent calls
     const bool gen_perf = true; // whether to generate performance stats.
 
+    // LLAMA_DRAFT_PREFETCH (C615): this drafter issues the target's n-gram rows of each token as it samples it, so
+    // common_speculative_draft does not issue them again at the end of the draft
+    bool prefetches_rows = false;
+
     int64_t t_begin_us  = 0; // total time spent in refresh of this implementation in microseconds.
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
@@ -2152,6 +2156,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         short_init();
         embd_cache_init();
         h_carry_init();
+
+        // LLAMA_DRAFT_PREFETCH (C615): the verify pass's n-gram rows issued as the drafting passes give each token
+        if (llama_draft_prefetch_enabled(ctx_tgt)) {
+            prefetches_rows = true;
+            pf_toks.assign(n_seq, {});
+            SPC_INF("%s", "LLAMA_DRAFT_PREFETCH: the target's n-gram rows of id_last and of each drafted token are read ahead\n");
+        }
+    }
+
+    // LLAMA_DRAFT_PREFETCH (C615): per sequence, id_last and the tokens drafted so far, in the verify pass's order
+    std::vector<llama_tokens> pf_toks;
+
+    // issue the rows of pf_toks[seq_id]'s last token, at the target's positions from pos0
+    void prefetch_last(llama_seq_id seq_id, llama_pos pos0) {
+        const auto & t = pf_toks[seq_id];
+        llama_draft_prefetch(params.ctx_tgt, seq_id, pos0, t.data(), (int32_t) t.size(), (int32_t) t.size() - 1);
     }
 
     static bool overlap_wanted() {
@@ -2590,6 +2610,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
+
+            // C615: the verify pass starts with id_last, whose rows no pass has read yet
+            if (prefetches_rows) {
+                pf_toks[seq_id].assign(1, dp.id_last);
+                prefetch_last(seq_id, dp.pos0);
+            }
         }
 
         if (embd_cache_on && n_drafting > 0 && ++embd_cache_n_rounds % 1000 == 0) {
@@ -2690,6 +2716,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 result.push_back(id);
                 spec_info_add_marginal(dp.info, common_speculative_type_to_str(type), cur_p, id);
                 spec_push_p(dp, cur_p, id);
+
+                // C615: the drafted token's rows, read while the next drafting pass (or the verify's preparation) runs
+                if (prefetches_rows) {
+                    pf_toks[seq_id].push_back(id);
+                    prefetch_last(seq_id, dp.pos0);
+                }
 
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
@@ -3268,6 +3300,11 @@ struct common_speculative {
 
     // C703: the caller's work queued behind an implementation's pending catch-up, see common_speculative_after_catchup()
     std::vector<std::function<void()>> after_catchup;
+
+    // LLAMA_DRAFT_PREFETCH (C615): the target context whose n-gram rows a finished draft's tokens are issued in (nullptr:
+    // off), for the drafters that do not issue them as they sample; scratch for id_last and the draft
+    llama_context * pf_ctx = nullptr;
+    llama_tokens    pf_toks;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3838,7 +3875,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
         /* .after_catchup = */ {},
+        /* .pf_ctx      = */ nullptr,
+        /* .pf_toks     = */ {},
     });
+
+    // C615: only a target with a mapped n-gram table and the switch on
+    if (params.draft.ctx_tgt && llama_draft_prefetch_enabled(params.draft.ctx_tgt)) {
+        result->pf_ctx = params.draft.ctx_tgt;
+    }
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
@@ -4047,6 +4091,15 @@ void common_speculative_draft(common_speculative * spec) {
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
+
+                    // C615 (LLAMA_DRAFT_PREFETCH): the target's n-gram rows of id_last and the draft, issued once the
+                    // draft is known, for the drafters that did not issue them token by token (draft-mtp does)
+                    if (spec->pf_ctx && !impl->prefetches_rows) {
+                        spec->pf_toks.assign(1, dp.id_last);
+                        spec->pf_toks.insert(spec->pf_toks.end(), result.begin(), result.end());
+                        llama_draft_prefetch(spec->pf_ctx, seq_id, dp.pos0, spec->pf_toks.data(),
+                                (int32_t) spec->pf_toks.size(), 0);
+                    }
                 }
             }
 

@@ -543,6 +543,9 @@ public:
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    // the cache this context reads (C615: the draft prefetch's state is keyed by it)
+    const llama_kv_cache * get_kv() const { return kv; }
+
 private:
     llama_memory_status status;
 
