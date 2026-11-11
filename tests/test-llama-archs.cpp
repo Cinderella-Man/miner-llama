@@ -2900,9 +2900,9 @@ static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, co
                 int n_refused = 0;
                 std::vector<int> n_kind(OP_COUNT, 0);
 
-                // a recurrent memory's sequences that may hold a rollback not yet applied (a tail removed since their
-                // last decode): a copy of such a sequence would share a state with two rollback indices, which the
-                // recurrent memory cannot write, and which the server never makes
+                // a recurrent memory's sequences that may hold a rollback not yet applied (a removal from a position
+                // past the first since their last decode): a copy of such a sequence would share a state with two
+                // rollback indices, which the recurrent memory cannot write, and which the server never makes
                 std::vector<char> rs_pending(cfg.n_seq, 0);
                 int n_cp_skipped = 0;
 
@@ -2915,11 +2915,14 @@ static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, co
                             std::to_string(a) + " without the switch, " + std::to_string(b) + " with it";
                     }
                     n_refused += a ? 0 : 1;
-                    if (a && p1 < 0) {
-                        for (uint32_t t = 0; t < cfg.n_seq; t++) {
-                            if (s < 0 || (llama_seq_id) t == s) {
-                                rs_pending[t] = p0 > 0 ? 1 : 0;
-                            }
+                    for (uint32_t t = 0; a && t < cfg.n_seq; t++) {
+                        if (s >= 0 && (llama_seq_id) t != s) {
+                            continue;
+                        }
+                        if (p0 > 0) {
+                            rs_pending[t] = 1;
+                        } else if (p1 < 0) {
+                            rs_pending[t] = 0; // the whole sequence: its rollback index is reset
                         }
                     }
                     return a;
