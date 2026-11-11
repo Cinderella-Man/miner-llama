@@ -230,6 +230,9 @@ public:
     bool next()  override;
     bool apply() override;
 
+    bool tokens_settable() const override;
+    void set_tokens() override;
+
     //
     // llama_memory_hybrid_idx_context specific API
     //

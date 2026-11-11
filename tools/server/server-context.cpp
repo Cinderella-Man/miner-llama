@@ -2040,6 +2040,15 @@ public:
     uint32_t screen_head_m = 0; // > 0: the screened output head may be used (LLAMA_SCREEN_HEAD=1 and the model has one)
     int screen_head_state  = -1; // last decision (-1 = none yet), logged when it changes
 
+    // C738 (LLAMA_VERIFY_PREPARE=1, or 2 to also upload card 0's inputs): a step's verify pass prepared on ctx_tgt while
+    // draft-mtp's last drafting pass runs (verify_prepare_last_pass); the step's decode submits it. Off by default
+    int          verify_prepare = 0;
+    int          vprep_slot     = -1; // the slot whose verify pass is prepared in this step, -1: none
+    int32_t      vprep_n_draft  = 0;  // the draft size it was prepared for
+    uint64_t     vprep_n_calls  = 0;  // last drafting passes reported
+    uint64_t     vprep_n_done   = 0;  // verify passes prepared
+    common_batch vprep_batch;
+
     mtmd_context * mctx = nullptr;
     mtmd_helper_cap mtmd_cap = {};
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
@@ -2396,6 +2405,14 @@ private:
         // the shortlist head with a bound: set up by common_init_from_params (LLAMA_HEAD_BOUND), turned on and off
         // per batch (decode())
         head_bound_on = common_head_bound_requested() && ctx_tgt && llama_head_shortlist_size(ctx_tgt) > 0;
+
+        // C738: the verify pass prepared during the last drafting pass (draft-mtp)
+        if (const char * env = getenv("LLAMA_VERIFY_PREPARE"); env && atoi(env) > 0 && ctx_tgt) {
+            verify_prepare = atoi(env);
+            vprep_batch    = common_batch(ctx_tgt);
+            SRV_INF("LLAMA_VERIFY_PREPARE=%d: the verify pass is prepared while draft-mtp's last drafting pass runs%s\n",
+                    verify_prepare, verify_prepare >= 2 ? ", with card 0's inputs uploaded" : "");
+        }
 
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
@@ -5716,6 +5733,12 @@ private:
             }
         } step_trace_guard;
 
+        // C738: the step's decode submits a verify pass prepared during the draft; one left over is dropped
+        struct vprep_scope {
+            server_context_impl & s;
+            ~vprep_scope() { s.verify_prepare_settle(); }
+        } vprep_guard { *this };
+
         // checkpoint copies to the host that finished in the background take their checkpoints' place
         if (!ckpt_spills.empty()) {
             for (auto & slot : slots) {
@@ -5805,33 +5828,7 @@ private:
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
 
         if (batch.slot_batched) {
-            auto & slot_batched      = batch.slot_batched;
-            auto & alora_scale       = batch.alora_scale;
-            auto & alora_disabled_id = batch.alora_disabled_id;
-
-            // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
-            // apply lora, only need to do it once per batch
-            common_set_adapter_lora(ctx_tgt, slot_batched->lora);
-
-            // if the lora is temporarily disabled for an alora, re-enable it
-            // for next time
-            if (alora_scale > 0.0f) {
-                SRV_DBG("re-enabling alora with scale %f\n", alora_scale);
-                slot_batched->lora[alora_disabled_id].scale = alora_scale;
-            }
-
-            llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
-
-            // Q771: the micro-batch taper for this batch: the request's "ubatch_taper", else the server's
-            const std::string & taper_want = slot_batched->task && !slot_batched->task->params.ubatch_taper.empty()
-                ? slot_batched->task->params.ubatch_taper : taper_default;
-            if (taper_want != taper_cur) {
-                if (!llama_set_ubatch_taper(ctx_tgt, taper_want.c_str())) {
-                    SRV_WRN("bad ubatch_taper '%s' in a request - the server's (%s) instead\n", taper_want.c_str(), taper_default.c_str());
-                    llama_set_ubatch_taper(ctx_tgt, taper_default.c_str());
-                }
-                taper_cur = taper_want;
-            }
+            batch_settings();
         }
 
         llama_step_trace_mark("s.slots.end");
@@ -6130,6 +6127,14 @@ private:
                             /* .result_p = */ spec_adapt ? &slot.spec_draft_p : nullptr,
                         };
 
+                        // C738: the verify pass prepared while the last drafting pass runs
+                        if (verify_prepare > 0) {
+                            server_slot * ps = &slot;
+                            common_speculative_get_draft_params(spec.get(), slot.id).last_pass = [this, ps]() {
+                                verify_prepare_last_pass(*ps);
+                            };
+                        }
+
                         drafting.push_back(&slot);
                     }
                 }
@@ -6146,6 +6151,16 @@ private:
                 llama_step_trace_mark("s.drf.out");
             });
             llama_step_trace_mark("s.drf.end");
+
+            // C738: a prepared verify pass holds the draft it was prepared for (the drafter called last_pass only for a pass
+            // that adds its one last token)
+            for (server_slot * ps : drafting) {
+                common_speculative_get_draft_params(spec.get(), ps->id).last_pass = nullptr;
+                if (vprep_slot == ps->id && (int32_t) ps->spec_draft.size() != vprep_n_draft) {
+                    GGML_ABORT("C738: slot %d's draft came out with %zu tokens, its verify pass was prepared for %d\n", ps->id,
+                            ps->spec_draft.size(), vprep_n_draft);
+                }
+            }
         }
 
         // make checkpoints if needed
@@ -7076,6 +7091,115 @@ private:
         }
 
         return true;
+    }
+
+    // the batch's settings on ctx_tgt, from its first slot: LoRA, embeddings, the micro-batch taper (each setter keeps a
+    // value it already has, so a second call with the same batch changes nothing)
+    void batch_settings() {
+        auto & slot_batched      = batch.slot_batched;
+        auto & alora_scale       = batch.alora_scale;
+        auto & alora_disabled_id = batch.alora_disabled_id;
+
+        // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
+        // apply lora, only need to do it once per batch
+        common_set_adapter_lora(ctx_tgt, slot_batched->lora);
+
+        // if the lora is temporarily disabled for an alora, re-enable it
+        // for next time
+        if (alora_scale > 0.0f) {
+            SRV_DBG("re-enabling alora with scale %f\n", alora_scale);
+            slot_batched->lora[alora_disabled_id].scale = alora_scale;
+        }
+
+        llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+
+        // Q771: the micro-batch taper for this batch: the request's "ubatch_taper", else the server's
+        const std::string & taper_want = slot_batched->task && !slot_batched->task->params.ubatch_taper.empty()
+            ? slot_batched->task->params.ubatch_taper : taper_default;
+        if (taper_want != taper_cur) {
+            if (!llama_set_ubatch_taper(ctx_tgt, taper_want.c_str())) {
+                SRV_WRN("bad ubatch_taper '%s' in a request - the server's (%s) instead\n", taper_want.c_str(), taper_default.c_str());
+                llama_set_ubatch_taper(ctx_tgt, taper_default.c_str());
+            }
+            taper_cur = taper_want;
+        }
+    }
+
+    // C738 (LLAMA_VERIFY_PREPARE): draft-mtp has queued its last drafting pass for this slot, whose draft now lacks only
+    // that pass's token. Prepare the step's verify pass on ctx_tgt now, as update_slots() and decode() will run it, if
+    // nothing between here and that decode can change what it computes: the decode submits it with the last token's id
+    void verify_prepare_last_pass(server_slot & slot) {
+        vprep_n_calls++;
+
+        const auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+        const int32_t n_draft = (int32_t) dp.result->size() + 1;
+
+        // the step's batch is this slot's sampled token and its draft: the one slot at work, generating text
+        int n_busy = 0;
+        for (const auto & s : slots) {
+            n_busy += s.is_processing() ? 1 : 0;
+        }
+        bool ok = n_busy == 1 && slot.is_processing() && slot.state == SLOT_STATE_GENERATING && slot.task &&
+                  slot.task->type == SERVER_TASK_TYPE_COMPLETION && !slot.audio_stream && slot.inp_embd.empty() &&
+                  slot.pipe_win.empty() && batch.size() == 0 && batch.slot_batched == &slot;
+        // the draft is verified whole (no cap below it, no adaptive cut, no forced tokens), and nothing reads or changes
+        // ctx_tgt's memory or settings before the decode (no checkpoint of it, no checkpoints inside the call, no shared
+        // memory with the draft, no per-batch output head decisions)
+        ok = ok && !server_spec_adapt::on() && !server_spec_verify::get().any_draft() &&
+             (dp.n_max <= 0 || dp.n_max >= n_draft) &&
+             ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+             !(ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > (int32_t) llama_n_rs_seq(ctx_tgt)) &&
+             ctx_dft && llama_get_memory(ctx_dft) != llama_get_memory(ctx_tgt) &&
+             ckpt_incall.empty() && incall_cuts.empty() && screen_head_m == 0 && !head_bound_on;
+        if (!ok) {
+            return;
+        }
+
+        // what update_slots() and decode() set on ctx_tgt for this batch (a batch with outputs)
+        batch_settings();
+        llama_set_ubatch_taper_next(ctx_tgt, -1, 1);
+
+        // the batch handle_last_sampled_token() and render() will make, with a stand-in for the token not drafted yet
+        vprep_batch.clear();
+        llama_pos pos = slot.prompt.tokens.pos_next();
+        vprep_batch.add(slot.sampled, pos++, slot.id, true);
+        for (const llama_token t : *dp.result) {
+            vprep_batch.add(t, pos++, slot.id, true);
+        }
+        vprep_batch.add(dp.result->empty() ? slot.sampled : dp.result->back(), pos++, slot.id, true);
+
+        llama_step_trace_mark("s.vp");
+        const int32_t ret = llama_decode_prepare(ctx_tgt, vprep_batch.get());
+        llama_step_trace_mark("s.vp.end");
+
+        if (ret == 0) {
+            vprep_slot    = slot.id;
+            vprep_n_draft = n_draft;
+            vprep_n_done++;
+        } else if (ret < 0) {
+            SLT_WRN(slot, "C738: preparing the verify pass failed (%d), it runs as usual\n", ret);
+        }
+        if (vprep_n_calls == 1 || vprep_n_calls % 1000 == 0) {
+            SRV_INF("C738: %" PRIu64 " verify passes prepared during the last drafting pass, of %" PRIu64 "\n", vprep_n_done, vprep_n_calls);
+        }
+    }
+
+    // C738: a verify pass prepared and not submitted when the step ends (an error path): ctx_tgt drops it, which clears
+    // the slot's sequence, so the slot forgets its cached prompt
+    void verify_prepare_settle() {
+        if (vprep_slot < 0) {
+            return;
+        }
+        if (ctx_tgt && llama_decode_prepared(ctx_tgt)) {
+            llama_decode_prepare_drop(ctx_tgt);
+            for (auto & s : slots) {
+                if (s.id == vprep_slot) {
+                    SLT_WRN(s, "%s", "C738: the prepared verify pass was not decoded; the slot's cached prompt is cleared\n");
+                    s.prompt_clear();
+                }
+            }
+        }
+        vprep_slot = -1;
     }
 
     // returns true = success ; false = retry with smaller batch size

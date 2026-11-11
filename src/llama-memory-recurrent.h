@@ -213,6 +213,10 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    // C738: the recurrent cells keep no token ids
+    bool tokens_settable() const override { return true; }
+    void set_tokens() override {}
+
     //
     // llama_memory_recurrent_context specific API
     //

@@ -812,6 +812,18 @@ bool llama_memory_hybrid_idx_context::apply() {
     return res;
 }
 
+// C738: the attention and indexer caches keep token ids, the k-pool state none
+bool llama_memory_hybrid_idx_context::tokens_settable() const {
+    return llama_memory_hybrid_context::tokens_settable() && (!ctx_idx || ctx_idx->tokens_settable());
+}
+
+void llama_memory_hybrid_idx_context::set_tokens() {
+    llama_memory_hybrid_context::set_tokens();
+    if (ctx_idx) {
+        ctx_idx->set_tokens();
+    }
+}
+
 bool llama_memory_hybrid_idx_context::kpool_track() const {
     // Derived from mem instead of being cached.
     return mem != nullptr && mem->get_mem_idx() != nullptr && mem->get_kpool() > 0 && !ns_ubatch.empty();

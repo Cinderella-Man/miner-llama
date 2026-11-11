@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-sched-preupload.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -1308,6 +1309,18 @@ struct ggml_backend_sched {
     // GGML_SCHED_PREFETCH=0 (C693): no early fetch, each split's inputs are copied when it runs, as before upstream
     // #30966 (default 1)
     bool prefetch;
+
+    // C738: graph inputs of one split uploaded before the evaluation (ggml_backend_sched_preupload_inputs), with a copy
+    // of the host bytes each upload sent; the next evaluation skips an input whose host bytes are still the same
+    int                   preup_split; // -1: none
+    int                   preup_n;
+    int                   preup_cap;
+    struct ggml_tensor ** preup_inputs; // [preup_cap]
+    size_t              * preup_offs;   // [preup_cap] into preup_data
+    char                * preup_data;
+    size_t                preup_size;
+    size_t                preup_data_cap;
+    int                   preup_skipped; // inputs the last evaluation did not copy again
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2466,11 +2479,122 @@ static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int s
     }
 }
 
+// C738: drop the inputs uploaded ahead (a new graph, a reset, or their evaluation has run)
+static void ggml_backend_sched_preupload_drop(ggml_backend_sched_t sched) {
+    sched->preup_split = -1;
+    sched->preup_n     = 0;
+    sched->preup_size  = 0;
+}
+
+// C738: the input was uploaded ahead for this split and its host bytes are the ones that upload sent
+static bool ggml_backend_sched_preuploaded(ggml_backend_sched_t sched, int preup_split, int split_id, const struct ggml_tensor * input) {
+    if (split_id != preup_split) {
+        return false;
+    }
+    for (int i = 0; i < sched->preup_n; i++) {
+        if (sched->preup_inputs[i] == input) {
+            const size_t nbytes = ggml_nbytes(input);
+            const size_t end    = i + 1 < sched->preup_n ? sched->preup_offs[i + 1] : sched->preup_size;
+            return end - sched->preup_offs[i] == nbytes && memcmp(sched->preup_data + sched->preup_offs[i], input->data, nbytes) == 0;
+        }
+    }
+    return false;
+}
+
+int ggml_backend_sched_preupload_inputs(ggml_backend_sched_t sched, size_t * nbytes) {
+    GGML_ASSERT(sched);
+    ggml_backend_sched_preupload_drop(sched);
+    if (nbytes) {
+        *nbytes = 0;
+    }
+    if (!sched->is_alloc) {
+        return 0;
+    }
+
+    ggml_backend_t cpu_backend = sched->backends[sched->n_backends - 1];
+
+    int split_id = -1;
+    for (int i = 0; i < sched->n_splits; i++) {
+        if (sched->backends[sched->splits[i].backend_id] != cpu_backend) {
+            split_id = i;
+            break;
+        }
+    }
+    if (split_id < 0) {
+        return 0;
+    }
+    // a packed split stages its inputs itself
+    if (sched->input_upload >= 2 && sched->caller_sync && split_id < sched->packs_capacity && sched->packs[split_id].n > 0) {
+        return 0;
+    }
+
+    struct ggml_backend_sched_split * split = &sched->splits[split_id];
+    const int split_backend_id = split->backend_id;
+    ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+    if (sched->preup_cap < split->n_inputs) {
+        sched->preup_cap    = split->n_inputs;
+        sched->preup_inputs = (struct ggml_tensor **) realloc(sched->preup_inputs, sched->preup_cap*sizeof(sched->preup_inputs[0]));
+        sched->preup_offs   = (size_t *) realloc(sched->preup_offs, sched->preup_cap*sizeof(sched->preup_offs[0]));
+        GGML_ASSERT(sched->preup_inputs && sched->preup_offs);
+    }
+
+    for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+        struct ggml_tensor * input = split->inputs[input_id];
+        // the graph inputs in host memory that ggml_backend_sched_copy_input would copy synchronously
+        if (!(input->flags & GGML_TENSOR_FLAG_INPUT) || ggml_backend_sched_is_host_weight(input) ||
+                !sched->hv_tensor_requires_copy[hash_id(input)] || ggml_backend_sched_input_skipped(sched, input) ||
+                input->buffer == NULL || !ggml_backend_buffer_is_host(input->buffer) || input->data == NULL ||
+                ggml_backend_sched_get_tensor_backend(sched, input) != cpu_backend) {
+            continue;
+        }
+        struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+        if (input_cpy == NULL || input_cpy->buffer == NULL) {
+            continue;
+        }
+
+        // the waits ggml_backend_sched_copy_input makes before it overwrites the copy
+        if (sched->caller_sync) {
+            // the previous evaluation that read input_cpy has finished
+        } else if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_sched_wait_event(sched, sched->events[split_backend_id][sched->cur_copy]);
+        } else {
+            ggml_backend_sched_wait_backend(sched, split_backend);
+        }
+        ggml_backend_tensor_copy(input, input_cpy);
+
+        const size_t n = ggml_nbytes(input);
+        if (sched->preup_data_cap < sched->preup_size + n) {
+            sched->preup_data_cap = 2*(sched->preup_size + n);
+            sched->preup_data     = (char *) realloc(sched->preup_data, sched->preup_data_cap);
+            GGML_ASSERT(sched->preup_data);
+        }
+        memcpy(sched->preup_data + sched->preup_size, input->data, n);
+        sched->preup_inputs[sched->preup_n] = input;
+        sched->preup_offs  [sched->preup_n] = sched->preup_size;
+        sched->preup_n++;
+        sched->preup_size += n;
+    }
+
+    if (sched->preup_n > 0) {
+        sched->preup_split = split_id;
+    }
+    if (nbytes) {
+        *nbytes = sched->preup_size;
+    }
+    return sched->preup_n;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
     int prev_backend_id = -1;
+
+    // C738: the inputs uploaded ahead serve this evaluation only
+    const int preup_split = sched->preup_split;
+    sched->preup_split   = -1;
+    sched->preup_skipped = 0;
 
     sched->last_cpu_split = -1;
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -2513,6 +2637,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             struct ggml_tensor * input = split->inputs[input_id];
             if (packed && ggml_backend_sched_input_packed(sched, split_id, input)) {
+                continue;
+            }
+            if (ggml_backend_sched_preuploaded(sched, preup_split, split_id, input)) {
+                sched->preup_skipped++;
                 continue;
             }
             if (!ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)]) {
@@ -2587,6 +2715,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     (long long) (ggml_time_us() - t_trace1), on_cpu && split->graph.n_nodes > 0 ? ":" : "",
                     on_cpu && split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "");
             trace_line += buf;
+            if (split_id == preup_split) {
+                // C738: inputs uploaded before the evaluation and not copied again
+                snprintf(buf, sizeof(buf), ":u%d", sched->preup_skipped);
+                trace_line += buf;
+            }
         }
 
         prev_backend_id = split_backend_id;
@@ -2687,6 +2820,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
 
+    sched->preup_split = -1;
+
     ggml_backend_sched_reset(sched);
 
     return sched;
@@ -2713,6 +2848,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
     }
     free(sched->packs);
+    free(sched->preup_inputs);
+    free(sched->preup_offs);
+    free(sched->preup_data);
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->dep_ctx);
     ggml_free(sched->ctx);
@@ -2747,6 +2885,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     }
     sched->is_alloc = false;
     sched->n_skip_inputs = 0;
+    ggml_backend_sched_preupload_drop(sched);
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
@@ -2784,6 +2923,8 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
+
+    ggml_backend_sched_preupload_drop(sched);
 
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;

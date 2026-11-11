@@ -242,8 +242,37 @@ struct llama_context {
             llama_memory_context_i * mctx,
                        ggml_status & ret);
 
+    // the host's times of a ubatch for LLAMA_UBATCH_TRACE [TAG_UBATCH_TRACE]
+    struct ubatch_trace_times {
+        int64_t      t0    = 0;
+        int64_t      pre   = 0;
+        int64_t      build = 0;
+        int64_t      alloc = 0;
+        const char * why   = nullptr; // why the graph was rebuilt
+    };
+
+    // process_ubatch's first part: the memory applied, the graph chosen (reused, or built and allocated) and the
+    // scheduler's caller_sync set for it (the caller clears it); nullptr with ret set on a failure
+    llm_graph_result * process_ubatch_graph(
+                const llama_ubatch & ubatch,
+                    llm_graph_type   gtype,
+            llama_memory_context_i * mctx,
+                       ggml_status & ret,
+                ubatch_trace_times & tt);
+
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
+
+    // C738 (LLAMA_VERIFY_PREPARE, llama_decode_prepare): the host part of a decode done before the ids of some of its
+    // tokens are known: the batch split, the memory's slots applied, the graph chosen and the inputs that need no token
+    // id set (with LLAMA_VERIFY_PREPARE=2 also the first device split's graph inputs uploaded). The next decode() submits
+    // it: it must bring the same batch, token ids aside, or the process aborts. Returns 0 if prepared, 1 if not (then
+    // nothing was done that the next decode would not do the same way first), < 0 on an error
+    int  decode_prepare(const llama_batch_ext & batch_inp);
+    bool decode_prepared() const { return vprep.active; }
+    // a prepared decode that will not be submitted (error paths): the sequences it holds lose every cell (the memory
+    // cannot give back exactly what apply() took before the graph ran); false if there were any
+    bool decode_prepare_drop();
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -588,6 +617,35 @@ private:
 
     // scheduler of the graph of the last process_ubatch(), nullptr for the shared one
     ggml_backend_sched_t sched_active = nullptr;
+
+    // C738: the decode prepared by decode_prepare(), and the mode decode() and process_ubatch() run in: 0 a plain call,
+    // 1 preparing (up to the inputs that need no token id), 2 submitting the prepared call (from the other inputs on)
+    struct verify_prep {
+        bool                                 active = false;
+        std::vector<llama_batch_ext::token>  tokens; // the prepared batch, which the next decode must bring
+        llama_memory_context_ptr             mctx;   // applied
+        llm_graph_result                   * res   = nullptr;
+        ggml_backend_sched_t                 sched = nullptr; // sched_active of the prepared ubatch
+        int32_t                              h_nextn_w = 0;
+        // the settings the graph was chosen with
+        bool                                 embeddings  = false;
+        bool                                 causal_attn = true;
+        bool                                 screen_head = false;
+        std::map<llama_seq_id, llama_sampler *> samplers;
+        // the first device split's inputs uploaded ahead (LLAMA_VERIFY_PREPARE=2)
+        int                                  n_preup     = 0;
+        size_t                               preup_bytes = 0;
+    } vprep;
+    int vprep_mode  = 0;
+    int vprep_level = 0; // LLAMA_VERIFY_PREPARE, read at construction (2: also the uploads)
+    uint64_t vprep_n_prepared = 0;
+    uint64_t vprep_n_refused  = 0;
+    uint64_t vprep_n_dropped  = 0;
+    uint64_t vprep_n_preup    = 0; // inputs uploaded ahead, in all
+
+    // C738: the next decode() brings the prepared batch: compare it, and put its token ids where the prepared call keeps
+    // them (the batch allocator, the ubatch, the memory's cells)
+    void vprep_take_batch(const llama_batch_ext & batch_inp);
 
     ggml_backend_sched_t sched_res() const { return sched_active ? sched_active : sched.get(); }
 

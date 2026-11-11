@@ -119,6 +119,12 @@ public:
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
+    // C738 (llama_decode_prepare): true if set_input reads no token id of the ubatch, and what it does is the same
+    // whenever it runs between the memory's apply() and the graph's evaluation: such an input may be set before the
+    // batch's last token ids are known. Each class answers for itself only: its subclasses answer false unless they
+    // override it
+    virtual bool sets_without_tokens() const { return false; }
+
     // after the graph has run and the scheduler synchronized: compare what the devices built from the inputs with the
     // host's own (LLAMA_QSA_POOL_MASK_DEV_CHECK); the caller asks only when needs_check_outputs() says so
     virtual bool needs_check_outputs() const { return false; }
@@ -212,6 +218,7 @@ public:
     virtual ~llm_graph_input_pos() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool sets_without_tokens() const override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -277,6 +284,7 @@ public:
     virtual ~llm_graph_input_out_ids() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool sets_without_tokens() const override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -347,6 +355,7 @@ public:
     virtual ~llm_graph_input_rs() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool sets_without_tokens() const override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -473,6 +482,7 @@ public:
     ~llm_graph_input_attn_kv() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool sets_without_tokens() const override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -799,6 +809,7 @@ public:
     virtual ~llm_graph_input_mem_hybrid() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool sets_without_tokens() const override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -1083,6 +1094,9 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+    // C738: set_inputs in two parts, each input once: the inputs that need no token id (sets_without_tokens), then the
+    // others, each part in the inputs' order
+    void set_inputs_part(const llama_ubatch * ubatch, bool without_tokens);
     void set_outputs(const llm_graph_params & params);
 
     // see llm_graph_input_i::check_outputs

@@ -229,6 +229,9 @@ public:
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
+    // C738: the cells' token ids (ext.tok) again from the ubatch that apply_ubatch() placed there, as apply_ubatch() sets them
+    void apply_ubatch_tokens(const slot_info & sinfo, const llama_ubatch & ubatch);
+
     //
     // input API
     //
@@ -480,6 +483,9 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+
+    bool tokens_settable() const override;
+    void set_tokens() override;
 
     //
     // llama_kv_cache_context specific API

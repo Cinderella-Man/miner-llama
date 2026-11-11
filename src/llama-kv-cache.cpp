@@ -1239,6 +1239,35 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
+void llama_kv_cache::apply_ubatch_tokens(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other || !ubatch.token) {
+        return;
+    }
+
+    assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+            const uint32_t i = s*sinfo.size() + ii;
+
+            const bool is_embd = ubatch.is_mixed() && ubatch.type[i];
+            if (is_embd) {
+                continue;
+            }
+
+            auto & cells = v_cells[sinfo.strm[s]];
+
+            const auto idx = sinfo.idxs[s][ii];
+
+            // what apply_ubatch() wrote, with this token id
+            llama_kv_cell_ext ext = cells.ext_get(idx);
+            ext.tok = ubatch.token[i];
+            cells.ext_set(idx, ext);
+        }
+    }
+}
+
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -3394,6 +3423,15 @@ bool llama_kv_cache_context::apply() {
     n_kv_rows = kv->get_n_kv_rows(ubatches[i_cur]);
 
     return true;
+}
+
+bool llama_kv_cache_context::tokens_settable() const {
+    return !ubatches.empty();
+}
+
+void llama_kv_cache_context::set_tokens() {
+    GGML_ASSERT(!ubatches.empty());
+    kv->apply_ubatch_tokens(sinfos[i_cur], ubatches[i_cur]);
 }
 
 llama_memory_status llama_kv_cache_context::get_status() const {

@@ -232,6 +232,20 @@ LLAMA_API void llama_step_trace_count(const char * name, int64_t value); // adde
 LLAMA_API void llama_step_trace_end  (void);
 LLAMA_API void llama_step_trace_role (struct llama_context * ctx, char role);
 
+// C738 (LLAMA_VERIFY_PREPARE): the host part of the next decode done before the ids of some of its tokens are known,
+// e.g. a speculative verify pass prepared while the last drafting pass runs. llama_decode_prepare splits the batch,
+// applies the memory's slots, chooses the graph and sets every input that reads no token id (with
+// LLAMA_VERIFY_PREPARE=2 it also uploads the first device split's graph inputs); the next llama_decode or llama_process
+// on the context submits it and must bring the same batch with any token ids (anything else aborts). The result is the
+// one the plain call gives. Returns 0 if prepared, 1 if not (a batch with embeddings or state rows, a call in flight, a
+// batch of more than one ubatch, a memory that cannot take token ids later, ...: nothing was done that the next decode
+// would not do the same way first), < 0 on an error. Its marks in the step trace have the role 'p'
+LLAMA_API int32_t llama_decode_prepare(struct llama_context * ctx, struct llama_batch_ext * batch);
+LLAMA_API bool    llama_decode_prepared(const struct llama_context * ctx);
+// a prepared decode that will not be submitted (error paths only): the sequences it holds lose every cell, since the
+// memory cannot give back what it took before the graph ran exactly; false if one was dropped
+LLAMA_API bool    llama_decode_prepare_drop(struct llama_context * ctx);
+
 // The main model's head over the context's shortlist (llama_head_shortlist_init) with an exact bound on every other
 // logit (Q619): while it is on, a decode with one output computes the shortlist's logits and gives every other token
 // -INFINITY; llama_head_bound_ith(i) is then at least every left-out logit the full head would have computed (Cauchy-

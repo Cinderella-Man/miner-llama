@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstdlib>
+#include <typeinfo>
 
 // LLAMA_GDN_FUSE=0 builds the delta-net conv window and output norm as separate ops, as before C20 (Q438), so one
 // binary runs both arms; GGML_CUDA_GDN_FUSE=0 turns off the CUDA side (the state read in place, C19)
@@ -824,6 +825,11 @@ class llama_model_qwen4exp::llm_graph_input_kpool : public llm_graph_input_i {
 public:
     llm_graph_input_kpool(const llama_memory_hybrid_idx_context * mctx, uint32_t kpool) : mctx(mctx), kpool(kpool) {}
     virtual ~llm_graph_input_kpool() = default;
+
+    // C738: the pool tables follow the cells and the k-pool state apply() built, no token id
+    bool sets_without_tokens() const override {
+        return typeid(*this) == typeid(llm_graph_input_kpool);
+    }
 
     void set_input(const llama_ubatch * ubatch) override {
         const bool    stats = qwen4exp_qsa_input_stats() > 0;
