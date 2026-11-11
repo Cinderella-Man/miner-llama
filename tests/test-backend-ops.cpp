@@ -14190,6 +14190,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // Q3_K's products of 2 to 8 tokens in the k-column kernel's order (mmvq-pascal-q3kmt.cu, GGML_CUDA_MMVQ_PASCAL_Q3K_MT=1,
+    // C726): Qwen3.8-Flash-Next's ssm_out (6144 -> 2560) and the shared expert's 2560 -> 640, each lane-group size (2 to
+    // 32 lanes per row at 512 to 8192 weights), a partial last row block, rows that are views of wider rows (2-byte-aligned
+    // rows whose super-blocks lie 2 bytes off in turn), K = 6144 (left to the k-column kernel from 5 tokens on, where
+    // fewer than 2 warps a block fit), K = 8192 (from 4 on) and K = 12288 (from 3 on), and 768-wide rows (an odd number
+    // of super-blocks, one lane per row: left to the k-column kernel). The kcol cases above hold attn_qkv, attn_gate and attn_q (2560 -> 10240, 6144 and 12288), 333 x 1024,
+    // 128 x 256 and 256 x 2560 in views of 2816; the large activations run the kernel too.
+    {
+        struct q3k_case { int64_t m, k, k_v; };
+        for (const q3k_case & c : std::vector<q3k_case>{
+                { 2560, 6144, 0 }, { 640, 2560, 0 }, { 4097, 2560, 0 }, { 200, 512, 0 }, { 129, 2048, 0 },
+                { 77, 4096, 0 }, { 64, 8192, 0 }, { 96, 12288, 0 }, { 333, 768, 0 }, { 257, 2560, 2816 },
+                { 129, 512, 768 } }) {
+            for (int64_t n = 1; n <= 8; ++n) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, c.m, n, c.k, { 1, 1 }, { 1, 1 },
+                                                         { 0, 1, 2, 3 }, c.k_v));
+            }
+        }
+    }
     // all 512 experts, as the file has them
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q2_0, GGML_GLU_OP_SWIGLU, 1, 640, 2560, true, 512, 10,
                                                         true));
@@ -16119,11 +16138,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // shared expert's down projection (Q2_0, Q4_0, Q5_0, IQ4_NL) and the output layer (Q5_K, the draft's Q6_K); compare
     // the k-column kernels (mmvq-pascal-kcol.cu) on and off with GGML_CUDA_MMVQ_PASCAL_KCOL, and with
     // GGML_CUDA_MMVQ_PASCAL_DMT (C722) IQ4_XS's and Q4_K's kernel of 2 to 4 tokens, whose shapes the IQ4_XS attn_gate and
-    // the Q4_K attn_qkv and attn_gate (2560 -> 10240 and 6144) complete
+    // the Q4_K attn_qkv and attn_gate (2560 -> 10240 and 6144) complete, and with GGML_CUDA_MMVQ_PASCAL_Q3K_MT (C726)
+    // Q3_K's kernel of 2 to 8 tokens, whose shapes the Q3_K ssm_out (6144 -> 2560) and the shared expert's Q3_K 2560 -> 640
+    // complete
     for (int64_t n = 1; n <= 8; ++n) {
         for (auto [type, m, k] : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{
                 { GGML_TYPE_Q8_0, 10240, 320 }, { GGML_TYPE_Q8_0, 320, 10240 },
                 { GGML_TYPE_Q3_K, 10240, 2560 }, { GGML_TYPE_Q3_K, 6144, 2560 }, { GGML_TYPE_Q3_K, 12288, 2560 },
+                { GGML_TYPE_Q3_K, 2560, 6144 }, { GGML_TYPE_Q3_K, 640, 2560 },
                 { GGML_TYPE_IQ4_XS, 10240, 2560 }, { GGML_TYPE_IQ4_XS, 12288, 2560 }, { GGML_TYPE_IQ4_XS, 2560, 6144 },
                 { GGML_TYPE_IQ4_XS, 6144, 2560 }, { GGML_TYPE_Q4_K, 10240, 2560 }, { GGML_TYPE_Q4_K, 6144, 2560 },
                 { GGML_TYPE_Q4_K, 2560, 6144 }, { GGML_TYPE_Q2_0, 2560, 640 },
