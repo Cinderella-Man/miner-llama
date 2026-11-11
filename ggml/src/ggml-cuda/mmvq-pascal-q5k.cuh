@@ -8,12 +8,14 @@
 // the last card, whose four-token product took 2.82 times its one-token time on the k-column kernel (Q1222, C690). The
 // design is at the top of mmvq-pascal-q5k.cu.
 //
-// GGML_CUDA_MMVQ_PASCAL_Q5K_MT: 0 (default) off, the k-column and the earlier multi-token kernels as before; 1 on; 2 on
-// without the register prefetch of each warp's next weight segment (for measuring it).
-// GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R=1: one row per lane group, as the one-token kernel (default 2: two rows, which share
-// the activation loads). GGML_CUDA_MMVQ_PASCAL_Q5K_MT_NW=n: warps per block (1 to 6 at R = 1, 1 to 3 at R = 2, default
-// the most; fewer where the block's shared memory would pass 48 KB). The kernels follow GGML_CUDA_MMVQ_PASCAL (0 off,
-// 2 any NVIDIA GPU) and GGML_CUDA_MMVQ_PASCAL_SKIP=q5_K, as the one-token kernel does.
+// GGML_CUDA_MMVQ_PASCAL_Q5K_MT: 0 (default) off, the k-column and the earlier multi-token kernels as before; 1 on,
+// at one row per lane group without the register prefetch (since C766: on a P106 the fastest at 2 to 4 tokens, R75);
+// 2 the same, with the prefetch kept off even under _PF=1 (before C766, 1 meant two rows with the prefetch and 2 the
+// same without it). GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R=2: two rows per lane group, which share the activation loads
+// (default 1, as the one-token kernel). GGML_CUDA_MMVQ_PASCAL_Q5K_MT_PF=1 (with 1): the register prefetch of each
+// warp's next weight segments. GGML_CUDA_MMVQ_PASCAL_Q5K_MT_NW=n: warps per block (1 to 6 at R = 1, 1 to 3 at R = 2,
+// default the most; fewer where the block's shared memory would pass 48 KB). The kernels follow GGML_CUDA_MMVQ_PASCAL
+// (0 off, 2 any NVIDIA GPU) and GGML_CUDA_MMVQ_PASCAL_SKIP=q5_K, as the one-token kernel does.
 
 // Whether ggml_cuda_mmvq_pascal_q5k_mt takes a product of ncols columns of a Q5_K matrix with K weights per row,
 // nrows rows row_bytes apart from x, on the current device (the k-column kernels leave such products to it).
