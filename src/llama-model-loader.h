@@ -88,6 +88,11 @@ struct llama_model_loader {
     uint32_t            share_tensors = 0;
     uint32_t            share_used    = 0;
 
+    // the buffer types of the token embeddings when they don't follow the input layer's: set by the model before its
+    // tensors are created (LLAMA_DRAFT_EMBD_DEV=layer, C762) and placed ahead of any tensor_buft_overrides rule, whose
+    // match is then reported; the output head that reuses the table (TENSOR_DUPLICATED) is not affected
+    const buft_list_t * buft_list_tok_embd = nullptr;
+
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
     struct lazy_read {

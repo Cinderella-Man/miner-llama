@@ -1677,6 +1677,25 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// a file that holds only the NextN (MTP) layers, as an MTP draft's: no tensor of layer 0 and one of the first NextN
+// layer il_nextn (LLAMA_DRAFT_EMBD_DEV)
+static bool llama_file_is_nextn_only(const llama_model_loader & ml, uint32_t il_nextn) {
+    if (il_nextn == 0) {
+        return false;
+    }
+    const std::string nextn = format("blk.%u.", il_nextn);
+    bool has_nextn = false;
+    for (const auto & it : ml.weights_map) {
+        if (it.first.rfind("blk.0.", 0) == 0) {
+            return false;
+        }
+        if (it.first.rfind(nextn, 0) == 0) {
+            has_nextn = true;
+        }
+    }
+    return has_nextn;
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1800,6 +1819,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pimpl->dev_input = pimpl->dev_layer[0];
         LLAMA_LOG_INFO("%s: input layer assigned to device %s (LLAMA_INPUT_ON_GPU)\n", __func__,
                 ggml_backend_dev_name(pimpl->dev_input.dev));
+    }
+
+    // LLAMA_DRAFT_EMBD_DEV=layer (C762): a draft file that holds only its MTP layers (no layer 0, as Flash-Next's MTP
+    // draft) keeps its token embeddings on the device of its first MTP layer, so that a pass gathers its token rows where
+    // the layer reads them and only the token ids cross to that device. Without it the table follows the input layer
+    // (the host) or a -otd rule (the v3 preset's -otd token_embd=CUDA4), and every pass's F32 rows cross from there
+    // through the host; the switch goes ahead of such a rule. The rows are the same bytes on either device. A file with
+    // its trunk (a target, or an MTP context on the target's weights) is placed as before
+    if (const char * s = getenv("LLAMA_DRAFT_EMBD_DEV"); s != nullptr && *s != '\0' && strcmp(s, "0") != 0) {
+        if (strcmp(s, "layer") != 0 && strcmp(s, "1") != 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_DRAFT_EMBD_DEV='%s' is not 'layer': the token embeddings are placed as without it\n",
+                    __func__, s);
+        } else if (hparams.n_layer_nextn > 0 && ml.load_mtp && llama_file_is_nextn_only(ml, hparams.n_layer())) {
+            const auto & ld = pimpl->dev_layer.at(hparams.n_layer());
+            ml.buft_list_tok_embd = ld.buft_list;
+            LLAMA_LOG_INFO("%s: the token embeddings go with the MTP layer %u on device %s (LLAMA_DRAFT_EMBD_DEV)\n",
+                    __func__, hparams.n_layer(), ggml_backend_dev_name(ld.dev));
+        }
     }
 
     // assign the output layer
