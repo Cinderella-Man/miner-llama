@@ -4150,6 +4150,8 @@ bool common_speculative_get_state_at(common_speculative * spec, llama_seq_id seq
         return false;
     }
 
+    common_speculative_flush_or_log(spec);
+
     for (auto & impl : spec->impls) {
         if (impl->get_state_at(seq_id, i_row, data)) {
             return true;
