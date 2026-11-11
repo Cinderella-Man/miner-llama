@@ -4311,8 +4311,13 @@ void llama_context::vprep_take_batch(const llama_batch_ext & batch_inp) {
     }
 
     // the cells apply() filled keep each token's id (PLE n-grams, M-RoPE): the late ones go there before the inputs
-    // that read them are set
-    if (changed) {
+    // that read them are set. LLAMA_VERIFY_PREPARE_FAULT=1 leaves the stand-ins there: a fault for the checks
+    // (test-llama-archs --verify-prepare must fail with it), never for use
+    static const bool fault = [] {
+        const char * env = getenv("LLAMA_VERIFY_PREPARE_FAULT");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (changed && !fault) {
         vprep.mctx->set_tokens();
     }
 }

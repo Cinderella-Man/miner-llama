@@ -2694,9 +2694,10 @@ static int test_mtp_catchup_overlap(const std::string & arch_filter, const size_
 // C738 (llama_decode_prepare, LLAMA_VERIFY_PREPARE): the calls of a speculative server step on the main model, run
 // plainly and with each verify pass prepared before its last token id is known (a stand-in token then), as the server
 // prepares it during the last drafting pass. A prompt, then rounds of: the verify pass (the sampled token and three
-// drafted ones, every one an output), the rejected tail removed, and every third round a one-token call in between. The
-// logits of every output (or the backend sampler's tokens, probabilities and candidates) and the sequence's state at
-// the end must be bit-identical; a context that refuses to prepare runs the plain calls
+// drafted ones, every one an output), the rejected tail removed (0 to 3 drafted tokens kept), and every third round a
+// one-token call in between. The logits of every output (or the backend sampler's tokens, probabilities and
+// candidates) and the sequence's state at the end must be bit-identical; a context that refuses to prepare runs the
+// plain calls
 struct verify_prepare_run {
     std::vector<float>       out;
     std::vector<llama_token> tok;
@@ -2783,7 +2784,7 @@ static verify_prepare_run verify_prepare_sequence(
             common_batch pb(ctx);
             for (int i = 0; i < n_verify; ++i) {
                 // the stand-in: the token before it (as the server's), or the true one every fourth round
-                const llama_token t = i < n_verify - 1 || r % 4 == 3 ? tokens[ti + i] : tokens[ti + i - 1];
+                const llama_token t = i < n_verify - 1 || r % 4 == 1 ? tokens[ti + i] : tokens[ti + i - 1];
                 pb.add(t, pos + i, 0, true);
             }
             const int32_t rc = llama_decode_prepare(ctx, pb.get());
@@ -2802,8 +2803,9 @@ static verify_prepare_run verify_prepare_sequence(
         outputs(n_verify);
         run.n_rounds++;
 
-        // r % 3 drafted tokens accepted: the rest of the pass is removed (the next pass starts with a new token)
-        const int n_keep = 1 + r % 3;
+        // r % 4 drafted tokens accepted: the rest of the pass is removed (the next pass starts with a new token); with
+        // all three kept, the token that was not known when the call was prepared stays in the memory
+        const int n_keep = 1 + r % 4;
         if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, pos + n_keep, -1)) {
             throw std::runtime_error("the memory cannot remove a rejected draft");
         }
