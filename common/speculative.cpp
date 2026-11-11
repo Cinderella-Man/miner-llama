@@ -2020,6 +2020,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // a step's last drafting pass copies no hidden row to the host (LLAMA_MTP_SKIP_LAST_ROW, C742), and the draft
+    // context's copies to the host and copies left out since the start
+    bool     last_row_on     = false;
+    uint64_t last_row_drafts = 0;
+    uint64_t h_host_n        = 0;
+    uint64_t h_skip_n        = 0;
+
     // the draft head over a shortlist of tokens (LLAMA_DRAFT_SHORTLIST, Q592) and when each sequence falls back to the
     // full head
     bool                                       short_on = false;
@@ -2175,6 +2182,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        last_row_init();
         short_init();
         embd_cache_init();
         h_carry_init();
@@ -2211,6 +2219,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     static bool overlap_wanted() {
         const char * s = getenv("LLAMA_MTP_CATCHUP_OVERLAP");
         return s != nullptr && atoi(s) != 0;
+    }
+
+    // LLAMA_MTP_SKIP_LAST_ROW=1: the drafting pass after which every drafting sequence stops at n_max copies no hidden
+    // row to the host, since no later pass reads it (a p_min cut is known only after the pass: those passes copy theirs)
+    void last_row_init() {
+        const char * s = getenv("LLAMA_MTP_SKIP_LAST_ROW");
+        if (s == nullptr || atoi(s) == 0) {
+            return;
+        }
+        last_row_on = true;
+        SPC_INF("%s", "draft hidden rows: a step's last drafting pass copies none to the host\n");
+    }
+
+    void last_row_report() const {
+        SPC_INF("draft hidden rows to the host: %" PRIu64 " copied, %" PRIu64 " left out (the last pass) in %" PRIu64 " drafts\n",
+                h_host_n, h_skip_n, last_row_drafts);
     }
 
     // LLAMA_DRAFT_H_CARRY=1: each drafting pass after a step's first reads its h from the previous pass's output on the
@@ -2354,6 +2378,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (last_row_on) {
+            last_row_report();
+        }
         if (short_on) {
             short_report();
         }
@@ -2654,6 +2681,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // LLAMA_STEP_TRACE (C405): per drafting pass its decode, its sampled id and the next pass's batch
         llama_step_trace_mark("mtp.drf");
 
+        // C742: the draft context's hidden-row copies to the host before this step's passes
+        uint64_t h_host0 = 0;
+        uint64_t h_skip0 = 0;
+        llama_embeddings_nextn_host_stats(ctx_dft, &h_host0, &h_skip0);
+
         batch.clear();
 
         // keep track of which sequences are still drafting
@@ -2761,6 +2793,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // the first pass reads the target's row from the host, the later ones the previous pass's on the device
             if (h_carry_on) {
                 llama_set_nextn_carry(ctx_dft, i > 0, true);
+            }
+
+            // C742: after this pass every drafting sequence has n_max tokens, so no pass reads its hidden rows
+            if (last_row_on) {
+                bool last = true;
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    last = last && (!drafting[seq_id] || (int) dparams[seq_id].result->size() + 1 >= params.n_max);
+                }
+                if (last) {
+                    llama_skip_embeddings_nextn_next(ctx_dft);
+                }
             }
 
             llama_step_trace_mark("mtp.dp");
@@ -2907,6 +2950,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+        }
+
+        // C742: this step's hidden rows copied to the host and left out
+        {
+            uint64_t h_host1 = 0;
+            uint64_t h_skip1 = 0;
+            llama_embeddings_nextn_host_stats(ctx_dft, &h_host1, &h_skip1);
+            h_host_n += h_host1 - h_host0;
+            h_skip_n += h_skip1 - h_skip0;
+            last_row_drafts++;
+            llama_step_trace_count("h.host", (int64_t) (h_host1 - h_host0));
+            llama_step_trace_count("h.skip", (int64_t) (h_skip1 - h_skip0));
         }
 
         llama_step_trace_mark("mtp.drf.end");

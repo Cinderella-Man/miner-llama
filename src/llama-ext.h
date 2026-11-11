@@ -207,6 +207,13 @@ LLAMA_API bool llama_embd_cache_stats(const struct llama_context * ctx, uint64_t
 LLAMA_API bool llama_nextn_carry_init(struct llama_context * ctx);
 LLAMA_API void llama_set_nextn_carry (struct llama_context * ctx, bool in, bool out);
 
+// C742: the caller reads none of the next decode's h_nextn rows (a draft's last pass), so that decode copies none to the
+// host: llama_get_embeddings_nextn_ith then returns an earlier decode's rows. The graph and its outputs are the same, and
+// the decode after it copies again. The stats: since the context was created, the micro-batches that copied their h_nextn
+// rows to the host and those that left them out for the mark.
+LLAMA_API void llama_skip_embeddings_nextn_next (struct llama_context * ctx);
+LLAMA_API void llama_embeddings_nextn_host_stats(const struct llama_context * ctx, uint64_t * n_copied, uint64_t * n_skipped);
+
 // The QSA k-pool tables kept on the devices (LLAMA_QSA_KPOOL_DEV, C100): since the context was created, the ubatches
 // that updated them, those that rewrote every row the graph reads, the rows uploaded, and the ubatches that
 // LLAMA_QSA_KPOOL_DEV_CHECK compared with the tables built without the switch; false while the switch is off.

@@ -208,6 +208,10 @@ struct llama_context {
     bool nextn_carry_init();
     void set_nextn_carry(bool in, bool out);
 
+    // the next decode copies no h_nextn rows to the host (llama_skip_embeddings_nextn_next), and the counts
+    void skip_h_nextn_next() { h_nextn_skip_next = true; }
+    void h_nextn_host_stats(uint64_t * n_copied, uint64_t * n_skipped) const;
+
     // the prefix of this context's marks in a step trace (llama_step_trace_role)
     void set_step_trace_role(char role) { step_trace_role = role; }
 
@@ -891,6 +895,13 @@ private:
     std::string        taper_spec      = "off";
     int32_t            taper_next_head = -1;
     int32_t            taper_next_tail = -1;
+
+    // C742: the next decode copies no h_nextn rows to the host (llama_skip_embeddings_nextn_next), which that call
+    // consumes; since the context was created, the micro-batches that copied their rows to the host and those that left
+    // them out for the mark
+    bool     h_nextn_skip_next = false;
+    uint64_t n_h_nextn_host    = 0;
+    uint64_t n_h_nextn_skipped = 0;
 
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;

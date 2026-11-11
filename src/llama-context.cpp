@@ -2405,6 +2405,15 @@ void llama_context::set_nextn_carry(bool in, bool out) {
     cparams.nextn_carry_out = out && cparams.nextn_carry != nullptr;
 }
 
+void llama_context::h_nextn_host_stats(uint64_t * n_copied, uint64_t * n_skipped) const {
+    if (n_copied) {
+        *n_copied = n_h_nextn_host;
+    }
+    if (n_skipped) {
+        *n_skipped = n_h_nextn_skipped;
+    }
+}
+
 bool llama_context::embd_cache_init(uint32_t n_rows, uint32_t max_tokens) {
     if (model.arch != LLM_ARCH_QWEN4EXP) {
         LLAMA_LOG_ERROR("%s: only the qwen4exp MTP draft reads its token rows from a row cache\n", __func__);
@@ -4514,6 +4523,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     taper_next_head = -1;
     taper_next_tail = -1;
 
+    // C742: the caller's mark is for this call only
+    const bool h_nextn_skip = h_nextn_skip_next;
+    h_nextn_skip_next = false;
+
     // C217: the device-store fills requested for this call; their results stay until the next call
     store_at_last = std::move(store_at_next);
     store_at_next.clear();
@@ -5073,7 +5086,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
             // the device buffer replaces the host extraction, see build_h_nextn_dev()
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && !write_h_nextn) {
+            const bool to_host = embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && !write_h_nextn;
+
+            // C742: a call whose rows the caller does not read (a draft's last pass) leaves them on the device; the graph
+            // and the bookkeeping of its rows are the same
+            if (to_host && h_nextn_skip) {
+                n_h_nextn_skipped++;
+                extract_all_idxs = extract_all_idxs || !masked;
+            } else if (to_host) {
+                n_h_nextn_host++;
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_res(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -8005,6 +8026,14 @@ bool llama_ngram_prefetch_stats(const llama_context * ctx, bool * on, uint64_t *
 
 void llama_set_nextn_carry(llama_context * ctx, bool in, bool out) {
     ctx->set_nextn_carry(in, out);
+}
+
+void llama_skip_embeddings_nextn_next(llama_context * ctx) {
+    ctx->skip_h_nextn_next();
+}
+
+void llama_embeddings_nextn_host_stats(const llama_context * ctx, uint64_t * n_copied, uint64_t * n_skipped) {
+    ctx->h_nextn_host_stats(n_copied, n_skipped);
 }
 
 void llama_step_trace_role(llama_context * ctx, char role) {
