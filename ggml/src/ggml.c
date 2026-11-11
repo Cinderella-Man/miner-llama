@@ -1160,9 +1160,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "KQ_MASK",
 
     "MOE_TAIL",
+
+    "RANGE_MASK",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1281,9 +1283,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "kq_mask(c,t)",
 
     "moe_tail(w,ids)",
+
+    "range_mask(r)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4323,6 +4327,25 @@ struct ggml_tensor * ggml_kq_mask(
     result->op     = GGML_OP_KQ_MASK;
     result->src[0] = cells;
     result->src[1] = toks;
+
+    return result;
+}
+
+// ggml_range_mask
+
+struct ggml_tensor * ggml_range_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ranges,
+        int64_t               n,
+        enum ggml_type        type) {
+    GGML_ASSERT(ranges->type == GGML_TYPE_I32 && ranges->ne[0] == 2 && ggml_is_contiguous(ranges));
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    GGML_ASSERT(n > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, n, ranges->ne[1], ranges->ne[2], ranges->ne[3]);
+
+    result->op     = GGML_OP_RANGE_MASK;
+    result->src[0] = ranges;
 
     return result;
 }

@@ -119,6 +119,11 @@ public:
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
+    // after the graph has run and the scheduler synchronized: compare what the devices built from the inputs with the
+    // host's own (LLAMA_QSA_POOL_MASK_DEV_CHECK); the caller asks only when needs_check_outputs() says so
+    virtual bool needs_check_outputs() const { return false; }
+    virtual void check_outputs(const llama_ubatch * ubatch) { GGML_UNUSED(ubatch); }
+
     // return true if the resulting input tensors using the provided graph parameters would be
     //   the same as the previous input tensors that we have currently stored in the object
     virtual bool can_reuse(const llm_graph_params & params) {
@@ -1079,6 +1084,10 @@ public:
 
     void set_inputs(const llama_ubatch * ubatch);
     void set_outputs(const llm_graph_params & params);
+
+    // see llm_graph_input_i::check_outputs
+    bool needs_check_outputs() const;
+    void check_outputs(const llama_ubatch * ubatch);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
     // this can only be done if we determine that the resulting graph using the new graph parameters

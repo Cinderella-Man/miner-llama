@@ -1807,6 +1807,23 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
 }
 
+bool llm_graph_result::needs_check_outputs() const {
+    for (const auto & input : inputs) {
+        if (input->needs_check_outputs()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void llm_graph_result::check_outputs(const llama_ubatch * ubatch) {
+    for (auto & input : inputs) {
+        if (input->needs_check_outputs()) {
+            input->check_outputs(ubatch);
+        }
+    }
+}
+
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);

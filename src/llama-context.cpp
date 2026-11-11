@@ -3144,6 +3144,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // LLAMA_QSA_POOL_MASK_DEV_CHECK=1 reads back the masks the devices built, once the graph has run
+    if (const auto * mem_idx = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get());
+            mem_idx && mem_idx->pool_mask_dev_check_on() && res->needs_check_outputs()) {
+        ggml_backend_sched_synchronize(sched_res());
+        res->check_outputs(&ubatch);
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -5381,8 +5388,10 @@ llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_graph) const
         // - a layer's attention mask built on the device (LLAMA_GPU_KQ_MASK) belongs on that layer's device, or the scheduler
         //   computes it once and copies it between devices, which is the transfer it exists to avoid; so does the staged
         //   input it is built from ("kq_stage"), or the scheduler uploads each part of the input separately
-        //   (and so does the update of the k-pool tables kept on the devices, "kpool_stage", LLAMA_QSA_KPOOL_DEV)
-        const bool kq_dev = strcmp(name, "kq_mask") == 0 || strcmp(name, "kq_stage") == 0 || strcmp(name, "kpool_stage") == 0;
+        //   (and so does the update of the k-pool tables kept on the devices, "kpool_stage", LLAMA_QSA_KPOOL_DEV, and the
+        //   QSA pool mask built on the devices, "kpool_mask", LLAMA_QSA_POOL_MASK_DEV)
+        const bool kq_dev = strcmp(name, "kq_mask") == 0 || strcmp(name, "kq_stage") == 0 || strcmp(name, "kpool_stage") == 0 ||
+                            strcmp(name, "kpool_mask") == 0;
         // - a card hop's casts (LLAMA_HOP_CAST, build_hop_cast): the narrow cast on the card before the boundary (il is
         //   that card's last layer), the cast back on the card after it, so the scheduler copies the narrow tensor
         const bool hop = strcmp(name, "hop_narrow") == 0 || strcmp(name, "hop_wide") == 0;
@@ -7215,6 +7224,18 @@ bool llama_nextn_carry_init(llama_context * ctx) {
 bool llama_kpool_dev_stats(const llama_context * ctx, uint64_t * n_ubatch, uint64_t * n_full, uint64_t * n_rows, uint64_t * n_checked) {
     const auto * mem_idx = dynamic_cast<const llama_memory_hybrid_idx *>(llama_get_memory(ctx));
     return mem_idx != nullptr && mem_idx->kpool_dev_stats(n_ubatch, n_full, n_rows, n_checked);
+}
+
+bool llama_pool_mask_dev_stats(const llama_context * ctx, uint64_t * n_ubatch, uint64_t * n_checked, uint64_t * n_masks) {
+    const auto * mem_idx = dynamic_cast<const llama_memory_hybrid_idx *>(llama_get_memory(ctx));
+    if (mem_idx == nullptr || !mem_idx->pool_mask_dev_on()) {
+        return false;
+    }
+    const auto & st = mem_idx->pool_mask_stats();
+    if (n_ubatch)  { *n_ubatch  = st.n_ubatch;  }
+    if (n_checked) { *n_checked = st.n_checked; }
+    if (n_masks)   { *n_masks   = st.n_masks;   }
+    return true;
 }
 
 void llama_set_nextn_carry(llama_context * ctx, bool in, bool out) {

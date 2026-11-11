@@ -8762,6 +8762,57 @@ void ggml_compute_forward_kq_mask(
     }
 }
 
+// ggml_compute_forward_range_mask
+
+template <typename T>
+static void ggml_compute_forward_range_mask_impl(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * ranges = dst->src[0];
+
+    const int64_t n  = dst->ne[0];
+    const int64_t nr = ggml_nrows(dst);
+
+    T keep;
+    T drop;
+    if constexpr (std::is_same_v<T, ggml_fp16_t>) {
+        keep = GGML_CPU_FP32_TO_FP16(0.0f);
+        drop = GGML_CPU_FP32_TO_FP16(-INFINITY);
+    } else {
+        keep = 0.0f;
+        drop = -INFINITY;
+    }
+
+    // dst is contiguous, so the r-th of its flattened rows is at r*nb1
+    for (int64_t r = params->ith; r < nr; r += params->nth) {
+        const int32_t * rng = (const int32_t *) ranges->data + 2*r;
+        const int64_t   j0  = std::min<int64_t>(std::max<int64_t>(rng[0], 0), n);
+        const int64_t   j1  = std::min<int64_t>(std::max<int64_t>(rng[1], j0), n);
+
+        T * row = (T *) ((char *) dst->data + r*dst->nb[1]);
+        std::fill(row,      row + j0, drop);
+        std::fill(row + j0, row + j1, keep);
+        std::fill(row + j1, row + n,  drop);
+    }
+}
+
+void ggml_compute_forward_range_mask(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+    switch (dst->type) {
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_range_mask_impl<ggml_fp16_t>(params, dst);
+            } break;
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_range_mask_impl<float>(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 static void ggml_compute_forward_timestep_embedding_f32(
     const ggml_compute_params * params,
     ggml_tensor * dst) {

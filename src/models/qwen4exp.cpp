@@ -839,6 +839,9 @@ public:
         if (stage_small) {
             set_input_small();
         }
+        if (mask_dev) {
+            mctx->pool_mask_dev_sent();
+        }
 
         if (stats) {
             size_t bytes = 0;
@@ -859,6 +862,19 @@ public:
         }
     }
 
+    // LLAMA_QSA_POOL_MASK_DEV_CHECK: every device's mask, kept as a graph output, against the host mask
+    bool needs_check_outputs() const override {
+        return mask_dev && mctx->pool_mask_dev_check_on();
+    }
+
+    void check_outputs(const llama_ubatch * ubatch) override {
+        std::vector<const ggml_tensor *> masks;
+        for (const auto & dm : dev_mask) {
+            masks.push_back(dm.second);
+        }
+        mctx->pool_mask_dev_check(masks, ubatch);
+    }
+
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
 
@@ -874,6 +890,8 @@ public:
         res &= dev               == mctx->kpool_dev_on();
         res &= !dev || n_upd     == mctx->get_n_kpool_upd();
         res &= stage_small       == mctx->kpool_stage_on();
+        res &= mask_dev          == mctx->pool_mask_dev_on();
+        res &= mask_check        == mctx->pool_mask_dev_check_on();
         res &= pool_mask->ne[1]  == params.ubatch.n_tokens;
         res &= tail_idxs->ne[1]  == params.ubatch.n_tokens;
         // the scatter mask shape follows n_kv
@@ -886,7 +904,7 @@ public:
     ggml_tensor * k_idxs        = nullptr; // I64 [n_tokens]
     ggml_tensor * pool_cells    = nullptr; // I32 [n_pool]         cell caching each block's pooled key (null with dev)
     ggml_tensor * pool_idxs     = nullptr; // I32 [kpool, n_pool]  member cells per block, n_kv sentinel for the padded blocks
-    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens]
+    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens], or I32 [2, n_tokens] ranges with mask_dev
     ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   members of the blocks to re-pool this ubatch
     ggml_tensor * new_pool_flat = nullptr; // I32 [kpool*n_new]    view of new_pool_idxs, shared by the QSA layers
@@ -906,6 +924,10 @@ public:
     std::vector<dev_tables> dev_tab;  // per copy
     std::vector<int32_t>    dev_used; // the copies this graph updates
 
+    // LLAMA_QSA_POOL_MASK_DEV (C719): pool_mask holds each token's range [start, end) of visible pools, and each device
+    // that runs a QSA layer builds the F16 [n_pool, n_tokens] mask from it (ggml_range_mask)
+    std::vector<std::pair<ggml_backend_dev_t, ggml_tensor *>> dev_mask; // per device, in graph order
+
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t kpool;
     uint32_t n_new  = 0; // padded to a stable bound, never below 1
@@ -914,6 +936,8 @@ public:
     uint32_t n_pool = 0;
     uint32_t n_upd  = 0; // padded to a stable bound
     bool     dev    = false;
+    bool     mask_dev   = false;
+    bool     mask_check = false; // the masks are graph outputs, read back after the graph has run
 
     // LLAMA_QSA_KPOOL_STAGE (C720, with dev): k_idxs, tail_idxs, new_pool_idxs, new_pool_rep and new_pool_pos follow the
     // update in kpool_upd, in this order, whole numbers as F32; the host's tensors above are filled as without the switch
@@ -949,6 +973,8 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
     inp->n_pool = n_pool;
     inp->dev    = mctx_hyb->kpool_dev_on();
+    inp->mask_dev   = mctx_hyb->pool_mask_dev_on();
+    inp->mask_check = mctx_hyb->pool_mask_dev_check_on();
 
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     if (inp->dev) {
@@ -964,7 +990,8 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
         ggml_set_input(inp->pool_cells);
         ggml_set_input(inp->pool_idxs);
     }
-    inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
+    inp->pool_mask  = inp->mask_dev ? ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, n_tokens) :
+                                      ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     ggml_set_input(inp->pool_mask);
     ggml_set_input(inp->tail_idxs);
@@ -1098,6 +1125,27 @@ llama_model_qwen4exp::kpool_small llama_model_qwen4exp::graph::build_kpool_small
     return dt.small;
 }
 
+// The pool mask on il's device, built once per graph and device from each token's range of visible pools: the callback
+// places it on the layer's device ("kpool_mask"), so a device receives 8 bytes a token instead of 2 a pool and token.
+ggml_tensor * llama_model_qwen4exp::graph::build_pool_mask(llm_graph_input_kpool * inp_kpool, int il) {
+    ggml_backend_dev_t dev = model.dev_layer(il);
+    for (const auto & dm : inp_kpool->dev_mask) {
+        if (dm.first == dev) {
+            return dm.second;
+        }
+    }
+
+    ggml_tensor * mask = ggml_range_mask(ctx0, inp_kpool->pool_mask, inp_kpool->n_pool, GGML_TYPE_F16); // [n_pool, n_tokens]
+    cb(mask, "kpool_mask", il);
+    if (inp_kpool->mask_check) {
+        // kept whole after the graph has run, for the check to read back
+        ggml_set_output(mask);
+    }
+    inp_kpool->dev_mask.emplace_back(dev, mask);
+
+    return mask;
+}
+
 // QSA attends to the top blocks of compress_ratio cells plus the incomplete tail, like the glm5-next k-pool indexer
 // a block is scored by one pooled key: the mean of its raw indexer keys, normed and rotated to its first member
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
@@ -1122,6 +1170,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         build_kpool_dev(mctx_hyb, inp_kpool, il, &pool_cells, &pool_idxs);
     }
     const kpool_small ks = build_kpool_small(mctx_hyb, inp_kpool, il);
+    ggml_tensor * pool_mask = inp_kpool->mask_dev ? build_pool_mask(inp_kpool, il) : inp_kpool->pool_mask;
 
     // cache rows store raw key | pooled key: pooling precedes norm and rotation, so the raw key gets neither
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
@@ -1177,8 +1226,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // which is the lightning indexer with every head weight set to that scale
     ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
     ggml_tensor * score = in_place ? // [n_pool, n_tokens]
-        ggml_lightning_indexer_rows(ctx0, q, kpool_cache.pooled_cells(scattered), weights, inp_kpool->pool_mask, pool_cells) :
-        ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask);
+        ggml_lightning_indexer_rows(ctx0, q, kpool_cache.pooled_cells(scattered), weights, pool_mask, pool_cells) :
+        ggml_lightning_indexer(ctx0, q, pooled, weights, pool_mask);
     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
     cb(score, "indexer_score", il);
 

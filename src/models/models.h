@@ -2824,6 +2824,11 @@ struct llama_model_qwen4exp : public llama_model_base {
           llm_graph_input_kpool * inp_kpool,
                             int   il);
 
+        // LLAMA_QSA_POOL_MASK_DEV (C719): the pool mask on il's device, built once per graph and device
+        ggml_tensor * build_pool_mask(
+          llm_graph_input_kpool * inp_kpool,
+                            int   il);
+
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
                     ggml_tensor * cur,

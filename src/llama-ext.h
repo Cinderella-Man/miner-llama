@@ -212,6 +212,12 @@ LLAMA_API void llama_set_nextn_carry (struct llama_context * ctx, bool in, bool 
 LLAMA_API bool llama_kpool_dev_stats(const struct llama_context * ctx, uint64_t * n_ubatch, uint64_t * n_full, uint64_t * n_rows,
                                      uint64_t * n_checked);
 
+// The QSA pool mask built on the devices (LLAMA_QSA_POOL_MASK_DEV, C719): since the context was created, the ubatches
+// that sent each token's range instead of the mask, those whose masks LLAMA_QSA_POOL_MASK_DEV_CHECK read back and
+// compared with the host mask, and the masks it compared (one per device); false while the switch is off.
+LLAMA_API bool llama_pool_mask_dev_stats(const struct llama_context * ctx, uint64_t * n_ubatch, uint64_t * n_checked,
+                                         uint64_t * n_masks);
+
 // The main model's head over the context's shortlist (llama_head_shortlist_init) with an exact bound on every other
 // logit (Q619): while it is on, a decode with one output computes the shortlist's logits and gives every other token
 // -INFINITY; llama_head_bound_ith(i) is then at least every left-out logit the full head would have computed (Cauchy-

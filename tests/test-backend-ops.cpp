@@ -10517,6 +10517,75 @@ struct test_kq_mask : public test_case {
     }
 };
 
+// GGML_OP_RANGE_MASK
+struct test_range_mask : public test_case {
+    const ggml_type type;
+    const int64_t n;
+    const std::array<int64_t, 3> nr; // rows: ne1, ne2, ne3
+    const int mode; // 0: 0 <= start <= end <= n, as the QSA pool mask; 1: also starts below 0, ends past n, end < start
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n, nr, mode);
+    }
+
+    test_range_mask(ggml_type type, int64_t n, std::array<int64_t, 3> nr = {1, 1, 1}, int mode = 0)
+        : type(type), n(n), nr(nr), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ranges = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, nr[0], nr[1], nr[2]);
+        ggml_set_name(ranges, "ranges");
+        ggml_tensor * out = ggml_range_mask(ctx, ranges, n, type);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(4321 + (int) n + 7 * (int) (nr[0]*nr[1]*nr[2]) + 31 * mode);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "ranges") == 0) {
+                const int64_t rows = nr[0]*nr[1]*nr[2];
+                std::vector<int32_t> data(2*rows);
+                for (int64_t r = 0; r < rows; ++r) {
+                    int32_t a = (int32_t) (rng() % (n + 1));
+                    int32_t b = a + (int32_t) (rng() % (n - a + 1));
+                    switch (rng() % 8) {
+                        case 0: b = a;                   break; // nothing visible
+                        case 1: a = 0; b = (int32_t) n;  break; // everything
+                        case 2: b = (int32_t) n;         break; // to the last column
+                        default:                         break;
+                    }
+                    if (mode == 1) {
+                        switch (rng() % 4) {
+                            case 0: a -= (int32_t) (rng() % 100) + 1;    break;
+                            case 1: b += (int32_t) (rng() % 100) + 1;    break;
+                            case 2: std::swap(a, b); b -= 1;             break;
+                            default:                                     break;
+                        }
+                    }
+                    data[2*r + 0] = a;
+                    data[2*r + 1] = b;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                // the harness's sentinels: left as they are, they hold what an earlier test left (NaN at times)
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double err(const float * a, const float * b, size_t ne) override {
+        size_t n_diff = 0;
+        for (size_t i = 0; i < ne; ++i) {
+            n_diff += a[i] != b[i];
+        }
+        return (double) n_diff;
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+};
+
 // GGML_OP_TIMESTEP_EMBEDDING
 struct test_timestep_embedding : public test_case {
     const ggml_type type;
@@ -15054,6 +15123,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_kq_mask(type,  768,   1, 1, 1, 513, 1, 1024));
         test_cases.emplace_back(new test_kq_mask(type, 2304,   1, 4, 0,   0, 4, 4096));
         test_cases.emplace_back(new test_kq_mask(type,  512, 128, 2, 1, 513, 2, 768));
+    }
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        // the QSA pool mask (C719): Flash-Next's padded pool counts at 16,384 and 49,152 tokens for a drafting pass,
+        // a four-token verify pass and a prompt micro-batch; small and odd widths; rows over three dims; bad ranges
+        for (int64_t n : { 4160, 12352 }) {
+            for (int64_t t : { 1, 4, 512 }) {
+                test_cases.emplace_back(new test_range_mask(type, n, {t, 1, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_range_mask(type,   64, {16, 1, 1}));
+        test_cases.emplace_back(new test_range_mask(type,  257, {33, 1, 1}));
+        test_cases.emplace_back(new test_range_mask(type, 1000, { 5, 3, 2}));
+        test_cases.emplace_back(new test_range_mask(type,  320, {64, 1, 1}, 1));
+        test_cases.emplace_back(new test_range_mask(type, 4160, { 4, 2, 1}, 1));
     }
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, 1048576.0f, 1.0f));
     test_cases.emplace_back(new test_timestep_embedding());
