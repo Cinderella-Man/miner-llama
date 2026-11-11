@@ -577,9 +577,14 @@ private:
         uint32_t               key;
         ggml_backend_sched_ptr sched;
         llm_graph_result     * ready; // the graph allocated in this scheduler, nullptr when it has to be rebuilt
+        bool                   in_flight; // with mtp_graph_keep: a graph of this scheduler submitted since the last wait
     };
     std::vector<sched_small_entry> sched_small;
     bool sched_per_size = false;
+
+    // env: LLAMA_MTP_GRAPH_KEEP=1 (C619), an MTP context only: schedulers per size, keyed also by the head's shortlist
+    // and the hidden-row carry (gf_res_key), and a per-size scheduler waits only for its own graph in flight
+    bool mtp_graph_keep = false;
 
     // env: LLAMA_GRAPH_PER_SIZE=0 keeps the two arenas of llama.cpp before #31156 (batches with and without outputs), so
     // verify batches of every width share one arena and one CUDA graph key, as on -ladder2; 1 (default, as #31156) gives
