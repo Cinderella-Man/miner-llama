@@ -2810,6 +2810,11 @@ static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, co
     LOG(template_row.c_str(), "Model arch.", "Config", "Cache", "Edits", "Decodes", "Refused",
         "seq_rm on: one seq/sorted/scan, any; cells", "Status");
 
+    // LLAMA_ARCHS_SKIP=<regex>: the tests named "<arch> <config>" that it matches are left out (a test that aborts the
+    // process, without the switch as well, so that the others still run); each test names itself on stderr first
+    const char * skip_env = getenv("LLAMA_ARCHS_SKIP");
+    const std::regex skip_re(skip_env ? skip_env : "^$");
+
     uint32_t i_arch = 0;
     for (const llm_arch & arch : llama_arch_all()) {
         i_arch++;
@@ -2849,6 +2854,14 @@ static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, co
                 const kv_seq_rm_config & cfg = configs[i_cfg];
                 const std::string config_name = std::string(moe_name) + " " + cfg.name;
                 const uint32_t n_ctx = cfg.unified ? cfg.n_cells : cfg.n_cells*cfg.n_seq;
+
+                const std::string test_name = std::string(llama_arch_name(arch)) + " " + config_name;
+                if (std::regex_search(test_name, skip_re)) {
+                    LOG(template_row.c_str(), llama_arch_name(arch), config_name.c_str(), "", "", "", "", "", "\033[1;33mSKIP\033[0m (LLAMA_ARCHS_SKIP)");
+                    continue;
+                }
+                fprintf(stderr, "kv-seq-rm start: %s\n", test_name.c_str());
+                fflush(stderr);
 
                 ud.verbosity = LOG_LEVEL_OUTPUT;
                 llama_context_ptr off = kv_seq_rm_ctx(model.get(), n_ctx, cfg.n_seq, cfg.unified, 64, false);
