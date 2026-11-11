@@ -2908,9 +2908,10 @@ static int test_verify_prepare(const std::string & arch_filter, const size_t see
                     verify_prepare_run off2;
                     verify_prepare_run on;
                     try {
+                        // the prepared run between the two plain ones
                         off  = verify_prepare_sequence(model.get(), tokens, cfg.smpl, false, seed);
-                        off2 = verify_prepare_sequence(model.get(), tokens, cfg.smpl, false, seed);
                         on   = verify_prepare_sequence(model.get(), tokens, cfg.smpl, true,  seed);
+                        off2 = verify_prepare_sequence(model.get(), tokens, cfg.smpl, false, seed);
                     } catch (...) {
                         ud.verbosity = verbosity;
                         throw;

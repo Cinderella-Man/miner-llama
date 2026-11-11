@@ -28,6 +28,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 #include <unordered_map>
 
 // LLAMA_STEP_TRACE (C405): a host timestamp of this context's stage; one flag when the variable is unset
@@ -4221,9 +4222,15 @@ int llama_context::decode_prepare(const llama_batch_ext & batch_inp) {
     bool ok = memory != nullptr && !batch_inp.tokens.empty() && batch_inp.embd.empty() && batch_inp.state.empty() &&
               !gf_in_flight && !head_bound && !layer_inp_dev && store_at_next.empty() && ubatch_cuts.empty() &&
               !pipe_drafter && pipe_slots.empty() && !sched_need_reserve && !cparams.embeddings;
+    // the memories whose cells can take token ids after apply() (tokens_settable), by their exact type: any other one
+    // is refused before decode() runs a step of the call. A batch of one sequence that fits in one ubatch
+    ok = ok && (typeid(*memory) == typeid(llama_kv_cache) || typeid(*memory) == typeid(llama_memory_recurrent) ||
+                typeid(*memory) == typeid(llama_memory_hybrid) || typeid(*memory) == typeid(llama_memory_hybrid_idx));
+    ok = ok && batch_inp.tokens.size() <= cparams.n_ubatch;
     for (size_t i = 0; ok && i < batch_inp.tokens.size(); ++i) {
         const auto & t = batch_inp.tokens[i];
-        ok = !t.has_embd && !t.has_state && t.embd_row < 0 && t.state_row < 0 && t.id >= 0;
+        ok = !t.has_embd && !t.has_state && t.embd_row < 0 && t.state_row < 0 && t.id >= 0 && t.seq_ids.size() == 1 &&
+             t.seq_ids == batch_inp.tokens[0].seq_ids;
     }
     if (!ok) {
         vprep_n_refused++;
