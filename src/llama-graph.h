@@ -195,6 +195,9 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * idxs = nullptr; // I64 [n_batch]
+
+    // added to each index when the input is set, nullptr for none (the h_nextn half a decode writes, C703)
+    const int64_t * row0 = nullptr;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -943,6 +946,9 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // the first row of h_nextn_dev this decode writes, read when the inputs are set (C703); nullptr for row 0
+    const int64_t * h_nextn_row0 = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1235,6 +1241,7 @@ struct llm_graph_context {
     ggml_tensor * layer_inp_src;
     ggml_tensor * h_nextn_dev;
     ggml_tensor * h_nextn_src;
+    const int64_t * h_nextn_row0;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "common.h"
 
+#include <functional>
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -241,6 +243,15 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+
+// LLAMA_MTP_CATCHUP_OVERLAP=1 (C703): process() may leave the draft's catch-up over a prompt call (no output row) pending
+// until the next process(), which runs it first: the target then has its next call queued. Every function above runs a
+// pending catch-up first. A caller that reads or edits the draft context itself while one is pending queues that work
+// behind it with common_speculative_after_catchup() (run at once when none is pending), or runs it with
+// common_speculative_flush().
+bool common_speculative_pending(const common_speculative * spec);
+bool common_speculative_flush(common_speculative * spec);
+void common_speculative_after_catchup(common_speculative * spec, std::function<void()> && fn);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

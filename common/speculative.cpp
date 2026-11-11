@@ -575,6 +575,11 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // (optional) work process() left for later (C703, the draft-mtp catch-up of a prompt call): whether some waits, and
+    // run it now; see common_speculative_flush()
+    virtual bool pending() const { return false; }
+    virtual bool flush() { return true; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -2023,6 +2028,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_batch_tgt = 0;
     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
 
+    // LLAMA_MTP_CATCHUP_OVERLAP=1 (C703): the catch-up over a prompt call (no row read back) waits until the target has
+    // its next call queued, so that the draft's passes run while the target's next call starts through the cards; the
+    // target keeps the call's h rows in its buffer's other half meanwhile (llama_hold_embeddings_nextn). The passes, their
+    // inputs and their order are the ones of the immediate catch-up
+    bool overlap = false;
+    struct {
+        bool                             active   = false;
+        std::vector<common_batch::token> tokens;
+        int64_t                          row_base = 0; // the first row of the half with the call's rows
+    } deferred;
+    uint64_t n_deferred = 0;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -2102,18 +2119,38 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_row0.assign(n_seq, -1);
 
         // shared memory and chained heads keep the host rows
+        const bool overlap_want = overlap_wanted();
         if (!is_mem_shared && !chain_heads) {
+            // C703: two halves of rows, before the buffer is made
+            if (overlap_want) {
+                llama_set_embeddings_nextn_dev_halves(ctx_tgt, 2);
+            }
             dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_embd_state_src(ctx_dft, ctx_tgt);
             if (!dev_rows) {
                 llama_set_embd_state_src(ctx_dft, nullptr);
                 llama_set_embeddings_nextn_dev(ctx_tgt, false);
+                llama_set_embeddings_nextn_dev_halves(ctx_tgt, 1);
             }
         }
         SPC_TRC("- target h rows on the device: %s\n", dev_rows ? "yes" : "no");
 
+        if (overlap_want) {
+            overlap = dev_rows;
+            if (overlap) {
+                SPC_INF("%s", "LLAMA_MTP_CATCHUP_OVERLAP: a prompt call's catch-up runs once the target has the next call queued\n");
+            } else {
+                SPC_WRN("%s", "LLAMA_MTP_CATCHUP_OVERLAP: needs the target's h rows on the device (not shared memory, not chained heads): off\n");
+            }
+        }
+
         short_init();
         embd_cache_init();
         h_carry_init();
+    }
+
+    static bool overlap_wanted() {
+        const char * s = getenv("LLAMA_MTP_CATCHUP_OVERLAP");
+        return s != nullptr && atoi(s) != 0;
     }
 
     // LLAMA_DRAFT_H_CARRY=1: each drafting pass after a step's first reads its h from the previous pass's output on the
@@ -2245,11 +2282,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (embd_cache_on) {
             embd_cache_report();
         }
+        if (overlap) {
+            SPC_INF("LLAMA_MTP_CATCHUP_OVERLAP: %" PRIu64 " catch-ups ran after the next call was queued\n", n_deferred);
+        }
 
         auto * ctx_dft = this->params.ctx_dft;
         if (dev_rows) {
             llama_set_embd_state_src(ctx_dft, nullptr);
             llama_set_embeddings_nextn_dev(this->params.ctx_tgt, false);
+            llama_set_embeddings_nextn_dev_halves(this->params.ctx_tgt, 1);
         }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -2293,7 +2334,52 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        const int32_t n_tokens = batch_in.size();
+        auto * ctx_tgt = this->params.ctx_tgt;
+
+        // C703: a prompt call's catch-up waits for the next call (see overlap); the caller ran the one before
+        // (common_speculative_flush)
+        if (overlap && can_defer(batch_in)) {
+            GGML_ASSERT(!deferred.active);
+            deferred.tokens   = batch_in.tokens;
+            deferred.row_base = llama_get_embeddings_nextn_row0(ctx_tgt);
+            deferred.active   = llama_hold_embeddings_nextn(ctx_tgt);
+            if (deferred.active) {
+                n_deferred++;
+                return true;
+            }
+            deferred.tokens.clear();
+        }
+
+        return catch_up(batch_in.tokens, dev_rows ? llama_get_embeddings_nextn_row0(ctx_tgt) : 0);
+    }
+
+    bool pending() const override {
+        return deferred.active;
+    }
+
+    bool flush() override {
+        if (!deferred.active) {
+            return true;
+        }
+        deferred.active = false;
+        const std::vector<common_batch::token> tokens = std::move(deferred.tokens);
+        deferred.tokens.clear();
+        return catch_up(tokens, deferred.row_base);
+    }
+
+    // a batch whose catch-up can wait: token ids only (no vision embeddings), no row the caller reads back
+    bool can_defer(const common_batch & batch_in) const {
+        for (const auto & t : batch_in.tokens) {
+            if (t.id == LLAMA_TOKEN_NULL || t.output) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // the catch-up over a target batch's tokens; with dev_rows its h rows start at row row_base of the target's buffer
+    bool catch_up(const std::vector<common_batch::token> & tokens_in, const int64_t row_base) {
+        const int32_t n_tokens = (int32_t) tokens_in.size();
 
         // remember the first and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
@@ -2301,7 +2387,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         for (int k = 0; k < n_tokens; ++k) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (batch_in.tokens[k].seq_id == seq_id) {
+                if (tokens_in[k].seq_id == seq_id) {
                     i_batch_end[seq_id] = k;
                     if (i_batch_beg[seq_id] < 0) {
                         i_batch_beg[seq_id] = k;
@@ -2319,7 +2405,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (short_on) {
             short_add.clear();
             for (int k = 0; k < n_tokens; ++k) {
-                const llama_token id = batch_in.tokens[k].id;
+                const llama_token id = tokens_in[k].id;
                 if (id != LLAMA_TOKEN_NULL && !llama_head_shortlist_contains(ctx_dft, id)) {
                     short_add.push_back(id);
                 }
@@ -2343,7 +2429,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 GGML_ASSERT(n_tokens <= n_batch_tgt && "the target batch exceeds the h_nextn device buffer");
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                     if (i_batch_beg[seq_id] >= 0) {
-                        llama_set_embeddings_nextn_rows(ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
+                        llama_set_embeddings_nextn_rows(ctx_tgt, row_base + n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
                     }
                 }
             }
@@ -2351,7 +2437,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const float * h_tgt = dev_rows ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
 
             for (int k = 0; k < n_tokens; ++k) {
-                const auto & t = batch_in.tokens[k];
+                const auto & t = tokens_in[k];
 
                 const llama_seq_id seq_id = t.seq_id;
 
@@ -2361,7 +2447,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     : batch.add_embd(t.embd, t.pos.data(), seq_id, false);
 
                 if (dev_rows) {
-                    batch.set_embd_state_row(idx, k == i_batch_beg[seq_id] ? n_batch_tgt + seq_id : k - 1);
+                    batch.set_embd_state_row(idx, (int32_t) row_base + (k == i_batch_beg[seq_id] ? n_batch_tgt + seq_id : k - 1));
                     continue;
                 }
 
@@ -2382,7 +2468,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         if (i_batch_beg[seq_id] < 0) {
                             continue;
                         }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
+                        llama_memory_seq_rm(mem_dft, seq_id, tokens_in[i_batch_beg[seq_id]].pos[0], -1);
                     }
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
@@ -2390,7 +2476,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
                 if (rc != 0) {
                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
+                            head, (int) rc, (int) tokens_in[0].pos[0]);
                     ok = false;
                     break;
                 }
@@ -2410,14 +2496,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-            if (is_mem_shared && !batch_in.tokens[i_batch_end[seq_id]].output) {
+            if (is_mem_shared && !tokens_in[i_batch_end[seq_id]].output) {
                 verify_h_rows[seq_id] = 0;
                 continue;
             }
 
             const bool all_rows_output = std::all_of(
-                    batch_in.tokens.begin() + i_batch_beg[seq_id],
-                    batch_in.tokens.begin() + i_batch_end[seq_id] + 1,
+                    tokens_in.begin() + i_batch_beg[seq_id],
+                    tokens_in.begin() + i_batch_end[seq_id] + 1,
                     [](const common_batch::token & token) { return token.output; });
             const int32_t h_rows = is_mem_shared && !all_rows_output ? 1 : n_rows;
             const int32_t h_offset = is_mem_shared && !all_rows_output ? i_batch_end[seq_id] : i_batch_beg[seq_id];
@@ -2426,8 +2512,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dev_rows) {
                 // the rows stay on the device until the next target decode, only the pending row comes to the host
-                verify_row0[seq_id] = h_offset;
-                llama_get_embeddings_nextn_rows(ctx_tgt, h_offset + h_rows - 1, 1, pending_h[seq_id].data());
+                verify_row0[seq_id] = (int32_t) row_base + h_offset;
+                llama_get_embeddings_nextn_rows(ctx_tgt, row_base + h_offset + h_rows - 1, 1, pending_h[seq_id].data());
                 continue;
             }
 
@@ -3128,6 +3214,9 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // C703: the caller's work queued behind an implementation's pending catch-up, see common_speculative_after_catchup()
+    std::vector<std::function<void()>> after_catchup;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3697,6 +3786,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impls       = */ std::move(impls),
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
+        /* .after_catchup = */ {},
     });
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
@@ -3744,10 +3834,59 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     return spec->dparams[seq_id];
 }
 
+bool common_speculative_pending(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+    for (const auto & impl : spec->impls) {
+        if (impl->pending()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool common_speculative_flush(common_speculative * spec) {
+    if (spec == nullptr) {
+        return true;
+    }
+
+    bool ok = true;
+    for (auto & impl : spec->impls) {
+        ok = impl->flush() && ok;
+    }
+
+    // then the caller's work that waited for it, in its order
+    std::vector<std::function<void()>> after = std::move(spec->after_catchup);
+    spec->after_catchup.clear();
+    for (auto & fn : after) {
+        fn();
+    }
+
+    return ok;
+}
+
+void common_speculative_after_catchup(common_speculative * spec, std::function<void()> && fn) {
+    if (common_speculative_pending(spec)) {
+        spec->after_catchup.push_back(std::move(fn));
+        return;
+    }
+    fn();
+}
+
+// the entry points below run a pending catch-up first (C703), so that they see the draft as the immediate catch-up leaves it
+static void common_speculative_flush_or_log(common_speculative * spec) {
+    if (!common_speculative_flush(spec)) {
+        SPC_ERR("%s", "a pending catch-up failed\n");
+    }
+}
+
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {
     if (spec == nullptr) {
         return;
     }
+
+    common_speculative_flush_or_log(spec);
 
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
@@ -3763,6 +3902,9 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
         return result;
     }
 
+    // C703: the last call's catch-up, now that the target has this one queued
+    result = common_speculative_flush(spec);
+
     for (auto & impl : spec->impls) {
         result = result && impl->process(batch);
     }
@@ -3774,6 +3916,8 @@ void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
     }
+
+    common_speculative_flush_or_log(spec);
 
     auto & dparams = spec->dparams;
 
@@ -3876,6 +4020,8 @@ void common_speculative_draft(common_speculative * spec) {
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    common_speculative_flush_or_log(spec);
+
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {
@@ -3923,6 +4069,8 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
         return false;
     }
 
+    common_speculative_flush_or_log(spec);
+
     for (auto & impl : spec->impls) {
         if (impl->get_state(seq_id, data)) {
             return true;
@@ -3936,6 +4084,8 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     if (spec == nullptr) {
         return;
     }
+
+    common_speculative_flush_or_log(spec);
 
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);

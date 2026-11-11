@@ -1892,8 +1892,13 @@ bool llama_context::h_nextn_dev_alloc() {
         h_nextn_backend = nullptr;
         buf_h_nextn_dev.reset();
         ctx_h_nextn_dev.reset();
-        ev_h_nextn_written_recorded = false;
-        ev_h_nextn_read_recorded    = false;
+        for (int h = 0; h < 2; ++h) {
+            ev_h_nextn_written_recorded[h] = false;
+            ev_h_nextn_read_recorded[h]    = false;
+        }
+        h_nextn_last = 0;
+        h_nextn_held = false;
+        h_nextn_row0 = 0;
     };
 
     // __func__ inside the lambda would be "operator()"
@@ -1924,7 +1929,8 @@ bool llama_context::h_nextn_dev_alloc() {
     };
     ctx_h_nextn_dev.reset(ggml_init(params));
 
-    h_nextn_dev = ggml_new_tensor_2d(ctx_h_nextn_dev.get(), GGML_TYPE_F32, model.hparams.n_embd_out(), cparams.n_batch + cparams.n_seq_max);
+    h_nextn_dev = ggml_new_tensor_2d(ctx_h_nextn_dev.get(), GGML_TYPE_F32, model.hparams.n_embd_out(),
+            (int64_t) h_nextn_halves*(cparams.n_batch + cparams.n_seq_max));
     ggml_set_name(h_nextn_dev, "h_nextn_dev");
 
     buf_h_nextn_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_h_nextn_dev.get(), ggml_backend_dev_buffer_type(h_nextn_dev_dev)));
@@ -1932,16 +1938,21 @@ bool llama_context::h_nextn_dev_alloc() {
         return fail("failed to allocate the h_nextn device buffer");
     }
 
-    if (!ev_h_nextn_written) {
-        ev_h_nextn_written.reset(ggml_backend_event_new(h_nextn_dev_dev));
-        ev_h_nextn_read.reset(ggml_backend_event_new(h_nextn_dev_dev));
-    }
-    if (!ev_h_nextn_written || !ev_h_nextn_read) {
-        return fail("the device has no events");
+    for (int h = 0; h < h_nextn_halves; ++h) {
+        if (!ev_h_nextn_written[h]) {
+            ev_h_nextn_written[h].reset(ggml_backend_event_new(h_nextn_dev_dev));
+            ev_h_nextn_read[h].reset(ggml_backend_event_new(h_nextn_dev_dev));
+        }
+        // C703: the CPU computes a decode before it returns, so two halves there need no events (the CPU check)
+        const bool cpu = ggml_backend_dev_type(h_nextn_dev_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        if ((!ev_h_nextn_written[h] || !ev_h_nextn_read[h]) && !(h_nextn_halves > 1 && cpu)) {
+            return fail("the device has no events");
+        }
     }
 
-    LLAMA_LOG_INFO("%s: %10s h_nextn buffer size = %8.2f MiB\n", __func__,
-            ggml_backend_buffer_name(buf_h_nextn_dev.get()), ggml_backend_buffer_get_size(buf_h_nextn_dev.get())/1024.0/1024.0);
+    LLAMA_LOG_INFO("%s: %10s h_nextn buffer size = %8.2f MiB%s\n", __func__,
+            ggml_backend_buffer_name(buf_h_nextn_dev.get()), ggml_backend_buffer_get_size(buf_h_nextn_dev.get())/1024.0/1024.0,
+            h_nextn_halves > 1 ? " (two halves)" : "");
 
     return true;
 }
@@ -1963,12 +1974,36 @@ bool llama_context::set_embeddings_nextn_dev(bool value) {
     return h_nextn_dev_alloc() && cparams.embeddings_nextn_dev == value;
 }
 
+bool llama_context::set_h_nextn_halves(int32_t n) {
+    if (n < 1 || n > 2) {
+        return false;
+    }
+    if (h_nextn_halves != n) {
+        h_nextn_halves = n;
+        // the next graphs see the new buffer
+        sched_need_reserve = true;
+        if (cparams.embeddings_nextn_dev && !h_nextn_dev_alloc()) {
+            return false;
+        }
+    }
+    return h_nextn_dev == nullptr || h_nextn_halves == n;
+}
+
+bool llama_context::hold_h_nextn() {
+    if (h_nextn_dev == nullptr || h_nextn_halves < 2) {
+        return false;
+    }
+    h_nextn_held = true;
+    return true;
+}
+
 bool llama_context::get_h_nextn_rows(int64_t row0, int64_t n_rows, float * out) {
     if (h_nextn_dev == nullptr || row0 < 0 || n_rows < 0 || row0 + n_rows > h_nextn_dev->ne[1]) {
         return false;
     }
-    if (ev_h_nextn_written_recorded) {
-        ggml_backend_event_synchronize(ev_h_nextn_written.get());
+    const int32_t h = h_nextn_half_of(row0);
+    if (ev_h_nextn_written_recorded[h]) {
+        ggml_backend_event_synchronize(ev_h_nextn_written[h].get());
     } else {
         synchronize();
     }
@@ -1981,8 +2016,9 @@ bool llama_context::set_h_nextn_rows(int64_t row0, int64_t n_rows, const float *
         return false;
     }
     // a reader may still read these rows
-    if (ev_h_nextn_read_recorded) {
-        ggml_backend_event_synchronize(ev_h_nextn_read.get());
+    const int32_t h = h_nextn_half_of(row0);
+    if (ev_h_nextn_read_recorded[h]) {
+        ggml_backend_event_synchronize(ev_h_nextn_read[h].get());
     }
     ggml_backend_tensor_set(h_nextn_dev, data, row0*h_nextn_dev->nb[1], n_rows*h_nextn_dev->nb[1]);
     return true;
@@ -4285,19 +4321,35 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     // ordering for the h_nextn device buffer, as for the layer input buffer
+    // (C703: per half of the buffer; the batch's rows say which halves this decode reads)
     llama_context * state_src     = has_state_row ? cparams.ctx_state_src : nullptr;
     ggml_backend_t  state_backend = nullptr;
+    bool            state_half[2] = { false, false };
     if (state_src) {
         state_backend = backend_from_dev(state_src->h_nextn_dev_dev);
-        if (state_src->ev_h_nextn_written_recorded) {
-            ggml_backend_event_synchronize(state_src->ev_h_nextn_written.get());
-        } else {
-            state_src->synchronize();
+        for (const auto & t : batch_inp.tokens) {
+            state_half[state_src->h_nextn_half_of(t.state_row)] = true;
+        }
+        for (int h = 0; h < 2; ++h) {
+            if (!state_half[h]) {
+                continue;
+            }
+            if (state_src->ev_h_nextn_written_recorded[h]) {
+                ggml_backend_event_synchronize(state_src->ev_h_nextn_written[h].get());
+            } else {
+                state_src->synchronize();
+            }
         }
     }
     const bool write_h_nextn = cparams.embeddings_nextn_dev && h_nextn_dev != nullptr;
-    if (write_h_nextn && ev_h_nextn_read_recorded) {
-        ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
+    int32_t    h_nextn_w     = 0;
+    if (write_h_nextn) {
+        // C703: a held half stays as it is, this decode writes the other one (the hold ends with a decode that completes)
+        h_nextn_w    = h_nextn_held ? 1 - h_nextn_last : h_nextn_last;
+        h_nextn_row0 = h_nextn_w*h_nextn_half_rows();
+    }
+    if (write_h_nextn && ev_h_nextn_read_recorded[h_nextn_w]) {
+        ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read[h_nextn_w].get());
     }
 
     do {
@@ -4543,13 +4595,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
     }
     if (write_h_nextn) {
-        ggml_backend_event_record(ev_h_nextn_written.get(), h_nextn_backend);
-        ev_h_nextn_written_recorded = true;
+        if (ev_h_nextn_written[h_nextn_w]) {
+            ggml_backend_event_record(ev_h_nextn_written[h_nextn_w].get(), h_nextn_backend);
+            ev_h_nextn_written_recorded[h_nextn_w] = true;
+        }
+        h_nextn_last = h_nextn_w;
+        h_nextn_held = false;
     }
     if (state_src) {
         if (state_backend) {
-            ggml_backend_event_record(state_src->ev_h_nextn_read.get(), state_backend);
-            state_src->ev_h_nextn_read_recorded = true;
+            for (int h = 0; h < 2; ++h) {
+                if (state_half[h] && state_src->ev_h_nextn_read[h]) {
+                    ggml_backend_event_record(state_src->ev_h_nextn_read[h].get(), state_backend);
+                    state_src->ev_h_nextn_read_recorded[h] = true;
+                }
+            }
         } else {
             synchronize();
         }
@@ -5152,6 +5212,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.h_nextn_row0  =*/ &h_nextn_row0,
     };
 }
 
@@ -7261,6 +7322,18 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 bool llama_set_embeddings_nextn_dev(llama_context * ctx, bool value) {
     return ctx->set_embeddings_nextn_dev(value);
+}
+
+bool llama_set_embeddings_nextn_dev_halves(llama_context * ctx, int32_t n) {
+    return ctx->set_h_nextn_halves(n);
+}
+
+bool llama_hold_embeddings_nextn(llama_context * ctx) {
+    return ctx->hold_h_nextn();
+}
+
+int64_t llama_get_embeddings_nextn_row0(const llama_context * ctx) {
+    return ctx->get_h_nextn_row0();
 }
 
 bool llama_get_embeddings_nextn_rows(llama_context * ctx, int64_t row0, int64_t n_rows, float * out) {

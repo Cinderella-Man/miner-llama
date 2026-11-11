@@ -268,6 +268,15 @@ LLAMA_API uint64_t llama_memory_recurrent_n_swaps(const struct llama_context * c
 // Returns false if the buffer cannot be used, the rows are then extracted to host memory.
 LLAMA_API bool llama_set_embeddings_nextn_dev(struct llama_context * ctx, bool value);
 
+// C703 (LLAMA_MTP_CATCHUP_OVERLAP): n = 2 gives the h_nextn device buffer two halves of n_batch + n_seq_max rows each, rows
+// [h*(n_batch + n_seq_max), (h + 1)*(n_batch + n_seq_max)) for half h with the layout above; a decode writes the half of the
+// last one, unless llama_hold_embeddings_nextn() was called after it: then the other half, so that a reader can read the
+// held rows while the next decode runs. n = 1: one half (the default). Returns false if the buffer cannot be used.
+LLAMA_API bool    llama_set_embeddings_nextn_dev_halves(struct llama_context * ctx, int32_t n);
+LLAMA_API bool    llama_hold_embeddings_nextn          (struct llama_context * ctx);
+// the first row of the half the last decode wrote (0 with one half)
+LLAMA_API int64_t llama_get_embeddings_nextn_row0      (const struct llama_context * ctx);
+
 // Copy rows of the h_nextn device buffer to or from host memory, ordered after the last decode and its readers
 LLAMA_API bool llama_get_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, float * out);
 LLAMA_API bool llama_set_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, const float * data);

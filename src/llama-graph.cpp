@@ -458,9 +458,11 @@ void llm_graph_input_batch_idxs::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ubatch->data && ubatch->data->batch_idxs.size() == (size_t) n_tokens);
     GGML_ASSERT(ggml_backend_buffer_is_host(idxs->buffer));
 
+    const int64_t off = row0 ? *row0 : 0;
+
     int64_t * data = (int64_t *) idxs->data;
     for (int64_t i = 0; i < n_tokens; ++i) {
-        data[i] = ubatch->data->batch_idxs[i];
+        data[i] = ubatch->data->batch_idxs[i] + off;
     }
 }
 
@@ -1963,6 +1965,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     layer_inp_src    (params.layer_inp_src),
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
+    h_nextn_row0     (params.h_nextn_row0),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -5258,6 +5261,7 @@ void llm_graph_context::build_h_nextn_dev() const {
 
     inp->idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
     ggml_set_input(inp->idxs);
+    inp->row0 = h_nextn_row0;
 
     ggml_build_forward_expand(gf, ggml_set_rows(ctx0, h_nextn_dev, ggml_reshape_2d(ctx0, src, src->ne[0], n_tokens), inp->idxs));
 

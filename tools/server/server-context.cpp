@@ -4164,9 +4164,12 @@ private:
         if (!on_dev) {
             cur.update_tgt(ctx_tgt, slot.id, flags_tgt);
         }
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        // the draft's part, and the draft's speculative state stashed with the checkpoint (C703: once the draft's catch-up
+        // of the last call, queued behind the next call, has run)
+        common_speculative_after_catchup(spec.get(), [this, ckpt, id = slot.id]() {
+            ckpt->update_dft(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            common_speculative_get_state(spec.get(), id, ckpt->data_spec);
+        });
 
         const int64_t t_save_us = ggml_time_us() - t_save_start;
 
@@ -4586,12 +4589,26 @@ private:
         return n_read;
     }
 
+    // C703: run the draft's catch-up queued behind the next prompt call, and the work queued behind it
+    void spec_flush() {
+        if (spec && !common_speculative_flush(spec.get())) {
+            throw std::runtime_error("failed to process a queued speculative batch");
+        }
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
+        }
+
+        // C703: a task that may touch a slot sees the draft after its queued catch-up; the loop's own turn and the reads
+        // of the server state leave it queued
+        if (!is_yielding && task.type != SERVER_TASK_TYPE_NEXT_RESPONSE && task.type != SERVER_TASK_TYPE_METRICS &&
+                task.type != SERVER_TASK_TYPE_SLOT_GET && task.type != SERVER_TASK_TYPE_GET_LORA) {
+            spec_flush();
         }
 
         switch (task.type) {
@@ -5418,6 +5435,22 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // C703: the draft's catch-up of the last prompt call stays queued behind the next call only when this turn reads
+        // that prompt on alone
+        if (spec && common_speculative_pending(spec.get())) {
+            int  n_busy = 0;
+            bool prompt = false;
+            for (const auto & slot : slots) {
+                if (slot.is_processing()) {
+                    n_busy++;
+                    prompt = slot.state == SLOT_STATE_PROCESSING_PROMPT;
+                }
+            }
+            if (n_busy != 1 || !prompt) {
+                spec_flush();
+            }
+        }
 
         // checkpoint copies to the host that finished in the background take their checkpoints' place
         if (!ckpt_spills.empty()) {
@@ -6332,7 +6365,19 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    if (slot.ctx_dft && common_speculative_pending(spec.get())) {
+                        // C703: the draft's part after its queued catch-up of the last call
+                        common_memory mem_tgt;
+                        mem_tgt.init(ctx_tgt);
+                        mem_tgt.seq_rm(slot.id, p0, -1);
+                        common_speculative_after_catchup(spec.get(), [this, id = slot.id, p0]() {
+                            common_memory mem_dft;
+                            mem_dft.init(ctx_dft);
+                            mem_dft.seq_rm(id, p0, -1);
+                        });
+                    } else {
+                        slot.mem.seq_rm(slot.id, p0, -1);
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
