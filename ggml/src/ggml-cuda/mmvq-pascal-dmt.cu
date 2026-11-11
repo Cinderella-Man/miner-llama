@@ -42,27 +42,53 @@
 //   - The lane groups' segments are padded so that the lanes' reads of their super-blocks (Q4_K: 128-bit, IQ4_XS's
 //     136-byte super-blocks: 64-bit) hit distinct banks (dmt_gstride).
 //   - Each warp loads its next segments into registers before it computes the current ones, but where dmt_pick_pf says.
+//   - Q6_K (C727, GGML_CUDA_MMVQ_PASCAL_Q6K_MT): the one-token kernel's step (mmvqp_dot_q6_K) is, per sub-block s and
+//     token, sumf = fmaf(d8, (float) (sc0 * (isum0 - t0) + sc1 * (isum1 - t1)), sumf), isum0 and isum1 the dp4a sums
+//     of the 6-bit codes (0..63) and the activations of the sub-block's two halves, t0 and t1 32 times the halves' int8
+//     sums; per super-block fmaf(d, sumf, acc). Here each half's dp4a chain starts at 0x4B400000 - t (staged per token
+//     beside d8), so its result reads as the float 12582912 + (isum - t), |isum - t| <= 16 * 32 * 128 = 2^16;
+//     fmaf(12582912 + (isum - t), sc, -12582912 * sc) is sc * (isum - t) rounded once, which is exact (|.| <= 2^23),
+//     and the two halves' sum is the integer expression exactly (|.| <= 2^24). So no I2F and no integer multiply, and
+//     every FP32 operation of the one-token kernel sees the same operands. The int8 scales come out exactly as the
+//     float of 12582912 with (scale ^ 0x80) in its low mantissa bits, less 12583040.
+//     Its 210-byte super-blocks are 2-byte aligned. The segments are staged in 16-byte units as the other types' (rows
+//     of a multiple of 8 super-blocks, 16-byte aligned: Flash-Next's attn_output and ssm_out, 6144 -> 2560, 8 lanes per
+//     row), and each lane reads its super-block from the staging with 32-bit loads of the aligned words around it,
+//     shifted by 2 bytes where it starts at an odd half-word, as the one-token kernel reads its staging (mmvqp_lds_h);
+//     the lane groups' segments are padded so that those reads hit distinct banks. At 4 tokens and K = 6144 the
+//     activations take 33.6 KB, beside 2 warps at R = 1. A product of one warp a block is left to the k-column kernel,
+//     as C726's kernel leaves it (R79: one warp a block lost to the k-column kernel on a P106), unless _DMT_NW=1.
 
 #define DMT_NW_MAX   6                    // warps per block at R = 1, at most (3 at R = 2)
 #define DMT_MAX_COLS 4
-#define DMT_NU_MAX   9                    // 16-byte units of a super-block, rounded up (Q4_K 9, IQ4_XS 8.5)
+#define DMT_NU_MAX   14                   // 16-byte units of a super-block, rounded up (Q6_K 13.1, Q4_K 9, IQ4_XS 8.5)
 #define DMT_SMEM_MAX (48 * 1024)
 
-static_assert(sizeof(block_q4_K) == 144 && sizeof(block_iq4_xs) == 136, "the staging assumes these super-blocks");
+static_assert(sizeof(block_q4_K) == 144 && sizeof(block_iq4_xs) == 136 && sizeof(block_q6_K) == 210,
+              "the staging assumes these super-blocks");
 
 namespace {
 
 // Per type: SB bytes of a super-block, DSW words per sub-block and token of the staged activation terms (d8, and for
-// Q4_K S).
+// Q4_K S, for Q6_K the two halves' dp4a starts).
 template <ggml_type type> struct dmt_traits;
 template <> struct dmt_traits<GGML_TYPE_Q4_K>   { static constexpr int SB = 144; static constexpr int DSW = 2; };
 template <> struct dmt_traits<GGML_TYPE_IQ4_XS> { static constexpr int SB = 136; static constexpr int DSW = 1; };
+template <> struct dmt_traits<GGML_TYPE_Q6_K>   { static constexpr int SB = 210; static constexpr int DSW = 3; };
 
 static int dmt_sb(const ggml_type type) {
-    return type == GGML_TYPE_Q4_K ? dmt_traits<GGML_TYPE_Q4_K>::SB : dmt_traits<GGML_TYPE_IQ4_XS>::SB;
+    return type == GGML_TYPE_Q4_K ? dmt_traits<GGML_TYPE_Q4_K>::SB :
+           type == GGML_TYPE_Q6_K ? dmt_traits<GGML_TYPE_Q6_K>::SB : dmt_traits<GGML_TYPE_IQ4_XS>::SB;
 }
 static int dmt_dsw(const ggml_type type) {
-    return type == GGML_TYPE_Q4_K ? dmt_traits<GGML_TYPE_Q4_K>::DSW : dmt_traits<GGML_TYPE_IQ4_XS>::DSW;
+    return type == GGML_TYPE_Q4_K ? dmt_traits<GGML_TYPE_Q4_K>::DSW :
+           type == GGML_TYPE_Q6_K ? dmt_traits<GGML_TYPE_Q6_K>::DSW : dmt_traits<GGML_TYPE_IQ4_XS>::DSW;
+}
+
+// Bytes of shared memory past the warps' staging buffers: Q6_K's 32-bit reads of its 2-byte-aligned super-blocks reach
+// up to 4 bytes past the last one (mmvqp_lds_h's padding).
+static int dmt_tail(const ggml_type type) {
+    return type == GGML_TYPE_Q6_K ? 16 : 0;
 }
 
 struct dmt_args {
@@ -82,26 +108,29 @@ struct dmt_args {
     int          stage_off;     // bytes from the start of shared memory to the warps' staging buffers
     int          wstage;        // bytes of a warp's staging buffer
     int          gstride;       // bytes between two lane groups' segments in it (dmt_gstride)
+    int          fault;         // Q6_K: GGML_CUDA_MMVQ_PASCAL_Q6K_MT_FAULT (checks only)
 };
 
 // Words per super-block position of the staged activations: NT tokens x 8 sub-blocks of 8 int8 words, and of the terms
 // (DSW words each), each padded so that consecutive positions start in other banks: an odd number of 4-word groups apart
-// for the int8 words (128-bit reads), an odd number of 2-word (DSW = 2) or 1-word (DSW = 1) units for the terms.
+// for the int8 words (128-bit reads), an odd number of 2-word (DSW = 2) or 1-word (DSW = 1) units for the terms. Q6_K
+// (DSW = 3): the d8 of the 8 NT records, then their pairs of dp4a starts (64-bit reads), an odd number of 2-word units.
 template <int NT> constexpr __host__ __device__ int dmt_q_words() { return 64 * NT + 4; }
 template <ggml_type type, int NT> constexpr __host__ __device__ int dmt_ds_words() {
-    return dmt_traits<type>::DSW == 2 ? 16 * NT + 2 : 8 * NT + 1;
+    return dmt_traits<type>::DSW == 3 ? 24 * NT + 2 : dmt_traits<type>::DSW == 2 ? 16 * NT + 2 : 8 * NT + 1;
 }
 
 static int dmt_act_bytes(const ggml_type type, const int nt, const int nsb) {
     const int q  = nsb * (64 * nt + 4) * 4;
-    const int dw = dmt_dsw(type) == 2 ? 16 * nt + 2 : 8 * nt + 1;
+    const int dw = dmt_dsw(type) == 3 ? 24 * nt + 2 : dmt_dsw(type) == 2 ? 16 * nt + 2 : 8 * nt + 1;
     const int ds = (nsb * dw * 4 + 15) / 16 * 16;
     return q + ds;
 }
 
 // Every token's activation blocks into shared memory, by all warps of the block: the int8 words (IQ4_XS: regrouped as
 // mmvqp_load_act regroups them for its lookup) and per sub-block d8 (Q4_K also S = d8 * the sum of the int8 values, as
-// mmvqp_load_act computes it).
+// mmvqp_load_act computes it; Q6_K also the starts of its two halves' dp4a chains, 0x4B400000 less mmvqp_load_act's
+// t[0] and t[1], 32 times the halves' sums).
 template <ggml_type type, int NT>
 static __device__ __forceinline__ void dmt_stage_act(const dmt_args & p, uint32_t * aq, float * ads) {
     constexpr int QW = dmt_q_words<NT>();
@@ -111,7 +140,12 @@ static __device__ __forceinline__ void dmt_stage_act(const dmt_args & p, uint32_
     for (int e = threadIdx.y * WARP_SIZE + threadIdx.x; e < NT * nab; e += nth) {
         const int j = e / nab;
         const int b = e - j * nab;
-        const uint32_t * src = (const uint32_t *) (p.vy + j * p.col_bytes_y + b * (int) sizeof(block_q8_1));
+        int jy = j;
+        if constexpr (type == GGML_TYPE_Q6_K) {
+            // the fault of the checks: each token takes the next token's activations
+            jy = p.fault ? (j + 1 < NT ? j + 1 : 0) : j;
+        }
+        const uint32_t * src = (const uint32_t *) (p.vy + jy * p.col_bytes_y + b * (int) sizeof(block_q8_1));
         uint32_t w[9];
 #pragma unroll
         for (int k = 0; k < 9; ++k) {
@@ -128,6 +162,18 @@ static __device__ __forceinline__ void dmt_stage_act(const dmt_args & p, uint32_
                 q[2*k + 1] = __byte_perm(w[1 + k], w[5 + k], 0x7362);
             }
             ads[sb * DW + s*NT + j] = d8;
+        } else if constexpr (type == GGML_TYPE_Q6_K) {
+            int s0 = 0;
+            int s1 = 0;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                q[k]     = w[1 + k];
+                q[k + 4] = w[5 + k];
+                s0 = ggml_cuda_dp4a(0x01010101, (int) w[1 + k], s0);
+                s1 = ggml_cuda_dp4a(0x01010101, (int) w[5 + k], s1);
+            }
+            ads[sb * DW + s*NT + j] = d8;
+            *(int2 *) (ads + sb * DW + 8*NT + (s*NT + j) * 2) = make_int2(0x4B400000 - (s0 << 5), 0x4B400000 - (s1 << 5));
         } else {
             int sum = 0;
 #pragma unroll
@@ -300,6 +346,113 @@ static __device__ __forceinline__ void dmt_superblock_q4_K(const char * const (&
     }
 }
 
+// Words i0 .. i0 + N - 1 of a super-block at a 2-byte boundary p in shared memory, as mmvqp_lds_h gives them: the
+// 4-byte-aligned words around them, shifted by 2 bytes where p is at an odd half-word (one read more than N).
+template <int N>
+static __device__ __forceinline__ void dmt_lds_h(uint32_t (&w)[N], const char * p, const int i0) {
+    const int        mis = (int) ((uintptr_t) p & 2);
+    const uint32_t * aw  = (const uint32_t *) (p - mis) + i0; // pointer arithmetic keeps the shared address space
+    const uint32_t   sel = mis ? 0x5432 : 0x3210;
+    uint32_t cur = aw[0];
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        const uint32_t nxt = aw[i + 1];
+        w[i] = __byte_perm(cur, nxt, sel);
+        cur = nxt;
+    }
+}
+
+// Q6_K: the super-blocks of R rows at one position (sw[i]: row i's 210 bytes, 2-byte aligned) times every token's
+// activations at that position (aq: the int8 words, ads: d8, then the dp4a starts), added to acc[i][j] exactly as
+// mmvqp_dot_q6_K adds row i's super-block for token j alone. Its words (mmvqp_dot_q6_K's w): ql 0..31, qh 32..47,
+// scales 48..51, d in the low half of 52; sub-block s = 4h + k takes the low (k < 2) or high nibbles of ql words
+// 16h + 8(k & 1) + j, bits 2k, 2k + 1 of qh words 32 + 8h + j, and scales[2s], scales[2s + 1].
+template <int NT, int R>
+static __device__ __forceinline__ void dmt_superblock_q6_K(const char * const (&sw)[R], const uint32_t * aq,
+                                                           const float * ads, float (&acc)[R][NT]) {
+    float sumf[R][NT];
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            sumf[i][j] = 0.0f;
+        }
+    }
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        uint32_t ql[R][16];
+        uint32_t qh[R][8];
+        uint32_t sc[R][2];
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            dmt_lds_h<16>(ql[i], sw[i], 16*h);
+            dmt_lds_h<8>(qh[i], sw[i], 32 + 8*h);
+            dmt_lds_h<2>(sc[i], sw[i], 48 + 2*h);
+        }
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int s = 4*h + k;
+            int   q[R][8];
+            float scf0[R], scf1[R];
+            float cneg0[R], cneg1[R];
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const uint32_t l  = ql[i][8*(k & 1) + j];
+                    const uint32_t hb = qh[i][j];
+                    const uint32_t lo = k < 2 ? l & 0x0F0F0F0F : (l >> 4) & 0x0F0F0F0F;
+                    const uint32_t hi = k == 0 ? (hb << 4) & 0x30303030 : k == 1 ? (hb << 2) & 0x30303030
+                                      : k == 2 ? hb & 0x30303030 : (hb >> 2) & 0x30303030;
+                    q[i][j] = (int) (lo | hi);
+                }
+                // (float) scales[2s] and (float) scales[2s + 1] exactly: (scale ^ 0x80) = scale + 128 as the low
+                // mantissa bits of 12582912 = 2^23 + 2^22
+                const uint32_t sx  = sc[i][k >> 1] ^ 0x80808080u;
+                const uint32_t sel = 0x7650 | (2 * (k & 1));
+                scf0[i]  = __int_as_float((int) __byte_perm(sx, 0x4B400000u, sel))     - 12583040.0f;
+                scf1[i]  = __int_as_float((int) __byte_perm(sx, 0x4B400000u, sel + 1)) - 12583040.0f;
+                cneg0[i] = -12582912.0f * scf0[i];
+                cneg1[i] = -12582912.0f * scf1[i];
+            }
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                const uint4 u0 = *(const uint4 *) (aq + (s*NT + j)*8);
+                const uint4 u1 = *(const uint4 *) (aq + (s*NT + j)*8 + 4);
+                const float d8 = ads[s*NT + j];
+                const int2  st = *(const int2 *) (ads + 8*NT + (s*NT + j)*2);
+#pragma unroll
+                for (int i = 0; i < R; ++i) {
+                    // the results read as 12582912 + (isum0 - t0) and 12582912 + (isum1 - t1)
+                    int ia0 = st.x;
+                    ia0 = ggml_cuda_dp4a(q[i][0], (int) u0.x, ia0);
+                    ia0 = ggml_cuda_dp4a(q[i][1], (int) u0.y, ia0);
+                    ia0 = ggml_cuda_dp4a(q[i][2], (int) u0.z, ia0);
+                    ia0 = ggml_cuda_dp4a(q[i][3], (int) u0.w, ia0);
+                    int ia1 = st.y;
+                    ia1 = ggml_cuda_dp4a(q[i][4], (int) u1.x, ia1);
+                    ia1 = ggml_cuda_dp4a(q[i][5], (int) u1.y, ia1);
+                    ia1 = ggml_cuda_dp4a(q[i][6], (int) u1.z, ia1);
+                    ia1 = ggml_cuda_dp4a(q[i][7], (int) u1.w, ia1);
+                    const float x0 = fmaf(__int_as_float(ia0), scf0[i], cneg0[i]); // sc0 * (isum0 - t0), exactly
+                    const float x1 = fmaf(__int_as_float(ia1), scf1[i], cneg1[i]); // sc1 * (isum1 - t1), exactly
+                    sumf[i][j] = fmaf(d8, x0 + x1, sumf[i][j]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+        uint32_t dw[1];
+        dmt_lds_h<1>(dw, sw[i], 52);
+        const float d = mmvqp_h2f_lo(dw[0]);
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            acc[i][j] = fmaf(d, sumf[i][j], acc[i][j]);
+        }
+    }
+}
+
 // Grid: (blocks, 1, 1), each looping over warp row blocks; block (32, NW). Dynamic shared memory: the staged activations
 // (int8 words, then the terms), then the NW warps' staging buffers (R rows per lane group).
 template <ggml_type type, int NT, int R, bool PF>
@@ -438,6 +591,8 @@ static __global__ void mul_mat_vec_q_pascal_dmt(const dmt_args p) {
         const int sb = (it << lpr_log2) + sl;
         if constexpr (type == GGML_TYPE_IQ4_XS) {
             dmt_superblock_iq4_xs<NT, R>(sws, aq + sb * QW, ads + sb * DW, acc);
+        } else if constexpr (type == GGML_TYPE_Q6_K) {
+            dmt_superblock_q6_K<NT, R>(sws, aq + sb * QW, ads + sb * DW, acc);
         } else {
             dmt_superblock_q4_K<NT, R>(sws, aq + sb * QW, ads + sb * DW, acc);
         }
@@ -493,6 +648,24 @@ static int dmt_mode() {
     return mode;
 }
 
+// GGML_CUDA_MMVQ_PASCAL_Q6K_MT: Q6_K's products in this kernel (C727), as _DMT sends IQ4_XS's and Q4_K's: 0 off, 1 on,
+// 2 on without the register prefetch
+static int dmt_q6k_mode() {
+    static const int mode = dmt_env("GGML_CUDA_MMVQ_PASCAL_Q6K_MT", 0);
+    return mode;
+}
+
+// the switch of type's products
+static int dmt_type_mode(const ggml_type type) {
+    return type == GGML_TYPE_Q6_K ? dmt_q6k_mode() : dmt_mode();
+}
+
+// GGML_CUDA_MMVQ_PASCAL_Q6K_MT_FAULT=1, for the checks: each token of a Q6_K product takes the next token's activations
+static bool dmt_q6k_fault() {
+    static const bool fault = dmt_env("GGML_CUDA_MMVQ_PASCAL_Q6K_MT_FAULT", 0) == 1;
+    return fault;
+}
+
 // GGML_CUDA_MMVQ_PASCAL_DMT_R: rows per lane group, 1 (default since C758) or 2; 0 chooses per product as C722 did
 // (dmt_pick_r); any other value 1
 static int dmt_r_env() {
@@ -539,22 +712,23 @@ static int dmt_lpr_log2(const int nsb) {
 // Bytes between two lane groups' row segments in a warp's staging buffer: R segments of SB L bytes and the smallest
 // padding, a multiple of 16 bytes below 128, under which the lanes' reads of their super-blocks hit distinct banks: the
 // 8 lanes of each quarter warp for 128-bit reads (16-byte-aligned super-blocks), the 16 lanes of each half warp for
-// 64-bit reads (IQ4_XS's 136 bytes); without padding where none does that.
+// 64-bit reads (IQ4_XS's 136 bytes), the 32 lanes of the warp for 32-bit reads (Q6_K's 210 bytes: the aligned words
+// around each super-block); without padding where none does that.
 static int dmt_gstride(const int sb, const int r, const int lpr_log2) {
     const int L    = 1 << lpr_log2;
     const int base = r * (sb << lpr_log2);
-    const int w    = sb % 16 == 0 ? 16 : 8; // bytes per lane and read
-    const int nl   = 128 / w;               // lanes served together
+    const int w    = sb % 16 == 0 ? 16 : sb % 8 == 0 ? 8 : 4; // bytes per lane and read
+    const int nl   = 128 / w;                                 // lanes served together
     for (int pad = 0; pad < 128; pad += 16) {
         const int gs = base + pad;
         bool ok = true;
         for (int l0 = 0; l0 < WARP_SIZE && ok; l0 += nl) {
-            int seen[16];
+            int seen[32];
             for (int & s : seen) {
                 s = -1;
             }
             for (int lane = l0; lane < l0 + nl && ok; ++lane) {
-                const int a = (lane >> lpr_log2) * gs + (lane & (L - 1)) * sb;
+                const int a = ((lane >> lpr_log2) * gs + (lane & (L - 1)) * sb) / w * w;
                 const int g = (a / w) % nl;
                 ok   = seen[g] < 0 || seen[g] == a;
                 seen[g] = a;
@@ -571,15 +745,19 @@ static int dmt_wstage(const ggml_type type, const int r, const int lpr_log2) {
     return (WARP_SIZE >> lpr_log2) * dmt_gstride(dmt_sb(type), r, lpr_log2);
 }
 
+static int dmt_nw_env() {
+    static const int nw_env = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_NW", DMT_NW_MAX);
+    return nw_env;
+}
+
 // The warps per block for nt tokens, nsb super-blocks per row and r rows per lane group: GGML_CUDA_MMVQ_PASCAL_DMT_NW
 // (default and at most 6 at R = 1, 3 at R = 2), fewer where the shared memory would pass 48 KB; 0 if not even one warp
 // fits.
 static int dmt_nw(const ggml_type type, const int nt, const int nsb, const int r) {
-    static const int nw_env = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_NW", DMT_NW_MAX);
-    int       nw  = std::min(std::max(nw_env, 1), DMT_NW_MAX / r);
+    int       nw  = std::min(std::max(dmt_nw_env(), 1), DMT_NW_MAX / r);
     const int act = dmt_act_bytes(type, nt, nsb);
     const int ws  = dmt_wstage(type, r, dmt_lpr_log2(nsb));
-    while (nw > 0 && act + nw * ws > DMT_SMEM_MAX) {
+    while (nw > 0 && act + nw * ws + dmt_tail(type) > DMT_SMEM_MAX) {
         nw--;
     }
     return nw;
@@ -604,10 +782,11 @@ static int dmt_pick_r(const ggml_type type, const int nt, const int nsb) {
 // R = 1 for IQ4_XS's 2-token products at K = 2560, where on a P106 it costs time (R79, us with it and without: 6144 rows
 // 94.00 and 95.42 against 75.74 and 75.90, 10240 rows 153.56 and 151.83 against 117.74 and 118.73, 12288 rows 180.54 and
 // 180.89 against 135.00 and 136.04; at 3 and 4 tokens, at K = 6144 and at R = 2 it is faster, at Q4_K's 2 tokens at
-// K = 2560 within the spread). So since C758; GGML_CUDA_MMVQ_PASCAL_DMT_PF=1 keeps it there too, as C722 did.
+// K = 2560 within the spread). So since C758; GGML_CUDA_MMVQ_PASCAL_DMT_PF=1 keeps it there too, as C722 did. Q6_K's
+// products: with GGML_CUDA_MMVQ_PASCAL_Q6K_MT=1 always, =2 never.
 static bool dmt_pick_pf(const ggml_type type, const int nt, const int nsb, const int r) {
     static const bool pf_all = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_PF", 0) == 1;
-    if (dmt_mode() == 2) {
+    if (dmt_type_mode(type) == 2) {
         return false;
     }
     return pf_all || r != 1 || type != GGML_TYPE_IQ4_XS || nt != 2 || nsb != 10;
@@ -640,7 +819,8 @@ static void dmt_launch_type(const int nt, const int r, const dmt_args & p, const
 
 bool ggml_cuda_mmvq_pascal_dmt_takes(const ggml_type type, const int64_t K, const int64_t nrows, const int64_t ncols,
                                      const int64_t row_bytes, const void * x) {
-    if (dmt_mode() == 0 || ncols < 2 || ncols > DMT_MAX_COLS || (type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q4_K)) {
+    if (dmt_type_mode(type) == 0 || ncols < 2 || ncols > DMT_MAX_COLS ||
+            (type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q6_K)) {
         return false;
     }
     if (!ggml_cuda_mmvq_pascal_active(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ||
@@ -650,14 +830,17 @@ bool ggml_cuda_mmvq_pascal_dmt_takes(const ggml_type type, const int64_t K, cons
     if (K < QK_K || K % QK_K != 0 || K > INT_MAX || nrows < 1 || nrows > INT_MAX || row_bytes > INT_MAX) {
         return false;
     }
-    // the segments are staged in whole 16-byte units from 16-byte-aligned rows (IQ4_XS: an even number of lanes per row)
+    // the segments are staged in whole 16-byte units from 16-byte-aligned rows (IQ4_XS: an even number of lanes per row;
+    // Q6_K: a multiple of 8)
     const int nsb = (int) (K / QK_K);
     const int sb  = dmt_sb(type);
     if (row_bytes < (int64_t) nsb * sb || row_bytes % 16 != 0 || (uintptr_t) x % 16 != 0 ||
             (sb << dmt_lpr_log2(nsb)) % 16 != 0) {
         return false;
     }
-    return dmt_nw(type, (int) ncols, nsb, dmt_pick_r(type, (int) ncols, nsb)) > 0;
+    const int nw = dmt_nw(type, (int) ncols, nsb, dmt_pick_r(type, (int) ncols, nsb));
+    // Q6_K: a block of one warp only where _DMT_NW=1 asks for it (one warp a block lost to the k-column kernel, R79)
+    return type == GGML_TYPE_Q6_K && dmt_nw_env() != 1 ? nw >= 2 : nw > 0;
 }
 
 bool ggml_cuda_mmvq_pascal_dmt(const ggml_type type, const void * vx, const void * vy, float * dst, const int64_t K,
@@ -696,7 +879,8 @@ bool ggml_cuda_mmvq_pascal_dmt(const ggml_type type, const void * vx, const void
     p.stage_off      = act;
     p.wstage         = dmt_wstage(type, r, p.lpr_log2);
     p.gstride        = dmt_gstride(dmt_sb(type), r, p.lpr_log2);
-    const int smem   = act + nw * p.wstage;
+    p.fault          = type == GGML_TYPE_Q6_K && dmt_q6k_fault();
+    const int smem   = act + nw * p.wstage + dmt_tail(type);
 
     // a persistent grid: as many blocks as the SMs hold at once by shared memory and threads (the launch bounds keep the
     // registers for 2 blocks of the most warps), at most one per nw warp row blocks
@@ -709,6 +893,8 @@ bool ggml_cuda_mmvq_pascal_dmt(const ggml_type type, const void * vx, const void
 
     if (type == GGML_TYPE_IQ4_XS) {
         dmt_launch_type<GGML_TYPE_IQ4_XS>(nt, r, p, grid, block, smem, pf, stream);
+    } else if (type == GGML_TYPE_Q6_K) {
+        dmt_launch_type<GGML_TYPE_Q6_K>(nt, r, p, grid, block, smem, pf, stream);
     } else {
         dmt_launch_type<GGML_TYPE_Q4_K>(nt, r, p, grid, block, smem, pf, stream);
     }

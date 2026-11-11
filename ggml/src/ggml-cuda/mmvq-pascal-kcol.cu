@@ -227,7 +227,8 @@ bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tens
     if (src0->type == GGML_TYPE_Q5_K && ggml_cuda_mmvq_pascal_q5k_mt_takes(K, nrows, ncols, src0->nb[1], src0->data)) {
         return false;
     }
-    // GGML_CUDA_MMVQ_PASCAL_DMT: IQ4_XS's and Q4_K's products of 2 to 4 columns go to mmvq-pascal-dmt.cu (the same)
+    // GGML_CUDA_MMVQ_PASCAL_DMT: IQ4_XS's and Q4_K's products of 2 to 4 columns go to mmvq-pascal-dmt.cu (the same), and
+    // with GGML_CUDA_MMVQ_PASCAL_Q6K_MT Q6_K's (C727)
     if (ggml_cuda_mmvq_pascal_dmt_takes(src0->type, K, nrows, ncols, src0->nb[1], src0->data)) {
         return false;
     }

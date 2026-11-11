@@ -6,8 +6,8 @@
 // each weight once for all tokens and give every token, bit for bit, the sums of the one-token Pascal kernel
 // (mul_mat_vec_q_pascal, mmvq-pascal.cu): Qwen3.8-Flash-Next's attention and recurrent projections in a speculative
 // verify, which the k-column kernel runs at one row per lane group with sums other than the one-token kernel's (C722,
-// Q1277; C690's Q5_K kernel, mmvq-pascal-q5k.cu, carried to the other types). The design is at the top of
-// mmvq-pascal-dmt.cu.
+// Q1277; C690's Q5_K kernel, mmvq-pascal-q5k.cu, carried to the other types), and since C727 (Q1286) Q6_K's as well:
+// Flash-Next's Q6_K attn_output and ssm_out (6144 -> 2560). The design is at the top of mmvq-pascal-dmt.cu.
 //
 // GGML_CUDA_MMVQ_PASCAL_DMT: 0 (default) off, the k-column and the earlier kernels as before; 1 on, at one row per lane
 // group with the register prefetch of each warp's next weight segments, except IQ4_XS's 2 tokens at K = 2560, which run
@@ -19,6 +19,11 @@
 // 1 to 3 at R = 2; fewer where the block's shared memory would pass 48 KB). GGML_CUDA_MMVQ_PASCAL_DMT_SKIP=q4_K: types
 // left to the k-column kernel. The kernels follow GGML_CUDA_MMVQ_PASCAL (0 off, 2 any NVIDIA GPU) and
 // GGML_CUDA_MMVQ_PASCAL_SKIP, as the one-token kernel does.
+// GGML_CUDA_MMVQ_PASCAL_Q6K_MT: Q6_K's products, apart from _DMT: 0 (default) off; 1 on, with the prefetch; 2 on without
+// it. They follow _DMT_R, _DMT_NW and _DMT_SKIP (q6_K) as the other types do, take rows of a multiple of 8 super-blocks
+// (K = 2048, 4096, 6144, ...; at K = 2560 the 2-byte-aligned segments of 2 lanes per row are left to the k-column
+// kernel), and leave products of one warp a block to the k-column kernel unless _DMT_NW=1.
+// GGML_CUDA_MMVQ_PASCAL_Q6K_MT_FAULT=1 (checks only): each token of those products takes the next token's activations.
 
 // Whether ggml_cuda_mmvq_pascal_dmt takes a product of ncols columns of a matrix of type with K weights per row, nrows
 // rows row_bytes apart from x, on the current device (the k-column kernels leave such products to it).
