@@ -3013,7 +3013,7 @@ static int test_mtp_graph_keep(const std::string & arch_filter, const size_t see
 
                 char prompt_str[32];
                 char steps_str[48];
-                char compute_str[32];
+                char compute_str[48];
                 snprintf(prompt_str,  sizeof(prompt_str),  "%d/%d", off.built_prompt, on.built_prompt);
                 snprintf(steps_str,   sizeof(steps_str),   "%d/%d of %d", off.built_steps, on.built_steps, on.passes_steps);
                 snprintf(compute_str, sizeof(compute_str), "%zu/%zu", off.compute/1024, on.compute/1024);
