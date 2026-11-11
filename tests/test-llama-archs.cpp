@@ -3100,9 +3100,10 @@ static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, co
 
 // --kv-seq-rm-time (C740): the host time of one llama_memory_seq_rm call without and with LLAMA_KV_SEQ_RM_BOUND, as the
 // server makes it after each speculative step, in a context of 65,536 cells holding n tokens of one sequence: the
-// call that removes nothing (every drafted token accepted) and the call that removes the 3 tokens decoded just before
-// it (all rejected). llama (one KV cache) and qwen4exp (the recurrent memory, the attention cache and the QSA indexer
-// cache, as Qwen3.8-Flash-Next's target). A diagnostic of the CPU it runs on
+// call that removes nothing (every drafted token accepted), and the call after a verify batch of 4 tokens that removes
+// its last 3 (every drafted token rejected; the context grows by one token a call, as the server's). llama (one KV
+// cache) and qwen4exp (the recurrent memory, the attention cache and the QSA indexer cache, as Qwen3.8-Flash-Next's
+// target). A diagnostic of the CPU it runs on
 static int test_kv_seq_rm_time(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
     struct user_data_t {
         struct {
@@ -3162,7 +3163,7 @@ static int test_kv_seq_rm_time(const std::string & arch_filter, const size_t see
         llama_memory_t mem_off = llama_get_memory(off.get());
         llama_memory_t mem_on  = llama_get_memory(on.get());
 
-        const std::vector<llama_token> tokens = get_tokens(fills[sizeof(fills)/sizeof(fills[0]) - 1] + 8, n_vocab, seed);
+        const std::vector<llama_token> tokens = get_tokens(fills[sizeof(fills)/sizeof(fills[0]) - 1] + 4*n_three + 8, n_vocab, seed);
 
         for (const uint32_t n : fills) {
             for (llama_context * ctx : { off.get(), on.get() }) {
@@ -3183,17 +3184,19 @@ static int test_kv_seq_rm_time(const std::string & arch_filter, const size_t see
                 for (int r = 0; r < n_calls; r++) {
                     for (llama_context * ctx : { off.get(), on.get() }) {
                         llama_memory_t mem = llama_get_memory(ctx);
+                        // the next position: the sampled token and n_rm drafted ones, the drafted ones then removed
+                        const llama_pos p = llama_memory_seq_pos_max(mem, 0) + 1;
                         if (n_rm > 0) {
-                            decode_range(ctx, tokens.data() + n, n_rm, (llama_pos) n, 0, false);
+                            decode_range(ctx, tokens.data() + p, 1 + n_rm, p, 0, false);
                         }
                         const auto t0 = std::chrono::steady_clock::now();
-                        ok = llama_memory_seq_rm(mem, 0, (llama_pos) n, -1) && ok;
+                        ok = llama_memory_seq_rm(mem, 0, p + (n_rm > 0 ? 1 : 0), -1) && ok;
                         const auto t1 = std::chrono::steady_clock::now();
                         (ctx == off.get() ? t_off : t_on).push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
                     }
                 }
                 llama_memory_seq_rm_stats(mem_on, st1);
-                if (!ok || llama_memory_seq_pos_max(mem_off, 0) != (llama_pos) n - 1 ||
+                if (!ok || llama_memory_seq_pos_max(mem_off, 0) != llama_memory_seq_pos_max(mem_on, 0) ||
                         llama_memory_debug_state(mem_off) != llama_memory_debug_state(mem_on)) {
                     LOG_ERR("%s: %s, %u tokens, %d removed: the calls failed or the memories differ\n", __func__, llama_arch_name(arch), n, n_rm);
                     n_failed++;
