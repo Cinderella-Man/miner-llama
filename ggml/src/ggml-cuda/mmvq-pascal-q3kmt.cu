@@ -497,8 +497,9 @@ static int q3m_slot(const int lpr_log2, const int r, const int row_bytes) {
 }
 
 // The warps per block for nt tokens, nsb super-blocks per row and r rows per lane group: GGML_CUDA_MMVQ_PASCAL_Q3K_MT_NW
-// (default and at most 6 at R = 1, 3 at R = 2), fewer where the shared memory would pass 48 KB; 0 if not even one warp
-// fits.
+// (default and at most 6 at R = 1, 3 at R = 2), fewer where the shared memory would pass 48 KB; 0 (the product left to
+// the k-column kernel) where fewer than 2 fit, unless _NW=1 asks for one: a block of one warp leaves 2 warps a SM, and
+// C722's kernel lost 46-47 % to the k-column kernel on a P106 where it ran so (Q4_K at K = 6144, R = 2; R79).
 static int q3m_nw(const int nt, const int nsb, const int r, const int row_bytes) {
     static const int nw_env = q3m_env("GGML_CUDA_MMVQ_PASCAL_Q3K_MT_NW", Q3M_NW_MAX);
     const int lpr_log2 = q3m_lpr_log2(nsb);
@@ -508,7 +509,7 @@ static int q3m_nw(const int nt, const int nsb, const int r, const int row_bytes)
     while (nw > 0 && act + nw * ws > Q3M_SMEM_MAX) {
         nw--;
     }
-    return nw;
+    return nw >= std::min(2, std::max(nw_env, 1)) ? nw : 0;
 }
 
 template <int NT, int R>

@@ -12,7 +12,7 @@
 // GGML_CUDA_MMVQ_PASCAL_Q3K_MT: 0 (default) off, the k-column kernel as before; 1 on; 2 on without the register prefetch
 // of each warp's next weight segments. GGML_CUDA_MMVQ_PASCAL_Q3K_MT_R: rows per lane group, 1 (default) or 2.
 // GGML_CUDA_MMVQ_PASCAL_Q3K_MT_NW=n: warps per block at most (1 to 6 at R = 1, 1 to 3 at R = 2; fewer where the block's
-// shared memory would pass 48 KB). GGML_CUDA_MMVQ_PASCAL_Q3K_MT_PAD=n: n 16-byte units of padding after each row's slot
+// shared memory would pass 48 KB; a product where fewer than 2 fit stays on the k-column kernel unless n is 1). GGML_CUDA_MMVQ_PASCAL_Q3K_MT_PAD=n: n 16-byte units of padding after each row's slot
 // in the weight staging (default: the fewest that spread the lanes' reads over the banks; 0 for none).
 // GGML_CUDA_MMVQ_PASCAL_Q3K_MT_FAULT=1: a fault for the checks (each token takes the next token's activations), which
 // test-backend-ops and multitoken_bitid must fail. The kernel follows GGML_CUDA_MMVQ_PASCAL (0 off, 2 any NVIDIA GPU),

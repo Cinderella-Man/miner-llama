@@ -14175,9 +14175,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Q3_K's products of 2 to 8 tokens in the k-column kernel's order (mmvq-pascal-q3kmt.cu, GGML_CUDA_MMVQ_PASCAL_Q3K_MT=1,
     // C726): Qwen3.8-Flash-Next's ssm_out (6144 -> 2560) and the shared expert's 2560 -> 640, each lane-group size (2 to
     // 32 lanes per row at 512 to 8192 weights), a partial last row block, rows that are views of wider rows (2-byte-aligned
-    // rows whose super-blocks lie 2 bytes off in turn), K = 8192 (left to the k-column kernel from 4 tokens on) and
-    // K = 12288 (from 3 on), and 768-wide rows (an odd number of super-blocks, one lane per row: left to the k-column
-    // kernel). The kcol cases above hold attn_qkv, attn_gate and attn_q (2560 -> 10240, 6144 and 12288), 333 x 1024,
+    // rows whose super-blocks lie 2 bytes off in turn), K = 6144 (left to the k-column kernel from 5 tokens on, where
+    // fewer than 2 warps a block fit), K = 8192 (from 4 on) and K = 12288 (from 3 on), and 768-wide rows (an odd number
+    // of super-blocks, one lane per row: left to the k-column kernel). The kcol cases above hold attn_qkv, attn_gate and attn_q (2560 -> 10240, 6144 and 12288), 333 x 1024,
     // 128 x 256 and 256 x 2560 in views of 2816; the large activations run the kernel too.
     {
         struct q3k_case { int64_t m, k, k_v; };
