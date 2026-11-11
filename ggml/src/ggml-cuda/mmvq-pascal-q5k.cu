@@ -40,6 +40,12 @@
 //     current ones (11 128-bit loads per lane and row in flight during the 64 x 4 dp4a of a super-block). C690 made it
 //     the default; on a P106 it costs time at R = 1 (four tokens 3,401.63 and 3,412.48 us with it, 3,340.78 and
 //     3,346.73 without, R75), so since C766 it is off unless asked for.
+//   - One token (GGML_CUDA_MMVQ_PASCAL_Q5K_1R=1, C767): NT = 1 is the same code with one column, so its lanes, order and
+//     FP32 operations are the one-token kernel's and every result is that kernel's bit for bit. What differs is the
+//     work around them: the activations' int8 words and (d8, S) are staged once per block of the persistent grid,
+//     where the one-token kernel loads 288 bytes of block_q8_1 per lane and super-block from global memory and forms
+//     their 8 block sums with 64 dp4a in every warp; and the conversions skip I2F. At the output layer's shape on a
+//     P106, two tokens on this kernel took 2,575.94 and 2,574.12 us, one token on the one-token kernel 3,023.54 (R75).
 
 #define Q5KMT_NW_MAX   6                    // warps per block at R = 1, at most (3 at R = 2)
 #define Q5KMT_MAX_COLS 4
@@ -381,6 +387,21 @@ static bool q5kmt_pf() {
     return pf;
 }
 
+// GGML_CUDA_MMVQ_PASCAL_Q5K_1R=1: one-token products too (C767), those of at least GGML_CUDA_MMVQ_PASCAL_Q5K_1R_ROWS
+// rows (default 0, every one)
+static bool q5kmt_one_row(const int64_t nrows) {
+    static const bool    on   = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_1R", 0) == 1;
+    static const int64_t rows = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_1R_ROWS", 0);
+    return on && nrows >= rows;
+}
+
+// GGML_CUDA_MMVQ_PASCAL_Q5K_1R_FAULT=1: each lane group leaves its row's last iteration out of the one-token products
+// (a check that must fail)
+static bool q5kmt_one_row_fault() {
+    static const bool fault = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_1R_FAULT", 0) == 1;
+    return fault;
+}
+
 // log2 of the lanes per row: the largest power of two, at most 32, that divides the row's super-blocks (as
 // ggml_cuda_mmvq_pascal chooses it for Q5_K)
 static int q5kmt_lpr_log2(const int nsb) {
@@ -431,7 +452,7 @@ static void q5kmt_launch(const q5kmt_args & p, const dim3 grid, const dim3 block
 
 bool ggml_cuda_mmvq_pascal_q5k_mt_takes(const int64_t K, const int64_t nrows, const int64_t ncols, const int64_t row_bytes,
                                         const void * x) {
-    if (q5kmt_mode() == 0 || ncols < 2 || ncols > Q5KMT_MAX_COLS) {
+    if (ncols < 1 || ncols > Q5KMT_MAX_COLS || (ncols == 1 ? !q5kmt_one_row(nrows) : q5kmt_mode() == 0)) {
         return false;
     }
     if (!ggml_cuda_mmvq_pascal_active(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ||
@@ -473,6 +494,9 @@ bool ggml_cuda_mmvq_pascal_q5k_mt(const void * vx, const void * vy, float * dst,
     p.niter          = nsb >> p.lpr_log2;
     const int rpw    = (WARP_SIZE >> p.lpr_log2) * r; // rows per warp row block
     p.nwrb           = (int) ((nrows + rpw - 1) / rpw);
+    if (nt == 1 && p.niter > 1 && q5kmt_one_row_fault()) {
+        p.niter--; // the fault: every row's last L super-blocks left out
+    }
     p.col_bytes_y    = (int) col_bytes_y;
     p.stride_col_dst = (int) stride_col_dst;
     p.ds_off         = nsb * (64 * nt + 4);
@@ -492,6 +516,8 @@ bool ggml_cuda_mmvq_pascal_q5k_mt(const void * vx, const void * vy, float * dst,
     const bool pf = q5kmt_pf();
 
     switch (nt * 4 + r) {
+        case 1*4 + 1: q5kmt_launch<1, 1>(p, grid, block, smem, pf, stream); break;
+        case 1*4 + 2: q5kmt_launch<1, 2>(p, grid, block, smem, pf, stream); break;
         case 2*4 + 1: q5kmt_launch<2, 1>(p, grid, block, smem, pf, stream); break;
         case 3*4 + 1: q5kmt_launch<3, 1>(p, grid, block, smem, pf, stream); break;
         case 4*4 + 1: q5kmt_launch<4, 1>(p, grid, block, smem, pf, stream); break;

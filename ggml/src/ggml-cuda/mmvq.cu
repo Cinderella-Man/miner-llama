@@ -1751,8 +1751,8 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    // 2 to 4 tokens of a plain Q5_K product with GGML_CUDA_MMVQ_PASCAL_Q5K_MT (the output layer of a verify): each weight
-    // decoded once for all tokens, each token's sums those of the one-token kernel
+    // 2 to 4 tokens of a plain Q5_K product with GGML_CUDA_MMVQ_PASCAL_Q5K_MT (the output layer of a verify), one with
+    // _Q5K_1R: each weight decoded once for all tokens, each token's sums those of the one-token kernel
     if (!ids && !fusion && src0->type == GGML_TYPE_Q5_K && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmvq_pascal_q5k_mt(src0->data, src1_q8, dst_d, ne00, ne01, ne11, nb01, s11, s1, stream)) {
         return;
