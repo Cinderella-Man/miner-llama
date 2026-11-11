@@ -2744,8 +2744,9 @@ static verify_prepare_run verify_prepare_sequence(
     const int n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const int n_prompt = 40;
 
-    auto outputs = [&](int n) {
-        for (int i = 0; i < n; ++i) {
+    // the outputs of batch entries [i0, i0 + n)
+    auto outputs = [&](int i0, int n) {
+        for (int i = i0; i < i0 + n; ++i) {
             if (smpl > 0) {
                 const float * probs = llama_get_sampled_probs_ith(ctx, i);
                 const uint32_t n_probs = llama_get_sampled_probs_count_ith(ctx, i);
@@ -2773,7 +2774,7 @@ static verify_prepare_run verify_prepare_sequence(
     if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
         throw std::runtime_error("failed to decode the prompt");
     }
-    outputs(1);
+    outputs(n_prompt - 1, 1);
 
     int pos = n_prompt;
     int ti  = n_prompt;
@@ -2800,7 +2801,7 @@ static verify_prepare_run verify_prepare_sequence(
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
             throw std::runtime_error("failed to decode a verify pass");
         }
-        outputs(n_verify);
+        outputs(0, n_verify);
         run.n_rounds++;
 
         // r % 4 drafted tokens accepted: the rest of the pass is removed (the next pass starts with a new token); with
@@ -2819,7 +2820,7 @@ static verify_prepare_run verify_prepare_sequence(
             if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
                 throw std::runtime_error("failed to decode a token");
             }
-            outputs(1);
+            outputs(0, 1);
             pos += 1;
             ti  += 1;
         }
