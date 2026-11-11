@@ -18,6 +18,7 @@
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <random>
 #include <regex>
@@ -1994,12 +1995,31 @@ struct mtp_kv_only_run {
     std::vector<llama_token> cand;         // each draft pass's sampled candidates and token
     size_t                   n_nodes_catchup = 0;
     bool                     smpl_ok = true;
+
+    // LLAMA_QSA_KPOOL_DEV (C100): the draft memory's copies of the k-pool tables (llama_kpool_dev_stats) and the k-pool
+    // host inputs the catch-up ubatches' ops read, each one a copy its card receives (C748)
+    bool     kpool_dev       = false;
+    uint64_t kpool_full      = 0; // updates that rewrote every row
+    uint64_t kpool_rows      = 0; // rows uploaded
+    uint64_t kpool_checked   = 0; // ubatches LLAMA_QSA_KPOOL_DEV_CHECK compared
+    size_t   catchup_ubatch  = 0;
+    size_t   catchup_copies  = 0;
+    size_t   catchup_bytes   = 0;
 };
 
 struct mtp_node_count {
     bool   on = false;
     size_t n  = 0;
+
+    // with LLAMA_QSA_KPOOL_DEV: the k-pool host inputs ("kpool_*") read by an op, by the ubatch the memory counts
+    const llama_context * ctx = nullptr;
+    std::map<std::pair<uint64_t, const ggml_tensor *>, size_t> kpool_read;
+    std::map<uint64_t, size_t> ubatches;
 };
+
+static bool mtp_view_op(const ggml_op op) {
+    return op == GGML_OP_NONE || op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+}
 
 // LLAMA_MTP_KV_ONLY for the next context, or unset with nullptr
 static void mtp_kv_only_setenv(const char * value) {
@@ -2037,10 +2057,25 @@ static mtp_kv_only_run mtp_kv_only_sequence(
     ctx_params.type_v          = cfg.type_kv;
     ctx_params.flash_attn_type = cfg.fa ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     ctx_params.n_outputs_max_per_seq = 4;
-    ctx_params.cb_eval = [](struct ggml_tensor * /*t*/, bool ask, void * user_data) {
+    ctx_params.cb_eval = [](struct ggml_tensor * t, bool ask, void * user_data) {
         mtp_node_count * c = (mtp_node_count *) user_data;
         if (ask && c->on) {
             c->n++;
+            // the memory counts a ubatch in apply(), before its graph runs
+            uint64_t ub = 0;
+            if (c->ctx != nullptr && llama_kpool_dev_stats(c->ctx, &ub, nullptr, nullptr, nullptr)) {
+                c->ubatches[ub]++;
+                for (int i = 0; i < GGML_MAX_SRC && !mtp_view_op(t->op); ++i) {
+                    const ggml_tensor * s = t->src[i];
+                    if (s == nullptr) {
+                        continue;
+                    }
+                    s = s->view_src != nullptr ? s->view_src : s;
+                    if ((s->flags & GGML_TENSOR_FLAG_INPUT) && strncmp(s->name, "kpool_", 6) == 0) {
+                        c->kpool_read[{ ub, s }] = ggml_nbytes(s);
+                    }
+                }
+            }
         }
         return false;
     };
@@ -2053,6 +2088,7 @@ static mtp_kv_only_run mtp_kv_only_sequence(
     }
     llama_context * ctx = lctx.get();
     llama_set_embeddings_nextn(ctx, true, /*masked*/ true);
+    count.ctx = ctx;
 
     mtp_kv_only_run run;
 
@@ -2144,6 +2180,13 @@ static mtp_kv_only_run mtp_kv_only_sequence(
 
     run.n_nodes_catchup = count.n;
 
+    run.kpool_dev = llama_kpool_dev_stats(ctx, nullptr, &run.kpool_full, &run.kpool_rows, &run.kpool_checked);
+    run.catchup_ubatch = count.ubatches.size();
+    run.catchup_copies = count.kpool_read.size();
+    for (const auto & r : count.kpool_read) {
+        run.catchup_bytes += r.second;
+    }
+
     if (chain) {
         llama_set_sampler(ctx, 0, nullptr);
         llama_sampler_free(chain);
@@ -2185,7 +2228,10 @@ static int test_mtp_kv_only(const std::string & arch_filter, const size_t seed, 
     size_t n_tests  = 0;
     size_t n_failed = 0;
     common_log_flush(common_log_main());
-    LOG("|%10s|%13s|%12s|%12s|%12s|%12s|%s\n", "Model arch.", "Config", "KV, prompt", "Drafts", "KV, end", "Nodes off/on", "Status");
+    // with LLAMA_QSA_KPOOL_DEV (C100) also the tables' full rewrites and rows uploaded, which a KV-only pass must leave
+    // as the full pass leaves them (C748), and the k-pool copies and bytes of the catch-up ubatches
+    LOG("|%10s|%13s|%12s|%12s|%12s|%12s|%11s|%11s|%9s|%11s|%13s|%s\n", "Model arch.", "Config", "KV, prompt", "Drafts",
+            "KV, end", "Nodes off/on", "Full off/on", "Rows off/on", "Catch-up", "Copies", "Bytes", "Status");
 
     for (const llm_arch & arch : llama_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !mtp_kv_only_arch(arch)) {
@@ -2226,7 +2272,8 @@ static int test_mtp_kv_only(const std::string & arch_filter, const size_t seed, 
                 const mtp_kv_only_run off = mtp_kv_only_sequence(model.get(), tokens, h, cfg, false, seed);
                 const mtp_kv_only_run on  = mtp_kv_only_sequence(model.get(), tokens, h, cfg, true,  seed);
                 if (!off.smpl_ok || !on.smpl_ok) {
-                    LOG("%12s|%12s|%12s|%12s|\033[1;33mSKIP\033[0m (no backend sampler on this device)\n", "", "", "", "");
+                    LOG("%12s|%12s|%12s|%12s|%11s|%11s|%9s|%11s|%13s|\033[1;33mSKIP\033[0m (no backend sampler on this device)\n",
+                            "", "", "", "", "", "", "", "", "");
                     n_tests--;
                     continue;
                 }
@@ -2239,18 +2286,45 @@ static int test_mtp_kv_only(const std::string & arch_filter, const size_t seed, 
                 const bool nodes_ok    = cfg.smpl == 2 ? on.n_nodes_catchup == off.n_nodes_catchup
                                                        : on.n_nodes_catchup <  off.n_nodes_catchup;
 
+                // the tables on the devices: a KV-only pass updates the copies as the full pass does, so the next pass
+                // sends the changed rows only and never rewrites them all
+                const bool tables_ok   = off.kpool_dev == on.kpool_dev &&
+                    on.kpool_full == off.kpool_full && on.kpool_rows == off.kpool_rows;
+
                 char nodes_str[32];
                 snprintf(nodes_str, sizeof(nodes_str), "%zu/%zu", off.n_nodes_catchup, on.n_nodes_catchup);
-                LOG("%12s|%12s|%12s|%12s|", same_prompt ? "identical" : "DIFFERENT", same_drafts ? "identical" : "DIFFERENT",
-                        same_end ? "identical" : "DIFFERENT", nodes_str);
+                char full_str[32] = "-";
+                char rows_str[32] = "-";
+                char ub_str[32]   = "-";
+                char copy_str[32] = "-";
+                char byte_str[32] = "-";
+                if (on.kpool_dev) {
+                    snprintf(full_str, sizeof(full_str), "%" PRIu64 "/%" PRIu64, off.kpool_full, on.kpool_full);
+                    snprintf(rows_str, sizeof(rows_str), "%" PRIu64 "/%" PRIu64, off.kpool_rows, on.kpool_rows);
+                    snprintf(ub_str,   sizeof(ub_str),   "%zu/%zu", off.catchup_ubatch, on.catchup_ubatch);
+                    snprintf(copy_str, sizeof(copy_str), "%zu/%zu", off.catchup_copies, on.catchup_copies);
+                    snprintf(byte_str, sizeof(byte_str), "%zu/%zu", off.catchup_bytes, on.catchup_bytes);
+                }
+                LOG("%12s|%12s|%12s|%12s|%11s|%11s|%9s|%11s|%13s|", same_prompt ? "identical" : "DIFFERENT",
+                        same_drafts ? "identical" : "DIFFERENT", same_end ? "identical" : "DIFFERENT", nodes_str,
+                        full_str, rows_str, ub_str, copy_str, byte_str);
 
-                if (same_prompt && same_drafts && same_end && nodes_ok) {
+                if (same_prompt && same_drafts && same_end && nodes_ok && tables_ok) {
                     status = "\033[1;32mOK\033[0m";
+                    if (off.kpool_checked + on.kpool_checked > 0) {
+                        char chk_str[64];
+                        snprintf(chk_str, sizeof(chk_str), " (ubatches checked off/on %" PRIu64 "/%" PRIu64 ")",
+                                off.kpool_checked, on.kpool_checked);
+                        status += chk_str;
+                    }
                 } else {
                     n_failed++;
                     status = "\033[1;31mFAIL\033[0m";
                     if (!nodes_ok) {
                         status += cfg.smpl == 2 ? " (the pass was cut with a dist sampler)" : " (the pass was not cut)";
+                    }
+                    if (!tables_ok) {
+                        status += " (the KV-only passes left the k-pool tables on the devices behind)";
                     }
                 }
             } catch (const std::exception & err) {

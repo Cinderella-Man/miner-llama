@@ -996,6 +996,16 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     ggml_set_input(inp->pool_mask);
     ggml_set_input(inp->tail_idxs);
 
+    // names only, which test-llama-archs --mtp-kv-only follows to the k-pool inputs a pass reads (C748); given before
+    // the graph names its leaves
+    if (inp->dev) {
+        ggml_set_name(inp->kpool_upd, "kpool_upd");
+    } else {
+        ggml_set_name(inp->pool_cells, "kpool_pool_cells");
+        ggml_set_name(inp->pool_idxs,  "kpool_pool_idxs");
+    }
+    ggml_set_name(inp->pool_mask, "kpool_pool_mask");
+
     // set_input fills them all, so keep them allocated even when no op reads them
     for (ggml_tensor * t : { inp->pool_cells, inp->pool_idxs, inp->kpool_upd }) {
         if (t) {
