@@ -925,13 +925,13 @@ static int dmt_kt_tile_bytes(const ggml_type type, const int nt, const int lpr_l
 // The warps per block of the K tiles for nt tokens and nsb super-blocks per row (R = 1) where they take the product, else
 // 0: GGML_CUDA_MMVQ_PASCAL_DMT_KT_NW (default and at most 6), fewer where the block's shared memory would pass 48 KB;
 // none for other types than IQ4_XS and Q4_K or other token counts than 2 to 4, where the threads can't load a tile
-// ahead in DMT_KT_EU units each, or
-// (with _KT=1) where the kernel above holds as many warps (nw_full)
+// ahead in DMT_KT_EU units each, or (with _KT=1) where the kernel above holds as many warps (nw_full)
 static int dmt_kt_nw(const ggml_type type, const int nt, const int nsb, const int nw_full) {
     static const int nw_env = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_KT_NW", DMT_KT_NW_MAX);
     const int mode = dmt_kt_mode();
-    // the tiles have IQ4_XS's and Q4_K's steps and staging only; any other type this file takes keeps its own kernel
-    if ((mode != 1 && mode != 2) || (type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q4_K)) {
+    // the tiles have IQ4_XS's and Q4_K's steps and staging, at 2 to 4 tokens, only; any other product this file takes
+    // keeps its own kernel
+    if ((mode != 1 && mode != 2) || (type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q4_K) || nt < 2 || nt > 4) {
         return 0;
     }
     const int lpr_log2 = dmt_lpr_log2(nsb);
