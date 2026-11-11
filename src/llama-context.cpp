@@ -913,6 +913,14 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    // C738: what llama_decode_prepare did over the context's life (at WARN, so that a server at its default verbosity
+    // logs it)
+    if (vprep_n_prepared + vprep_n_refused + vprep_n_dropped > 0) {
+        LLAMA_LOG_WARN("%s: C738: %" PRIu64 " decodes prepared ahead of their last token ids, %" PRIu64 " not prepared, %"
+                PRIu64 " dropped; %" PRIu64 " inputs uploaded ahead\n", __func__, vprep_n_prepared, vprep_n_refused,
+                vprep_n_dropped, vprep_n_preup);
+    }
+
     if (cparams.moe_tail && moe_kept_tokens > 0) {
         moe_tail_log();
     }
