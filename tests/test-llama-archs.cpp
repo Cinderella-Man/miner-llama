@@ -2900,6 +2900,12 @@ static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, co
                 int n_refused = 0;
                 std::vector<int> n_kind(OP_COUNT, 0);
 
+                // a recurrent memory's sequences that may hold a rollback not yet applied (a tail removed since their
+                // last decode): a copy of such a sequence would share a state with two rollback indices, which the
+                // recurrent memory cannot write, and which the server never makes
+                std::vector<char> rs_pending(cfg.n_seq, 0);
+                int n_cp_skipped = 0;
+
                 // the same call in both contexts: its results must agree
                 auto rm = [&](llama_seq_id s, llama_pos p0, llama_pos p1) {
                     const bool a = llama_memory_seq_rm(mem_off, s, p0, p1);
@@ -2909,6 +2915,13 @@ static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, co
                             std::to_string(a) + " without the switch, " + std::to_string(b) + " with it";
                     }
                     n_refused += a ? 0 : 1;
+                    if (a && p1 < 0) {
+                        for (uint32_t t = 0; t < cfg.n_seq; t++) {
+                            if (s < 0 || (llama_seq_id) t == s) {
+                                rs_pending[t] = p0 > 0 ? 1 : 0;
+                            }
+                        }
+                    }
                     return a;
                 };
                 auto decode = [&](const std::vector<std::pair<llama_seq_id, std::vector<llama_token>>> & parts) {
@@ -2926,6 +2939,10 @@ static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, co
                     }
                     if (ra != 0) {
                         n_decode_fail++;
+                    } else {
+                        for (const auto & part : parts) {
+                            rs_pending[part.first] = 0;
+                        }
                     }
                     return ra;
                 };
@@ -3011,6 +3028,10 @@ static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, co
                             case OP_CP: {
                                 // as the server copies a slot: the destination cleared, then the whole source copied
                                 const llama_seq_id dst = (llama_seq_id) ((s + rnd(1, (int) cfg.n_seq - 1)) % (int) cfg.n_seq);
+                                if (recurrent && rs_pending[s]) {
+                                    n_cp_skipped++;
+                                    break;
+                                }
                                 rm(dst, -1, -1);
                                 llama_memory_seq_cp(mem_off, s, dst, -1, -1);
                                 llama_memory_seq_cp(mem_on,  s, dst, -1, -1);
@@ -3077,6 +3098,7 @@ static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, co
                     for (int j = 0; j < OP_COUNT; j++) {
                         status += std::string(" ") + op_names[j] + "=" + std::to_string(n_kind[j]);
                     }
+                    status += " copies skipped=" + std::to_string(n_cp_skipped);
                 }
                 LOG(template_row.c_str(), llama_arch_name(arch), config_name.c_str(), covered ? "host" : "state",
                     std::to_string(n_edits).c_str(), decodes, std::to_string(n_refused).c_str(), stats, status.c_str());
