@@ -202,6 +202,13 @@ public:
 
     const llama_batch & get_batch() const;
 
+    // C738 (llama_decode_prepare): token i of the current batch is id (a token batch, i < get_n_tokens()); the ubatches
+    // already split from it keep their own copies
+    void set_token(uint32_t i, llama_token id) {
+        GGML_ASSERT(i < token_vec.size());
+        token_vec[i] = id;
+    }
+
     uint32_t get_n_tokens()  const;
     uint32_t get_n_outputs() const;
     uint32_t get_n_used()    const;

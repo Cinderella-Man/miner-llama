@@ -183,6 +183,7 @@ static void usage(char ** argv) {
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
     LOG("  --mtp-kv-only            Check that LLAMA_MTP_KV_ONLY leaves the MTP draft's caches and drafts as they are (CPU only)\n");
     LOG("  --mtp-catchup-overlap    Check that LLAMA_MTP_CATCHUP_OVERLAP leaves the MTP draft's caches and drafts as they are (CPU only)\n");
+    LOG("  --verify-prepare         Check that a decode prepared before its last token id (llama_decode_prepare, C738) gives the plain decode's results\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -2690,6 +2691,270 @@ static int test_mtp_catchup_overlap(const std::string & arch_filter, const size_
     return n_failed == 0 ? 0 : 1;
 }
 
+// C738 (llama_decode_prepare, LLAMA_VERIFY_PREPARE): the calls of a speculative server step on the main model, run
+// plainly and with each verify pass prepared before its last token id is known (a stand-in token then), as the server
+// prepares it during the last drafting pass. A prompt, then rounds of: the verify pass (the sampled token and three
+// drafted ones, every one an output), the rejected tail removed, and every third round a one-token call in between. The
+// logits of every output (or the backend sampler's tokens, probabilities and candidates) and the sequence's state at
+// the end must be bit-identical; a context that refuses to prepare runs the plain calls
+struct verify_prepare_run {
+    std::vector<float>       out;
+    std::vector<llama_token> tok;
+    std::vector<uint8_t>     state;
+    int                      n_prepared = 0;
+    int                      n_rounds   = 0;
+    bool                     smpl_ok    = true;
+};
+
+static verify_prepare_run verify_prepare_sequence(
+        llama_model * model, const std::vector<llama_token> & tokens, const int smpl, const bool prepare, const size_t seed) {
+    verify_prepare_run run;
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx           = 0;
+    ctx_params.n_batch         = 64;
+    ctx_params.n_ubatch        = 16;
+    ctx_params.n_threads       = 4;
+    ctx_params.n_threads_batch = 4;
+    // the recurrent states keep a snapshot per verified token, so the rejected tail can be removed
+    ctx_params.n_rs_seq        = 4;
+    ctx_params.n_outputs_max_per_seq = 4;
+
+    llama_context_ptr lctx(llama_init_from_model(model, ctx_params));
+    if (!lctx) {
+        throw std::runtime_error("failed to create the context");
+    }
+    llama_context * ctx = lctx.get();
+
+    llama_sampler * chain = nullptr;
+    if (smpl > 0) {
+        chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+        if (smpl > 1) {
+            llama_sampler_chain_add(chain, llama_sampler_init_dist((uint32_t) seed));
+        }
+        if (!llama_set_sampler(ctx, 0, chain)) {
+            llama_sampler_free(chain);
+            run.smpl_ok = false;
+            return run;
+        }
+    }
+
+    const int n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int n_prompt = 40;
+
+    auto outputs = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            if (smpl > 0) {
+                const float * probs = llama_get_sampled_probs_ith(ctx, i);
+                const uint32_t n_probs = llama_get_sampled_probs_count_ith(ctx, i);
+                if (probs) {
+                    run.out.insert(run.out.end(), probs, probs + n_probs);
+                }
+                const llama_token * cand = llama_get_sampled_candidates_ith(ctx, i);
+                const uint32_t n_cand = llama_get_sampled_candidates_count_ith(ctx, i);
+                if (cand) {
+                    run.tok.insert(run.tok.end(), cand, cand + n_cand);
+                }
+                run.tok.push_back(llama_get_sampled_token_ith(ctx, i));
+            } else {
+                const float * logits = llama_get_logits_ith(ctx, i);
+                GGML_ASSERT(logits != nullptr);
+                run.out.insert(run.out.end(), logits, logits + n_vocab);
+            }
+        }
+    };
+
+    common_batch batch(ctx);
+    for (int pos = 0; pos < n_prompt; ++pos) {
+        batch.add(tokens[pos], pos, 0, pos == n_prompt - 1);
+    }
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+        throw std::runtime_error("failed to decode the prompt");
+    }
+    outputs(1);
+
+    int pos = n_prompt;
+    int ti  = n_prompt;
+    for (int r = 0; r < 9 && ti + 5 <= (int) tokens.size(); ++r) {
+        // the verify pass: the sampled token and three drafted ones; the last one is drafted while the call is prepared
+        const int n_verify = 4;
+        if (prepare) {
+            common_batch pb(ctx);
+            for (int i = 0; i < n_verify; ++i) {
+                // the stand-in: the token before it (as the server's), or the true one every fourth round
+                const llama_token t = i < n_verify - 1 || r % 4 == 3 ? tokens[ti + i] : tokens[ti + i - 1];
+                pb.add(t, pos + i, 0, true);
+            }
+            const int32_t rc = llama_decode_prepare(ctx, pb.get());
+            if (rc < 0) {
+                throw std::runtime_error("llama_decode_prepare failed");
+            }
+            run.n_prepared += rc == 0;
+        }
+        batch.clear();
+        for (int i = 0; i < n_verify; ++i) {
+            batch.add(tokens[ti + i], pos + i, 0, true);
+        }
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("failed to decode a verify pass");
+        }
+        outputs(n_verify);
+        run.n_rounds++;
+
+        // r % 3 drafted tokens accepted: the rest of the pass is removed (the next pass starts with a new token)
+        const int n_keep = 1 + r % 3;
+        if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, pos + n_keep, -1)) {
+            throw std::runtime_error("the memory cannot remove a rejected draft");
+        }
+        pos += n_keep;
+        ti  += n_verify;
+
+        // a plain one-token call in between (the decode without a draft)
+        if (r % 3 == 2) {
+            batch.clear();
+            batch.add(tokens[ti], pos, 0, true);
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                throw std::runtime_error("failed to decode a token");
+            }
+            outputs(1);
+            pos += 1;
+            ti  += 1;
+        }
+    }
+
+    run.state.resize(llama_state_seq_get_size(ctx, 0));
+    llama_state_seq_get_data(ctx, run.state.data(), run.state.size(), 0);
+    return run;
+}
+
+static int test_verify_prepare(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+    const struct { const char * name; int smpl; } configs[] = {
+        { "logits",     0 },
+        { "top-k dist", 2 },
+    };
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    common_log_flush(common_log_main());
+    LOG("|%16s|%6s|%11s|%10s|%10s|%10s|%s\n", "Model arch.", "Config", "Sampling", "Prepared", "Outputs", "State", "Status");
+
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !arch_supported(arch)) {
+            continue;
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+            continue;
+        }
+        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
+        if (encode) {
+            continue;
+        }
+        for (bool moe : {false, true}) {
+            if (moe && !moe_implemented(arch)) {
+                continue;
+            }
+            if (!moe && moe_mandatory(arch)) {
+                continue;
+            }
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            if (arch == LLM_ARCH_BAILINGMOE3) {
+                GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
+            }
+            llama_model_ptr model;
+            try {
+                model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+            } catch (const std::exception & err) {
+                LOG("|%16s|%6s|%11s|%10s|%10s|%10s|\033[1;31mERROR\033[0m (model load: %s)\n", llama_arch_name(arch),
+                        moe ? "MoE" : "Dense", "", "", "", "", err.what());
+                n_tests++;
+                n_failed++;
+                continue;
+            }
+            for (const auto & cfg : configs) {
+                n_tests++;
+                LOG("|%16s|%6s|%11s|", llama_arch_name(arch), moe ? "MoE" : "Dense", cfg.name);
+                std::string status;
+                try {
+                    // the context's own log lines stay out of the table
+                    ud.verbosity = LOG_LEVEL_OUTPUT;
+                    verify_prepare_run off;
+                    verify_prepare_run on;
+                    try {
+                        off = verify_prepare_sequence(model.get(), tokens, cfg.smpl, false, seed);
+                        on  = verify_prepare_sequence(model.get(), tokens, cfg.smpl, true,  seed);
+                    } catch (...) {
+                        ud.verbosity = verbosity;
+                        throw;
+                    }
+                    ud.verbosity = verbosity;
+                    if (!off.smpl_ok || !on.smpl_ok) {
+                        LOG("%10s|%10s|%10s|\033[1;33mSKIP\033[0m (no backend sampler)\n", "", "", "");
+                        n_tests--;
+                        continue;
+                    }
+                    const bool same_out   = !off.out.empty() && off.out.size() == on.out.size() &&
+                        memcmp(off.out.data(), on.out.data(), off.out.size()*sizeof(float)) == 0 && off.tok == on.tok;
+                    const bool same_state = !off.state.empty() && off.state == on.state;
+                    char prep_str[32];
+                    snprintf(prep_str, sizeof(prep_str), "%d/%d", on.n_prepared, on.n_rounds);
+                    LOG("%10s|%10s|%10s|", prep_str, same_out ? "identical" : "DIFFERENT", same_state ? "identical" : "DIFFERENT");
+                    if (same_out && same_state) {
+                        status = "\033[1;32mOK\033[0m";
+                    } else {
+                        n_failed++;
+                        status = "\033[1;31mFAIL\033[0m";
+                    }
+                } catch (const std::exception & err) {
+                    // a memory that cannot remove a rejected draft has no speculative steps to prepare
+                    if (strstr(err.what(), "cannot remove") != nullptr) {
+                        LOG("%10s|%10s|%10s|\033[1;33mSKIP\033[0m (%s)\n", "", "", "", err.what());
+                        n_tests--;
+                        continue;
+                    }
+                    n_failed++;
+                    status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
+                }
+                LOG("%s\n", status.c_str());
+            }
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -2706,6 +2971,7 @@ int main(int argc, char ** argv) {
     bool kv_shift = false;
     bool mtp_kv_only = false;
     bool mtp_catchup_overlap = false;
+    bool verify_prepare = false;
     bool save_mtp = false;
 
     int verbosity = LOG_LEVEL_ERROR;
@@ -2780,6 +3046,8 @@ int main(int argc, char ** argv) {
             mtp_kv_only = true;
         } else if (strcmp(argv[i], "--mtp-catchup-overlap") == 0) {
             mtp_catchup_overlap = true;
+        } else if (strcmp(argv[i], "--verify-prepare") == 0) {
+            verify_prepare = true;
         } else if (strcmp(argv[i], "--mtp") == 0) {
             save_mtp = true;
         } else {
@@ -2808,6 +3076,9 @@ int main(int argc, char ** argv) {
         }
         if (mtp_catchup_overlap) {
             return test_mtp_catchup_overlap(arch_filter, seed, stdev, verbosity);
+        }
+        if (verify_prepare) {
+            return test_verify_prepare(arch_filter, seed, stdev, verbosity);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {

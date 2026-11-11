@@ -1821,6 +1821,36 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_result::set_inputs_part(const llama_ubatch * ubatch, bool without_tokens) {
+    for (auto & input : inputs) {
+        if (input->sets_without_tokens() == without_tokens) {
+            input->set_input(ubatch);
+        }
+    }
+}
+
+// C738: the inputs that read no token id: positions, output rows, the KV indices and masks, the recurrent state copies.
+// The exact type: a subclass may read more
+bool llm_graph_input_pos::sets_without_tokens() const {
+    return typeid(*this) == typeid(llm_graph_input_pos);
+}
+
+bool llm_graph_input_out_ids::sets_without_tokens() const {
+    return typeid(*this) == typeid(llm_graph_input_out_ids);
+}
+
+bool llm_graph_input_rs::sets_without_tokens() const {
+    return typeid(*this) == typeid(llm_graph_input_rs);
+}
+
+bool llm_graph_input_attn_kv::sets_without_tokens() const {
+    return typeid(*this) == typeid(llm_graph_input_attn_kv);
+}
+
+bool llm_graph_input_mem_hybrid::sets_without_tokens() const {
+    return typeid(*this) == typeid(llm_graph_input_mem_hybrid);
+}
+
 bool llm_graph_result::needs_check_outputs() const {
     for (const auto & input : inputs) {
         if (input->needs_check_outputs()) {

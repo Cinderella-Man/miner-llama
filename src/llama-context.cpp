@@ -206,6 +206,12 @@ llama_context::llama_context(
     step_trace      = llama_step_trace_active();
     step_trace_role = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? 'd' : 'v';
 
+    // C738: LLAMA_VERIFY_PREPARE=2 also uploads the first device split's inputs of a prepared decode (1, or a caller of
+    // llama_decode_prepare without the variable: the host part only)
+    if (const char * env = getenv("LLAMA_VERIFY_PREPARE")) {
+        vprep_level = atoi(env);
+    }
+
     const auto & hparams = model.hparams;
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
@@ -3010,11 +3016,119 @@ bool llama_context::set_adapter_cvec(
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     // LLAMA_UBATCH_TRACE: the host's parts of this micro-batch until its first split leaves for a card [TAG_UBATCH_TRACE]
-    const bool    trace    = llama_ubatch_trace() > 0;
-    const int64_t t_trace0 = trace ? ggml_time_us() : 0;
-    int64_t       t_trace_build = 0;
-    int64_t       t_trace_alloc = 0;
-    const char *  trace_why     = nullptr; // why the graph was rebuilt
+    const bool trace = llama_ubatch_trace() > 0;
+    ubatch_trace_times tt;
+    tt.t0 = trace ? ggml_time_us() : 0;
+
+    // the scheduler's caller_sync, which process_ubatch_graph sets, is cleared once the graph is submitted (or prepared),
+    // so that the scheduler's other users (K-shift, training) keep the waits
+    struct caller_sync_scope {
+        ggml_backend_sched_t s = nullptr;
+        ~caller_sync_scope() {
+            if (s) {
+                ggml_backend_sched_set_caller_sync(s, false);
+            }
+        }
+    } caller_sync_reset;
+
+    llm_graph_result * res = nullptr;
+    if (vprep_mode == 2) {
+        // C738: submitting a prepared call: the memory applied, the graph chosen and its inputs without token ids set
+        res          = vprep.res;
+        sched_active = vprep.sched;
+        ggml_backend_sched_set_caller_sync(sched_res(), plain_upload > 0 && !gf_in_flight);
+        tt.pre = tt.build = tt.alloc = trace ? ggml_time_us() : 0;
+        tt.why = "prepared";
+    } else {
+        res = process_ubatch_graph(ubatch, gtype, mctx, ret, tt);
+    }
+    caller_sync_reset.s = sched_res();
+    if (!res) {
+        return nullptr;
+    }
+
+    // set the input data for the input tensors
+    {
+        //const auto t_start_us = ggml_time_us();
+
+        // LLAMA_GPU_KQ_MASK_CHECK=1 reads the devices' cell copies while it sets the inputs: let the last step finish
+        static const bool kq_mask_check = [] {
+            const char * env = getenv("LLAMA_GPU_KQ_MASK_CHECK");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        // so does LLAMA_QSA_KPOOL_DEV_CHECK=1 with the k-pool tables' copies (C738: those inputs are set when preparing)
+        const auto * mem_idx = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get());
+        if (vprep_mode != 2 && (kq_mask_check || (mem_idx && mem_idx->kpool_dev_check_on()))) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+
+        // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        if (vprep_mode == 0) {
+            res->set_inputs(&ubatch);
+        } else {
+            // C738: preparing sets the inputs that need no token id, submitting the others
+            res->set_inputs_part(&ubatch, vprep_mode == 1);
+        }
+
+        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+    LLAMA_STEP_MARK("ub.in");
+
+    if (vprep_mode == 1) {
+        // C738: the call is prepared; LLAMA_VERIFY_PREPARE=2 also sends the first device split's inputs now (those set
+        // again when the call is submitted go again then)
+        if (vprep_level >= 2) {
+            vprep.n_preup = ggml_backend_sched_preupload_inputs(sched_res(), &vprep.preup_bytes);
+            vprep_n_preup += vprep.n_preup;
+            LLAMA_STEP_MARK("ub.up");
+        }
+        vprep.res   = res;
+        vprep.sched = sched_active;
+        ret = GGML_STATUS_SUCCESS;
+        return res;
+    }
+
+    const int64_t t_trace_inputs = trace ? ggml_time_us() : 0;
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (trace) {
+        // pre: memory, scheduler choice and graph parameters; build: the reuse check, then the graph's construction
+        // (reused: the wait for the previous evaluation); alloc: the scheduler's split and allocation with any re-plan;
+        // inputs: the inputs set; submit: every split queued and the CPU's computed; card0: from the start until the
+        // first split off the CPU was launched (-1: none); a prepared call (C738) counts from its submission
+        const int64_t t_dev0 = ggml_backend_sched_get_trace_t_dev0(sched_res());
+        const int64_t t_end  = ggml_time_us();
+        const bool    prep   = vprep_mode == 2;
+        LLAMA_LOG_WARN("ubatch-trace: %s n_tokens = %u n_seqs = %u n_outputs = %u graph = %s%s%s pre = %lld build = %lld "
+                "alloc = %lld inputs = %lld submit = %lld card0 = %lld total = %lld us\n",
+                gtype == LLM_GRAPH_TYPE_DECODER_MTP ? "mtp" : gtype == LLM_GRAPH_TYPE_ENCODER ? "enc" : "dec",
+                ubatch.n_tokens, ubatch.n_seqs, n_outputs, prep ? "prepared" : tt.why ? "rebuilt" : "reused",
+                !prep && tt.why ? " why = " : "", !prep && tt.why ? tt.why : "", (long long) (tt.pre - tt.t0),
+                (long long) (tt.build - tt.pre), (long long) (tt.alloc - tt.build), (long long) (t_trace_inputs - tt.alloc),
+                (long long) (t_end - t_trace_inputs), (long long) (t_dev0 ? t_dev0 - tt.t0 : -1),
+                (long long) (t_end - tt.t0));
+    }
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        ret = status;
+        return nullptr;
+    }
+    LLAMA_STEP_MARK("ub.comp");
+
+    // LLAMA_QSA_POOL_MASK_DEV_CHECK=1 reads back the masks the devices built, once the graph has run
+    if (const auto * mem_idx = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get());
+            mem_idx && mem_idx->pool_mask_dev_check_on() && res->needs_check_outputs()) {
+        ggml_backend_sched_synchronize(sched_res());
+        res->check_outputs(&ubatch);
+    }
+
+    ret = GGML_STATUS_SUCCESS;
+
+    return res;
+}
+
+llm_graph_result * llama_context::process_ubatch_graph(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx,
+        ggml_status & ret, ubatch_trace_times & tt) {
+    const bool trace = llama_ubatch_trace() > 0;
 
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -3070,11 +3184,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // plain_upload: with nothing in flight, the scheduler need not wait for an earlier evaluation before it overwrites
     // the input copies, and stages the host inputs (packs are laid out when a graph is allocated, so this is set before);
-    // cleared once the graph is submitted, so that the scheduler's other users (K-shift, training) keep the waits
-    struct caller_sync_scope {
-        ggml_backend_sched_t s;
-        ~caller_sync_scope() { ggml_backend_sched_set_caller_sync(s, false); }
-    } caller_sync_reset { sched_res() };
+    // cleared once the graph is submitted (process_ubatch), so that the scheduler's other users keep the waits
     ggml_backend_sched_set_caller_sync(sched_res(), plain_upload > 0 && !gf_in_flight);
 
     // a per-size scheduler has one copy of its inputs (it is created without pipeline parallelism): when an earlier
@@ -3085,7 +3195,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const bool allocated = ss ? ss->ready == res : gf_res_prev_active == res;
-    const int64_t t_trace_pre = trace ? ggml_time_us() : 0;
+    tt.pre = trace ? ggml_time_us() : 0;
 
     if (!graph_reuse_disable && reuse_safe && allocated && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -3098,15 +3208,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
-        t_trace_build = t_trace_alloc = trace ? ggml_time_us() : 0;
+        tt.build = tt.alloc = trace ? ggml_time_us() : 0;
         LLAMA_STEP_MARK("ub.reuse");
     } else {
         if (trace) {
             // the same order as the test above: can_reuse ran only if the first three passed
-            trace_why = graph_reuse_disable ? "disabled" : !reuse_safe ? "in_flight" : !allocated ? "not_allocated" :
+            tt.why = graph_reuse_disable ? "disabled" : !reuse_safe ? "in_flight" : !allocated ? "not_allocated" :
                     res->reuse_reject ? res->reuse_reject : "unknown";
-            while (*trace_why >= '0' && *trace_why <= '9') {
-                trace_why++; // a type name from typeid starts with its length
+            while (*tt.why >= '0' && *tt.why <= '9') {
+                tt.why++; // a type name from typeid starts with its length
             }
         }
 
@@ -3131,14 +3241,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
-        t_trace_build = trace ? ggml_time_us() : 0;
+        tt.build = trace ? ggml_time_us() : 0;
 
         if (!ggml_backend_sched_alloc_graph(sched_res(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-        t_trace_alloc = trace ? ggml_time_us() : 0;
+        tt.alloc = trace ? ggml_time_us() : 0;
 
         if (ss) {
             ss->ready = res;
@@ -3146,60 +3256,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             gf_res_prev_active = res;
         }
         LLAMA_STEP_MARK("ub.build");
-    }
-
-    // set the input data for the input tensors
-    {
-        //const auto t_start_us = ggml_time_us();
-
-        // LLAMA_GPU_KQ_MASK_CHECK=1 reads the devices' cell copies while it sets the inputs: let the last step finish
-        static const bool kq_mask_check = [] {
-            const char * env = getenv("LLAMA_GPU_KQ_MASK_CHECK");
-            return env != nullptr && atoi(env) != 0;
-        }();
-        // so does LLAMA_QSA_KPOOL_DEV_CHECK=1 with the k-pool tables' copies
-        const auto * mem_idx = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get());
-        if (kq_mask_check || (mem_idx && mem_idx->kpool_dev_check_on())) {
-            ggml_backend_sched_synchronize(sched.get());
-        }
-
-        // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        res->set_inputs(&ubatch);
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
-    }
-    LLAMA_STEP_MARK("ub.in");
-
-    const int64_t t_trace_inputs = trace ? ggml_time_us() : 0;
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-    if (trace) {
-        // pre: memory, scheduler choice and graph parameters; build: the reuse check, then the graph's construction
-        // (reused: the wait for the previous evaluation); alloc: the scheduler's split and allocation with any re-plan;
-        // inputs: the inputs set; submit: every split queued and the CPU's computed; card0: from the start until the
-        // first split off the CPU was launched (-1: none)
-        const int64_t t_dev0 = ggml_backend_sched_get_trace_t_dev0(sched_res());
-        const int64_t t_end  = ggml_time_us();
-        LLAMA_LOG_WARN("ubatch-trace: %s n_tokens = %u n_seqs = %u n_outputs = %u graph = %s%s%s pre = %lld build = %lld "
-                "alloc = %lld inputs = %lld submit = %lld card0 = %lld total = %lld us\n",
-                gtype == LLM_GRAPH_TYPE_DECODER_MTP ? "mtp" : gtype == LLM_GRAPH_TYPE_ENCODER ? "enc" : "dec",
-                ubatch.n_tokens, ubatch.n_seqs, n_outputs, trace_why ? "rebuilt" : "reused", trace_why ? " why = " : "",
-                trace_why ? trace_why : "", (long long) (t_trace_pre - t_trace0), (long long) (t_trace_build - t_trace_pre),
-                (long long) (t_trace_alloc - t_trace_build), (long long) (t_trace_inputs - t_trace_alloc),
-                (long long) (t_end - t_trace_inputs), (long long) (t_dev0 ? t_dev0 - t_trace0 : -1),
-                (long long) (t_end - t_trace0));
-    }
-    if (status != GGML_STATUS_SUCCESS) {
-        LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
-        ret = status;
-        return nullptr;
-    }
-    LLAMA_STEP_MARK("ub.comp");
-
-    // LLAMA_QSA_POOL_MASK_DEV_CHECK=1 reads back the masks the devices built, once the graph has run
-    if (const auto * mem_idx = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get());
-            mem_idx && mem_idx->pool_mask_dev_check_on() && res->needs_check_outputs()) {
-        ggml_backend_sched_synchronize(sched_res());
-        res->check_outputs(&ubatch);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -4147,7 +4203,140 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+int llama_context::decode_prepare(const llama_batch_ext & batch_inp) {
+    GGML_ASSERT(!vprep.active && vprep_mode == 0 && "a prepared decode must be submitted (or dropped) first");
+
+    // what a prepared call does not cover: embeddings or rows from another context, a reader of the layer inputs, the
+    // shortlist head with its bound (it reads the token ids), calls that end at cuts or fill stores, pipelined slots, a
+    // reserve still to run, and anything in flight
+    bool ok = memory != nullptr && !batch_inp.tokens.empty() && batch_inp.embd.empty() && batch_inp.state.empty() &&
+              !gf_in_flight && !head_bound && !layer_inp_dev && store_at_next.empty() && ubatch_cuts.empty() &&
+              !pipe_drafter && pipe_slots.empty() && !sched_need_reserve && !cparams.embeddings;
+    for (size_t i = 0; ok && i < batch_inp.tokens.size(); ++i) {
+        const auto & t = batch_inp.tokens[i];
+        ok = !t.has_embd && !t.has_state && t.embd_row < 0 && t.state_row < 0 && t.id >= 0;
+    }
+    if (!ok) {
+        vprep_n_refused++;
+        return 1;
+    }
+
+    const char role = step_trace_role;
+    step_trace_role = 'p';
+    vprep_mode = 1;
+    const int ret = decode(batch_inp);
+    vprep_mode = 0;
+    step_trace_role = role;
+
+    if (ret != 0) {
+        vprep = verify_prep();
+        return ret < 0 ? ret : -1;
+    }
+    if (!vprep.active) {
+        vprep_n_refused++;
+        return 1;
+    }
+
+    vprep.tokens      = batch_inp.tokens;
+    vprep.embeddings  = cparams.embeddings;
+    vprep.causal_attn = cparams.causal_attn;
+    vprep.screen_head = cparams.screen_head;
+    vprep.samplers    = sampling.samplers;
+    vprep_n_prepared++;
+    if (vprep_n_prepared == 1 || vprep_n_prepared % 1000 == 0) {
+        LLAMA_LOG_INFO("%s: C738: %" PRIu64 " decodes prepared ahead of their last token ids, %" PRIu64 " not, %" PRIu64
+                " dropped; %" PRIu64 " inputs uploaded ahead (this one: %d, %zu bytes)\n", __func__, vprep_n_prepared,
+                vprep_n_refused, vprep_n_dropped, vprep_n_preup, vprep.n_preup, vprep.preup_bytes);
+    }
+    return 0;
+}
+
+void llama_context::vprep_take_batch(const llama_batch_ext & batch_inp) {
+    const auto & a = vprep.tokens;
+    const auto & b = batch_inp.tokens;
+
+    // the prepared call holds the batch's split, its cells and its inputs: only token ids may differ
+    if (a.size() != b.size() || !batch_inp.embd.empty() || !batch_inp.state.empty()) {
+        GGML_ABORT("%s: C738: the decode after llama_decode_prepare brings %zu tokens, the prepared one %zu\n", __func__,
+                b.size(), a.size());
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        const bool same = a[i].has_embd == b[i].has_embd && a[i].has_state == b[i].has_state && a[i].embd_row == b[i].embd_row &&
+                a[i].state_row == b[i].state_row && a[i].output == b[i].output && a[i].decision_order == b[i].decision_order &&
+                a[i].seq_ids == b[i].seq_ids && a[i].pos == b[i].pos;
+        if (!same) {
+            GGML_ABORT("%s: C738: token %zu of the decode after llama_decode_prepare differs from the prepared one in more than its id\n",
+                    __func__, i);
+        }
+    }
+    if (sched_need_reserve || cparams.embeddings != vprep.embeddings || cparams.causal_attn != vprep.causal_attn ||
+            cparams.screen_head != vprep.screen_head || sampling.samplers != vprep.samplers || !store_at_next.empty() ||
+            !ubatch_cuts.empty()) {
+        GGML_ABORT("%s: C738: the context's settings changed between llama_decode_prepare and the decode\n", __func__);
+    }
+
+    const llama_ubatch & ubatch = vprep.mctx->get_ubatch();
+    GGML_ASSERT(ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens && ubatch.token);
+
+    const int64_t n_vocab = model.vocab.n_tokens();
+
+    bool changed = false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].id == b[i].id) {
+            continue;
+        }
+        if (b[i].id < 0 || b[i].id >= n_vocab) {
+            GGML_ABORT("%s: C738: invalid token[%zu] = %d after llama_decode_prepare\n", __func__, i, b[i].id);
+        }
+        balloc->set_token((uint32_t) i, b[i].id);
+        bool found = false;
+        for (uint32_t k = 0; k < ubatch.n_tokens; ++k) {
+            if (ubatch.data->batch_idxs[k] == (int32_t) i) {
+                ubatch.token[k] = b[i].id;
+                found = true;
+                break;
+            }
+        }
+        GGML_ASSERT(found);
+        changed = true;
+    }
+
+    // the cells apply() filled keep each token's id (PLE n-grams, M-RoPE): the late ones go there before the inputs
+    // that read them are set
+    if (changed) {
+        vprep.mctx->set_tokens();
+    }
+}
+
+bool llama_context::decode_prepare_drop() {
+    if (!vprep.active) {
+        return true;
+    }
+
+    // apply() took the ubatch's cells before its graph ran; a recurrent state cannot be put back exactly, so the
+    // sequences lose every cell (the caller forgets what they held)
+    const llama_ubatch & ubatch = vprep.mctx->get_ubatch();
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        memory->seq_rm(ubatch.seq_id_unq[s], -1, -1);
+    }
+    LLAMA_LOG_WARN("%s: C738: a prepared decode was not submitted: its %u sequence(s) were cleared\n", __func__, ubatch.n_seqs_unq);
+
+    vprep = verify_prep();
+    vprep_n_dropped++;
+    return false;
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // C738: the call after llama_decode_prepare submits the prepared one
+    if (vprep.active && vprep_mode == 0) {
+        vprep_take_batch(batch_inp);
+        vprep_mode = 2;
+        const int ret = decode(batch_inp);
+        vprep_mode = 0;
+        vprep = verify_prep();
+        return ret;
+    }
+
     const int64_t t_trace0 = llama_ubatch_trace() > 0 ? ggml_time_us() : 0; // [TAG_UBATCH_TRACE]
     LLAMA_STEP_MARK("dec");
 
@@ -4247,7 +4436,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, output_all)) {
+    // C738: a prepared call keeps its batch (vprep_take_batch put the token ids in)
+    if (vprep_mode != 2 && !balloc->init(batch_inp, vocab, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -4306,10 +4496,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     embd_seq.clear();
 
-    if (t_compute_start_us == 0) {
-        t_compute_start_us = ggml_time_us();
+    // C738: a call being prepared is counted when it is submitted
+    if (vprep_mode != 1) {
+        if (t_compute_start_us == 0) {
+            t_compute_start_us = ggml_time_us();
+        }
+        n_queued_tokens += n_tokens_all;
     }
-    n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
     embd_batch_idxs.clear();
@@ -4321,17 +4514,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     bool did_optimize = false;
 
-    // handle any pending shifts/copies
-    memory_update(false);
+    // handle any pending shifts/copies (C738: a prepared call did, and nothing changed the memory since)
+    if (vprep_mode != 2) {
+        memory_update(false);
+    }
 
     // Q771: the micro-batch taper's plan for this call, which the memory module's splits follow; without one (taper off,
     // other batches, or a plan equal to the plain split) they take n_ubatch tokens at a time as before. The head rule
     // applies when nothing is in flight now (after every wait above), unless the caller said otherwise.
-    const bool taper_log = taper.enabled() && n_tokens_all > 8;
+    const bool taper_log = vprep_mode != 2 && taper.enabled() && n_tokens_all > 8;
     bool taper_head = false;
     bool taper_tail = false;
     std::vector<uint32_t> taper_sizes;
-    if (taper.enabled() && !embd_all && balloc->is_one_seq_tokens()) {
+    if (vprep_mode != 2 && taper.enabled() && !embd_all && balloc->is_one_seq_tokens()) {
         taper_head = taper_hint_head < 0 ? !gf_in_flight : taper_hint_head > 0;
         taper_tail = taper_hint_tail != 0;
         balloc->set_ubatch_plan(llama_ubatch_taper_plan(taper, n_tokens_all, cparams.n_ubatch, taper_head, taper_tail));
@@ -4340,8 +4535,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     llama_memory_context_ptr mctx;
 
     const int64_t t_trace_init = t_trace0 ? ggml_time_us() : 0;
-    while (true) {
+    // C738: a prepared call's memory context, applied
+    if (vprep_mode == 2) {
+        mctx = std::move(vprep.mctx);
+    }
+    while (vprep_mode != 2) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+
+        // C738: a call being prepared gives up here, before the memory changes; the call itself runs as usual
+        if (vprep_mode == 1 && (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS)) {
+            return 0;
+        }
+
         if (!mctx) {
             return -2;
         }
@@ -4384,17 +4589,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     LLAMA_STEP_MARK("dec.mem");
 
+    // C738: a call is prepared whole in one ubatch, in a memory that can take its token ids later
+    if (vprep_mode == 1 && (mctx->get_ubatch().n_tokens != n_tokens_all || !mctx->tokens_settable())) {
+        return 0;
+    }
+
     const int64_t t_trace_wait = t_trace0 ? ggml_time_us() : 0;
 
-    // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
+    // reserve output buffer (C738: a prepared call did)
+    if (vprep_mode != 2 && output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
 
-    // start a new sampling transaction for this logical batch
-    for (const auto & entry : sampling.samplers) {
-        llama_sampler_backend_begin(entry.second);
+    // start a new sampling transaction for this logical batch (C738: when the call is submitted, before the sampler
+    // inputs are set; the graph does not read it)
+    if (vprep_mode != 1) {
+        for (const auto & entry : sampling.samplers) {
+            llama_sampler_backend_begin(entry.second);
+        }
     }
 
     int64_t n_outputs_prev = 0;
@@ -4446,7 +4659,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         h_nextn_w    = h_nextn_held ? 1 - h_nextn_last : h_nextn_last;
         h_nextn_row0 = h_nextn_w*h_nextn_half_rows();
     }
-    if (write_h_nextn && ev_h_nextn_read_recorded[h_nextn_w]) {
+    // C738: a prepared call queued its wait for the readers of its half (no reader ran since), and must write that half
+    if (vprep_mode == 2 && write_h_nextn && h_nextn_w != vprep.h_nextn_w) {
+        GGML_ABORT("%s: C738: the h_nextn half changed between llama_decode_prepare and the decode\n", __func__);
+    }
+    if (vprep_mode != 2 && write_h_nextn && ev_h_nextn_read_recorded[h_nextn_w]) {
         ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read[h_nextn_w].get());
     }
 
@@ -4516,6 +4733,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
+        }
+
+        // C738: prepared; the next decode submits it from here
+        if (vprep_mode == 1) {
+            vprep.mctx      = std::move(mctx);
+            vprep.h_nextn_w = h_nextn_w;
+            vprep.active    = true;
+            LLAMA_STEP_MARK("dec.prep");
+            return 0;
         }
 
         // the staircase drafter commits this micro-batch's positions of its sequence
@@ -8197,6 +8423,18 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
         case LLAMA_PROCESS_TYPE_DECODE: return ctx->decode(*batch);
     }
     return -1;
+}
+
+int32_t llama_decode_prepare(llama_context * ctx, llama_batch_ext * batch) {
+    return ctx->decode_prepare(*batch);
+}
+
+bool llama_decode_prepared(const llama_context * ctx) {
+    return ctx->decode_prepared();
+}
+
+bool llama_decode_prepare_drop(llama_context * ctx) {
+    return ctx->decode_prepare_drop();
 }
 
 //

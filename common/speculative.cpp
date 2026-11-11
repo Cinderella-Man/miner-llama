@@ -2646,6 +2646,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
             llama_step_trace_mark("mtp.dp.ret");
 
+            // C738: this pass is the last and adds one token to every drafting sequence (no p_min cut can stop one, and
+            // n_min keeps the draft): its caller may prepare the verify pass while it runs
+            if (i + 1 == params.n_max && params.p_min <= 0.0f && params.n_min <= params.n_max) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    auto & dp = dparams[seq_id];
+                    if (drafting[seq_id] && dp.last_pass && (int) dp.result->size() == i) {
+                        dp.last_pass();
+                    }
+                }
+            }
+
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
             // whole prefix at the next head. dropped sequences are simply not re-added.

@@ -266,6 +266,15 @@ bool llama_memory_hybrid_context::apply() {
     return res;
 }
 
+bool llama_memory_hybrid_context::tokens_settable() const {
+    return ctx_attn && ctx_recr && ctx_attn->tokens_settable() && ctx_recr->tokens_settable();
+}
+
+void llama_memory_hybrid_context::set_tokens() {
+    ctx_attn->set_tokens();
+    ctx_recr->set_tokens();
+}
+
 llama_memory_status llama_memory_hybrid_context::get_status() const {
     return status;
 }
