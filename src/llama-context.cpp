@@ -683,6 +683,22 @@ llama_context::llama_context(
         }
         LLAMA_LOG_INFO("%s: graphs per batch size up to 8 tokens: %s, schedulers per size: %s\n", __func__,
                 graph_per_size ? "on" : "off (LLAMA_GRAPH_PER_SIZE=0)", sched_per_size ? "on (LLAMA_SCHED_PER_SIZE=1)" : "off");
+
+        // LLAMA_MTP_GRAPH_KEEP=1 (C619): an MTP draft context keeps one graph on a scheduler of its own for each batch of
+        // up to 8 tokens that differs in its tokens, its outputs, its head's shortlist or its hidden-row carry. A
+        // speculative step's catch-up (the verify pass's tokens, no output) and its drafting passes (one token, one
+        // output) then keep their graphs, where the one shared scheduler holds one allocated graph and each of the two
+        // rebuilt the other's every step (R86: 0.689 and 1.890 ms of host time a step on a P106)
+        const char * env_keep = getenv("LLAMA_MTP_GRAPH_KEEP");
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && env_keep && atoi(env_keep) != 0) {
+            if (!graph_per_size) {
+                LLAMA_LOG_WARN("%s: LLAMA_MTP_GRAPH_KEEP=1 needs per-size graphs, ignored with LLAMA_GRAPH_PER_SIZE=0\n", __func__);
+            } else {
+                mtp_graph_keep = true;
+                sched_per_size = true;
+                LLAMA_LOG_INFO("%s: LLAMA_MTP_GRAPH_KEEP: the draft keeps a graph and a scheduler per batch shape of up to 8 tokens\n", __func__);
+            }
+        }
     }
 
     // Q771: the micro-batch taper, off unless LLAMA_UBATCH_TAPER sets it (llama_set_ubatch_taper can change it later)
@@ -1303,6 +1319,9 @@ void llama_context::synchronize() {
     ggml_backend_sched_synchronize(sched.get());
     LLAMA_STEP_MARK("sync.end");
     gf_in_flight = false;
+    for (auto & e : sched_small) {
+        e.in_flight = false;
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -3174,7 +3193,7 @@ llm_graph_result * llama_context::process_ubatch_graph(const llama_ubatch & ubat
         }
         if (ss == nullptr) {
             sched_small.push_back({ key, ggml_backend_sched_ptr(ggml_backend_sched_new(
-                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), graph_max_nodes(8), false, cparams.op_offload)), nullptr });
+                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), graph_max_nodes(8), false, cparams.op_offload)), nullptr, false });
             ss = &sched_small.back();
             ggml_backend_sched_set_copy_callback(ss->sched.get(), sched_copy_experts, this);
             ggml_backend_sched_set_realloc_callback(ss->sched.get(), sched_graph_realloc, this);
@@ -3211,9 +3230,12 @@ llm_graph_result * llama_context::process_ubatch_graph(const llama_ubatch & ubat
 
     // a per-size scheduler has one copy of its inputs (it is created without pipeline parallelism): when an earlier
     // ubatch of this decode call is still computing, it may be this scheduler's own graph, so wait before its inputs
-    // are written again (only a decode call of several ubatches whose last one has at most 8 tokens gets here)
-    if (ss && gf_in_flight) {
+    // are written again (only a decode call of several ubatches whose last one has at most 8 tokens gets here).
+    // LLAMA_MTP_GRAPH_KEEP (C619) knows which schedulers have a graph in flight and waits only for this one's own, so
+    // that a drafting pass prepares its graph while the step's catch-up computes, as with the shared scheduler
+    if (ss && gf_in_flight && (!mtp_graph_keep || ss->in_flight)) {
         ggml_backend_sched_synchronize(ss->sched.get());
+        ss->in_flight = false;
     }
 
     const bool allocated = ss ? ss->ready == res : gf_res_prev_active == res;
@@ -5419,7 +5441,14 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 
 uint32_t llama_context::gf_res_key(uint32_t n_tokens) const {
     // batches of up to 8 tokens (decode, speculative verify) are keyed by their size too
-    return (n_outputs > 0 ? 1u : 0u) | ((graph_per_size && n_tokens <= 8 ? n_tokens : 0u) << 1);
+    uint32_t key = (n_outputs > 0 ? 1u : 0u) | ((graph_per_size && n_tokens <= 8 ? n_tokens : 0u) << 1);
+    // LLAMA_MTP_GRAPH_KEEP (C619): and a draft's by the switches its drafting passes flip between steps
+    if (mtp_graph_keep && n_tokens <= 8) {
+        key |= (cparams.head_short_on   ? 1u : 0u) << 5;
+        key |= (cparams.nextn_carry_in  ? 1u : 0u) << 6;
+        key |= (cparams.nextn_carry_out ? 1u : 0u) << 7;
+    }
+    return key;
 }
 
 void llama_context::gf_res_invalidate() {
@@ -5637,6 +5666,11 @@ ggml_status llama_context::graph_compute(
 
     auto status = ggml_backend_sched_graph_compute_async(sched_res(), gf);
     gf_in_flight = true;
+    if (mtp_graph_keep && sched_active) {
+        for (auto & e : sched_small) {
+            e.in_flight |= e.sched.get() == sched_active;
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }

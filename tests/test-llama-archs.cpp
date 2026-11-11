@@ -183,6 +183,7 @@ static void usage(char ** argv) {
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
     LOG("  --mtp-kv-only            Check that LLAMA_MTP_KV_ONLY leaves the MTP draft's caches and drafts as they are (CPU only)\n");
     LOG("  --mtp-catchup-overlap    Check that LLAMA_MTP_CATCHUP_OVERLAP leaves the MTP draft's caches and drafts as they are (CPU only)\n");
+    LOG("  --mtp-graph-keep         Check that LLAMA_MTP_GRAPH_KEEP leaves the MTP draft's caches and drafts as they are and builds fewer graphs (CPU only)\n");
     LOG("  --verify-prepare         Check that a decode prepared before its last token id (llama_decode_prepare, C738) gives the plain decode's results\n");
     LOG("  --mtp-h-dev              Check that LLAMA_MTP_H_DEV's host and device rows give the MTP draft the same caches and drafts (CPU only)\n");
     LOG("  --mtp-incall-overlap     Check that checkpoints inside a call (C217) give the MTP draft's parts and drafts of separate calls,\n");
@@ -3550,6 +3551,369 @@ static int test_verify_prepare(const std::string & arch_filter, const size_t see
     return n_failed == 0 ? 0 : 1;
 }
 
+// LLAMA_MTP_GRAPH_KEEP (C619): the draft context's graph builds over a run of speculative steps with the switch off and
+// on, and everything the draft computes in both
+struct mtp_keep_config {
+    const char * name;
+    ggml_type    type_kv;
+    bool         fa;
+    bool         backend_sampling; // the driver's top-k on the backend
+    const char * kv_only;          // LLAMA_MTP_KV_ONLY (C620)
+    const char * shortlist;        // LLAMA_DRAFT_SHORTLIST: the head's shortlist, the full head after a token outside it
+    const char * carry;            // LLAMA_DRAFT_H_CARRY: a step's later drafting passes read the previous pass's row
+};
+
+struct mtp_keep_run {
+    std::vector<uint8_t>     state_prompt; // the draft's sequence state and the driver's after the prompt
+    std::vector<uint8_t>     spec_prompt;
+    std::vector<uint8_t>     state_end;    // both after the last step
+    std::vector<uint8_t>     spec_end;
+    std::vector<llama_token> drafts;       // each step's draft, its length first
+    std::vector<float>       probs;        // the drafter's probability of each drafted token
+    int    n_steps      = 0;
+    int    built_prompt = 0; // the draft's graphs built during the prompt
+    int    built_steps  = 0; // and during the steps
+    int    passes_steps = 0; // the draft's micro-batches during the steps
+    bool   short_on     = false;
+    size_t compute      = 0; // the draft context's compute buffers at the end, bytes
+};
+
+// the draft context's micro-batches, from the lines LLAMA_UBATCH_TRACE logs ("ubatch-trace: mtp ... graph = rebuilt")
+static struct {
+    int built  = 0;
+    int reused = 0;
+} g_mtp_keep_trace;
+
+// the draft-mtp driver with the target as the server runs it: a prompt in four calls (32, 32, 32 and 4, the last one
+// with an output), then 16 steps whose verify batches take 3, 2, 1 or none of the three drafted tokens (the server's cap
+// at a reply's end or a cut), so that the catch-ups have every width from 1 to 4, and accept 0 to all of them
+static mtp_keep_run mtp_keep_sequence(
+        llama_model * model, const std::vector<llama_token> & tokens, const mtp_keep_config & cfg, const bool keep) {
+    static const char * names[] = { "LLAMA_MTP_GRAPH_KEEP", "LLAMA_MTP_KV_ONLY", "LLAMA_DRAFT_SHORTLIST", "LLAMA_DRAFT_H_CARRY" };
+    test_setenv(names[0], keep ? "1" : nullptr);
+    test_setenv(names[1], cfg.kv_only);
+    test_setenv(names[2], cfg.shortlist);
+    test_setenv(names[3], cfg.carry);
+    auto unset = [&]() {
+        for (const char * n : names) {
+            test_setenv(n, nullptr);
+        }
+    };
+
+    auto ctx_params_for = [&](const bool mtp) {
+        llama_context_params p = llama_context_default_params();
+        p.ctx_type        = mtp ? LLAMA_CONTEXT_TYPE_MTP : LLAMA_CONTEXT_TYPE_DEFAULT;
+        p.n_ctx           = 0;
+        p.n_batch         = 32;
+        p.n_ubatch        = mtp ? 18 : 8;
+        p.n_threads       = 4;
+        p.n_threads_batch = 4;
+        p.type_k          = cfg.type_kv;
+        p.type_v          = cfg.type_kv;
+        p.flash_attn_type = cfg.fa ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        p.n_outputs_max_per_seq = 4;
+        return p;
+    };
+
+    g_mtp_keep_trace.built  = 0;
+    g_mtp_keep_trace.reused = 0;
+
+    llama_context_ptr lctx_tgt(llama_init_from_model(model, ctx_params_for(false)));
+    llama_context_ptr lctx_dft(llama_init_from_model(model, ctx_params_for(true)));
+    if (!lctx_tgt || !lctx_dft) {
+        unset();
+        throw std::runtime_error("failed to create the target or the MTP context");
+    }
+    llama_context * ctx_tgt = lctx_tgt.get();
+    llama_context * ctx_dft = lctx_dft.get();
+
+    common_params_speculative sp;
+    sp.types                  = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    sp.draft.ctx_tgt          = ctx_tgt;
+    sp.draft.ctx_dft          = ctx_dft;
+    sp.draft.n_max            = 3;
+    sp.draft.n_min            = 0;
+    sp.draft.p_min            = 0.0f;
+    sp.draft.backend_sampling = cfg.backend_sampling;
+    common_speculative_ptr spec(common_speculative_init(sp, 1));
+    unset();
+    if (!spec) {
+        throw std::runtime_error("failed to create the draft-mtp driver");
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    mtp_keep_run run;
+    run.short_on = llama_head_shortlist_size(ctx_dft) > 0;
+
+    auto state_dft = [&]() {
+        std::vector<uint8_t> s(llama_state_seq_get_size(ctx_dft, 0));
+        llama_state_seq_get_data(ctx_dft, s.data(), s.size(), 0);
+        return s;
+    };
+
+    auto argmax = [&](int32_t i) {
+        const float * logits = llama_get_logits_ith(ctx_tgt, i);
+        GGML_ASSERT(logits != nullptr);
+        return (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
+    };
+
+    llama_tokens context;
+    llama_pos    pos = 0;
+
+    // the prompt's calls, the server's way: the cut past the batch's start in both memories, the target's call, the driver
+    int i = 0;
+    const int calls[] = { 32, 32, 32, 4 };
+    for (size_t c = 0; c < sizeof(calls)/sizeof(calls[0]); ++c) {
+        const bool last = c + 1 == sizeof(calls)/sizeof(calls[0]);
+
+        common_memory mem_tgt;
+        mem_tgt.init(ctx_tgt);
+        mem_tgt.seq_rm(0, pos, -1);
+        const llama_pos p0 = pos;
+        common_speculative_after_catchup(spec.get(), [&, p0]() {
+            common_memory mem_dft;
+            mem_dft.init(ctx_dft);
+            mem_dft.seq_rm(0, p0, -1);
+        });
+
+        common_batch batch(ctx_tgt);
+        for (int k = 0; k < calls[c]; ++k, ++i) {
+            batch.add(tokens[i], pos++, 0, last && k + 1 == calls[c]);
+            context.push_back(tokens[i]);
+        }
+        if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("failed to decode a prompt call");
+        }
+        if (!common_speculative_process(spec.get(), batch)) {
+            throw std::runtime_error("the driver failed on a prompt call");
+        }
+    }
+    common_speculative_flush(spec.get());
+    run.state_prompt = state_dft();
+    common_speculative_get_state(spec.get(), 0, run.spec_prompt);
+    run.built_prompt = g_mtp_keep_trace.built;
+
+    const int trace_built0  = g_mtp_keep_trace.built;
+    const int trace_passes0 = g_mtp_keep_trace.built + g_mtp_keep_trace.reused;
+
+    // a draft step from id_last at pos; the verify batch takes n_use of the draft and the driver is told that n_acc of
+    // them were accepted (the target keeps every token, so that its memory needs no rollback)
+    auto step = [&](llama_token id_last, int n_use, int n_acc) {
+        llama_tokens draft;
+        std::vector<float> probs;
+        common_speculative_get_draft_params(spec.get(), 0) = {
+            /* .drafting = */ true,
+            /* .n_max    = */ 3,
+            /* .pos0     = */ pos,
+            /* .id_last  = */ id_last,
+            /* .prompt   = */ &context,
+            /* .result   = */ &draft,
+            /* .result_q = */ nullptr,
+            /* .temp     = */ 1.0f,
+            /* .seed     = */ LLAMA_DEFAULT_SEED,
+            /* .info     = */ nullptr,
+            /* .result_p = */ &probs,
+        };
+        common_speculative_draft(spec.get());
+        run.drafts.push_back((llama_token) draft.size());
+        run.drafts.insert(run.drafts.end(), draft.begin(), draft.end());
+        run.probs.insert(run.probs.end(), probs.begin(), probs.end());
+
+        if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, pos, -1)) {
+            throw std::runtime_error("failed to remove the draft region");
+        }
+
+        n_use = std::min<int>(n_use, (int) draft.size());
+        common_batch batch(ctx_tgt);
+        batch.add(id_last, pos++, 0, true);
+        context.push_back(id_last);
+        for (int k = 0; k < n_use; ++k) {
+            batch.add(draft[k], pos++, 0, true);
+            context.push_back(draft[k]);
+        }
+        if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("failed to decode a verify batch");
+        }
+        if (!common_speculative_process(spec.get(), batch)) {
+            throw std::runtime_error("the driver failed on a verify batch");
+        }
+        common_speculative_accept(spec.get(), 0, (uint16_t) std::min(n_acc, n_use));
+        run.n_steps++;
+        return argmax(batch.size() - 1);
+    };
+
+    static const int steps[][2] = {
+        { 3, 0 }, { 3, 1 }, { 3, 3 }, { 2, 2 }, { 3, 0 }, { 1, 1 }, { 3, 2 }, { 0, 0 },
+        { 3, 3 }, { 3, 1 }, { 2, 0 }, { 3, 3 }, { 1, 0 }, { 3, 3 }, { 0, 0 }, { 3, 2 },
+    };
+    common_speculative_begin(spec.get(), 0, context);
+    llama_token id = argmax(-1);
+    for (const auto & s : steps) {
+        id = step(id, s[0], s[1]);
+    }
+
+    common_speculative_flush(spec.get());
+    run.state_end = state_dft();
+    common_speculative_get_state(spec.get(), 0, run.spec_end);
+    run.built_steps  = g_mtp_keep_trace.built - trace_built0;
+    run.passes_steps = g_mtp_keep_trace.built + g_mtp_keep_trace.reused - trace_passes0;
+
+    for (const auto & e : llama_get_memory_breakdown(ctx_dft)) {
+        run.compute += e.second.compute;
+    }
+
+    spec.reset();
+    return run;
+}
+
+static int test_mtp_graph_keep(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    // the draft's micro-batches are counted from their trace lines, which stay out of the table
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        if (strncmp(text, "ubatch-trace: mtp ", 18) == 0) {
+            if (strstr(text, " graph = rebuilt") != nullptr) {
+                g_mtp_keep_trace.built++;
+            } else if (strstr(text, " graph = reused") != nullptr) {
+                g_mtp_keep_trace.reused++;
+            }
+            return;
+        }
+        if (strncmp(text, "ubatch-trace: ", 14) == 0 || strncmp(text, "decode-trace: ", 14) == 0) {
+            return;
+        }
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    const mtp_keep_config configs[] = {
+        { "f16 fa",            GGML_TYPE_F16,  true,  true,  nullptr, nullptr,  nullptr },
+        { "f16",               GGML_TYPE_F16,  false, true,  nullptr, nullptr,  nullptr },
+        { "q8_0 fa",           GGML_TYPE_Q8_0, true,  true,  nullptr, nullptr,  nullptr },
+        { "f16 fa host",       GGML_TYPE_F16,  true,  false, nullptr, nullptr,  nullptr },
+        { "f16 fa kv-only",    GGML_TYPE_F16,  true,  true,  "1",     nullptr,  nullptr },
+        { "f16 fa short",      GGML_TYPE_F16,  true,  true,  nullptr, "32,8,2", nullptr },
+        { "f16 fa carry",      GGML_TYPE_F16,  true,  true,  nullptr, nullptr,  "1"     },
+        { "f16 fa kv+sl+carry", GGML_TYPE_F16, true,  true,  "1",     "32,8,2", "1"     },
+    };
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    common_log_flush(common_log_main());
+    LOG("|%10s|%19s|%11s|%11s|%11s|%7s|%15s|%13s|%17s|%s\n", "Model arch.", "Config", "Prompt", "Drafts", "End",
+            "Short", "Built, prompt", "Built, steps", "Compute KiB", "Status");
+
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !mtp_kv_only_arch(arch)) {
+            continue;
+        }
+        const bool moe = moe_mandatory(arch) || moe_implemented(arch);
+
+        gguf_context_ptr gguf_ctx = get_gguf_ctx_mtp(arch, moe);
+
+        llama_model_ptr model;
+        try {
+            model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, nullptr, /*load_mtp*/ true);
+        } catch (const std::exception & err) {
+            LOG("|%10s|%19s|%11s|%11s|%11s|%7s|%15s|%13s|%17s|\033[1;31mERROR\033[0m (model load: %s)\n",
+                    llama_arch_name(arch), "", "", "", "", "", "", "", "", err.what());
+            n_tests++;
+            n_failed++;
+            continue;
+        }
+
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const std::vector<llama_token> tokens = get_tokens(160, n_vocab, seed);
+
+        for (const mtp_keep_config & cfg : configs) {
+            n_tests++;
+            LOG("|%10s|%19s|", llama_arch_name(arch), cfg.name);
+            std::string status;
+            try {
+                // the driver's own log lines stay out of the table
+                struct log_pause {
+                    log_pause()  { common_log_pause(common_log_main()); }
+                    ~log_pause() { common_log_resume(common_log_main()); }
+                };
+                mtp_keep_run off;
+                mtp_keep_run on;
+                {
+                    log_pause pause;
+                    off = mtp_keep_sequence(model.get(), tokens, cfg, false);
+                    on  = mtp_keep_sequence(model.get(), tokens, cfg, true);
+                }
+
+                auto same = [](const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) {
+                    return !a.empty() && a == b;
+                };
+                const bool same_prompt = same(off.state_prompt, on.state_prompt) && same(off.spec_prompt, on.spec_prompt);
+                const bool same_drafts = !off.drafts.empty() && off.drafts == on.drafts && off.probs.size() == on.probs.size() &&
+                    memcmp(off.probs.data(), on.probs.data(), off.probs.size()*sizeof(float)) == 0;
+                const bool same_end    = same(off.state_end, on.state_end) && same(off.spec_end, on.spec_end);
+                // the trace counts every pass; with the switch the steps build fewer graphs than without it
+                const bool traced      = off.passes_steps > 0 && off.passes_steps == on.passes_steps;
+                const bool fewer       = on.built_steps < off.built_steps;
+                const bool short_ok    = off.short_on == on.short_on && (cfg.shortlist == nullptr || on.short_on);
+
+                char prompt_str[32];
+                char steps_str[48];
+                char compute_str[48];
+                snprintf(prompt_str,  sizeof(prompt_str),  "%d/%d", off.built_prompt, on.built_prompt);
+                snprintf(steps_str,   sizeof(steps_str),   "%d/%d of %d", off.built_steps, on.built_steps, on.passes_steps);
+                snprintf(compute_str, sizeof(compute_str), "%zu/%zu", off.compute/1024, on.compute/1024);
+                LOG("%11s|%11s|%11s|%7s|%15s|%13s|%17s|", same_prompt ? "identical" : "DIFFERENT",
+                        same_drafts ? "identical" : "DIFFERENT", same_end ? "identical" : "DIFFERENT",
+                        on.short_on ? "on" : "off", prompt_str, steps_str, compute_str);
+
+                if (same_prompt && same_drafts && same_end && traced && fewer && short_ok) {
+                    status = "\033[1;32mOK\033[0m";
+                } else {
+                    n_failed++;
+                    status = "\033[1;31mFAIL\033[0m";
+                    if (!traced) {
+                        status += " (no or unequal trace lines: run with LLAMA_UBATCH_TRACE=1)";
+                    } else if (!fewer) {
+                        status += " (the steps built no fewer graphs)";
+                    } else if (!short_ok) {
+                        status += " (the shortlist did not start)";
+                    }
+                }
+            } catch (const std::exception & err) {
+                n_failed++;
+                status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
+            }
+            LOG("%s\n", status.c_str());
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -3566,6 +3930,7 @@ int main(int argc, char ** argv) {
     bool kv_shift = false;
     bool mtp_kv_only = false;
     bool mtp_catchup_overlap = false;
+    bool mtp_graph_keep = false;
     bool verify_prepare = false;
     bool mtp_h_dev = false;
     bool mtp_incall_overlap = false;
@@ -3641,6 +4006,8 @@ int main(int argc, char ** argv) {
             kv_shift = true;
         } else if (strcmp(argv[i], "--mtp-kv-only") == 0) {
             mtp_kv_only = true;
+        } else if (strcmp(argv[i], "--mtp-graph-keep") == 0) {
+            mtp_graph_keep = true;
         } else if (strcmp(argv[i], "--verify-prepare") == 0) {
             verify_prepare = true;
         } else if (strcmp(argv[i], "--mtp-catchup-overlap") == 0) {
@@ -3686,6 +4053,11 @@ int main(int argc, char ** argv) {
         }
         if (verify_prepare) {
             return test_verify_prepare(arch_filter, seed, stdev, verbosity);
+        }
+        if (mtp_graph_keep) {
+            // the draft's graph builds are counted from LLAMA_UBATCH_TRACE's lines, read once at the first micro-batch
+            test_setenv("LLAMA_UBATCH_TRACE", "1");
+            return test_mtp_graph_keep(arch_filter, seed, stdev, verbosity);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {
