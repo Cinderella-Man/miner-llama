@@ -2161,17 +2161,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (llama_draft_prefetch_enabled(ctx_tgt)) {
             prefetches_rows = true;
             pf_toks.assign(n_seq, {});
+            pf_pending.assign(n_seq, 0);
             SPC_INF("%s", "LLAMA_DRAFT_PREFETCH: the target's n-gram rows of id_last and of each drafted token are read ahead\n");
         }
     }
 
-    // LLAMA_DRAFT_PREFETCH (C615): per sequence, id_last and the tokens drafted so far, in the verify pass's order
+    // LLAMA_DRAFT_PREFETCH (C615): per sequence, id_last and the tokens drafted so far, in the verify pass's order, and
+    // whether the newest one's rows wait to be issued
     std::vector<llama_tokens> pf_toks;
+    std::vector<uint8_t>      pf_pending;
 
-    // issue the rows of pf_toks[seq_id]'s last token, at the target's positions from pos0
-    void prefetch_last(llama_seq_id seq_id, llama_pos pos0) {
-        const auto & t = pf_toks[seq_id];
-        llama_draft_prefetch(params.ctx_tgt, seq_id, pos0, t.data(), (int32_t) t.size(), (int32_t) t.size() - 1);
+    // issue the rows of each sequence's newest token whose rows wait, at the target's positions from pos0: called once a
+    // drafting pass is queued (the host then waits for its sampling) and after the last pass
+    void prefetch_pending(const common_speculative_draft_params_vec & dparams) {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (!pf_pending[seq_id]) {
+                continue;
+            }
+            pf_pending[seq_id] = 0;
+            const auto & t = pf_toks[seq_id];
+            llama_draft_prefetch(params.ctx_tgt, seq_id, dparams[seq_id].pos0, t.data(), (int32_t) t.size(),
+                    (int32_t) t.size() - 1);
+        }
     }
 
     static bool overlap_wanted() {
@@ -2611,10 +2622,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
 
-            // C615: the verify pass starts with id_last, whose rows no pass has read yet
+            // C615: the verify pass starts with id_last, whose rows no pass has read yet: issued once the first
+            // drafting pass is queued
             if (prefetches_rows) {
                 pf_toks[seq_id].assign(1, dp.id_last);
-                prefetch_last(seq_id, dp.pos0);
+                pf_pending[seq_id] = true;
             }
         }
 
@@ -2677,6 +2689,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // whole prefix at the next head. dropped sequences are simply not re-added.
             batch.clear();
 
+            // C615: the rows of the tokens this pass was given, issued while the card runs it (the host would wait
+            // for its sampling anyway)
+            if (prefetches_rows) {
+                prefetch_pending(dparams);
+            }
+
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (!drafting[seq_id]) {
                     continue;
@@ -2717,10 +2735,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 spec_info_add_marginal(dp.info, common_speculative_type_to_str(type), cur_p, id);
                 spec_push_p(dp, cur_p, id);
 
-                // C615: the drafted token's rows, read while the next drafting pass (or the verify's preparation) runs
+                // C615: the drafted token's rows, issued once the next drafting pass is queued, or after the last one
                 if (prefetches_rows) {
                     pf_toks[seq_id].push_back(id);
-                    prefetch_last(seq_id, dp.pos0);
+                    pf_pending[seq_id] = true;
                 }
 
                 if (dp.result_q) {
@@ -2763,6 +2781,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             ++i;
+        }
+
+        // C615: the last drafted tokens' rows, which no later pass covers
+        if (prefetches_rows) {
+            prefetch_pending(dparams);
         }
 
         if (chain_heads) {
