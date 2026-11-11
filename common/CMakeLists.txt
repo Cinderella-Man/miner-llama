@@ -55,8 +55,27 @@ set(TARGET llama-common)
 
 include(parsers/sources.cmake)
 
+# C770: the LLAMA_ and GGML_ names the sources read, for the switch line at load (common_switches_info), scanned again
+# whenever one of those files changes or a new one appears
+set(SWITCH_NAME_GLOBS)
+foreach(dir src common tools ggml/src)
+    foreach(ext c cpp cu cuh h hpp)
+        list(APPEND SWITCH_NAME_GLOBS ${PROJECT_SOURCE_DIR}/${dir}/*.${ext})
+    endforeach()
+endforeach()
+file(GLOB_RECURSE SWITCH_NAME_SOURCES CONFIGURE_DEPENDS ${SWITCH_NAME_GLOBS})
+set(SWITCH_NAMES_CPP ${CMAKE_CURRENT_BINARY_DIR}/switch-names.cpp)
+add_custom_command(
+    OUTPUT  ${SWITCH_NAMES_CPP}
+    COMMAND ${CMAKE_COMMAND} -DROOT=${PROJECT_SOURCE_DIR} -DOUT=${SWITCH_NAMES_CPP}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/switch-names.cmake
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/switch-names.cmake ${SWITCH_NAME_SOURCES}
+    COMMENT "Listing the LLAMA_ and GGML_ names the sources read"
+    VERBATIM)
+
 add_library(${TARGET}
     ${LLAMA_CHAT_PARSERS_SOURCES}
+    ${SWITCH_NAMES_CPP}
     arg.cpp
     arg.h
     base64.hpp

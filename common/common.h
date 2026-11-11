@@ -868,6 +868,10 @@ void common_init();
 void common_params_print_info(const common_params & params, bool print_devices = true);
 std::string common_params_get_system_info(const common_params & params);
 
+// C770: every LLAMA_ and GGML_ variable in the environment with its value, sorted, and those no source of this build
+// reads (a typo, or another branch's switch) listed apart; common_params_print_info logs it at the INFO level
+std::string common_switches_info();
+
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);
 bool parse_cpu_mask(const std::string & mask, bool(&boolmask)[GGML_MAX_N_THREADS]);
 void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_params * role_model = nullptr);

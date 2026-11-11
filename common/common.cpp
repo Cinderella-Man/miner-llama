@@ -64,9 +64,23 @@
 #include <sys/systemcfg.h>
 #endif
 
+#if defined(_WIN32)
+#   define COMMON_ENVIRON _environ
+#elif defined(__APPLE__) && defined(__MACH__)
+#   include <crt_externs.h>
+#   define COMMON_ENVIRON (*_NSGetEnviron())
+#else
+extern char ** environ;
+#   define COMMON_ENVIRON environ
+#endif
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
+
+// C770: the LLAMA_ and GGML_ names the sources read, written at build time by common/switch-names.cmake
+extern const char * const common_switch_names[];
+extern const size_t       common_switch_names_n;
 
 common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
@@ -427,6 +441,10 @@ void common_params_print_info(const common_params & params, bool print_devices) 
     const int verbosity = common_log_get_verbosity_thold();
     COM_INF("%s: verbosity = %d (adjust with the `-lv N` CLI arg)\n", __func__, verbosity);
 
+    // C770: the switches at the INFO level, which llama-server shows at its default verbosity; the library's own
+    // lines that announce a switch are at the library's INFO level (verbosity 4), which it does not
+    COM_INF("%s: %s\n", __func__, common_switches_info().c_str());
+
     // device enumeration creates a primary context on CUDA backends, skip it when the caller does not own any device
     if (print_devices && verbosity >= LOG_LEVEL_TRACE) {
         COM_TRC("%s", "device_info:\n");
@@ -438,6 +456,70 @@ void common_params_print_info(const common_params & params, bool print_devices) 
         }
     }
     COM_TRC("%s\n", common_params_get_system_info(params).c_str());
+}
+
+std::string common_switches_info() {
+    const std::unordered_set<std::string> known(common_switch_names, common_switch_names + common_switch_names_n);
+    // common_arg reads LLAMA_ARG_NO_<X> for every LLAMA_ARG_<X> that has a negative form
+    const auto is_known = [&known](const std::string & name) {
+        return known.count(name) > 0 ||
+            (name.rfind("LLAMA_ARG_NO_", 0) == 0 && known.count("LLAMA_ARG_" + name.substr(13)) > 0);
+    };
+    const auto is_secret = [](const std::string & name) {
+        for (const char * s : { "KEY", "TOKEN", "SECRET", "PASSWORD" }) {
+            if (name.find(s) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::vector<std::pair<std::string, std::string>> vars;
+    for (char ** e = COMMON_ENVIRON; e != nullptr && *e != nullptr; ++e) {
+        const std::string kv = *e;
+        if (kv.rfind("LLAMA_", 0) != 0 && kv.rfind("GGML_", 0) != 0) {
+            continue;
+        }
+        const size_t eq = kv.find('=');
+        vars.emplace_back(kv.substr(0, eq), eq == std::string::npos ? "" : kv.substr(eq + 1));
+    }
+    std::sort(vars.begin(), vars.end());
+
+    // NAME=value, one line: a value that is empty or holds a space is quoted, control characters become '?'
+    const auto item = [&is_secret](const std::pair<std::string, std::string> & v) {
+        if (is_secret(v.first)) {
+            return v.first + "=(hidden)";
+        }
+        std::string value = v.second;
+        for (char & c : value) {
+            if ((unsigned char) c < 0x20 || c == 0x7f) {
+                c = '?';
+            }
+        }
+        if (value.empty() || value.find(' ') != std::string::npos) {
+            value = "\"" + value + "\"";
+        }
+        return v.first + "=" + value;
+    };
+    std::string read;
+    std::string unread;
+    for (const auto & v : vars) {
+        std::string & out = is_known(v.first) ? read : unread;
+        out += (out.empty() ? "" : " ") + item(v);
+    }
+
+    std::ostringstream os;
+    os << "switches: ";
+    if (vars.empty()) {
+        os << "none set";
+    } else {
+        os << vars.size() << " set:" << (read.empty() ? "" : " ") << read;
+        if (!unread.empty()) {
+            os << (read.empty() ? "" : ";") << " not read by this build: " << unread;
+        }
+    }
+    os << " (this build reads " << common_switch_names_n << " LLAMA_ and GGML_ names)";
+    return os.str();
 }
 
 std::string common_params_get_system_info(const common_params & params) {
