@@ -66,6 +66,11 @@ llama_ngram_prefetch::~llama_ngram_prefetch() {
     if (worker.joinable()) {
         worker.join();
     }
+    if (enabled) {
+        LLAMA_LOG_WARN("C761: LLAMA_NGRAM_PREFETCH: %" PRIu64 " calls planned, %" PRIu64 " n-gram rows issued by the helper, %"
+                PRIu64 " by set_input, %" PRIu64 " differed; at most %" PRIu64 " bytes ahead (cap %" PRIu64 ")\n",
+                tot.calls_planned, tot.rows_helper, tot.rows_inline, tot.rows_mismatch, tot.window_max, cap);
+    }
 }
 
 // the loop of llm_graph_input_qwen4exp_ple::set_input for one token (the n-gram hashes of the token and its

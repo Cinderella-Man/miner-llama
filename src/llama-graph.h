@@ -1090,9 +1090,9 @@ public:
     // times: LLAMA_UBATCH_TRACE's split of the inputs (C761): each input type's time in set_input, by type name in the
     // order of the first input of each type, and how many inputs of that type
     struct input_time {
-        const char * name;
-        int64_t      us;
-        int32_t      n;
+        std::string name; // the class name without llm_graph_input_ (a nested class: its own name)
+        int64_t     us;
+        int32_t     n;
     };
     void set_inputs(const llama_ubatch * ubatch, std::vector<input_time> * times = nullptr);
     void set_outputs(const llm_graph_params & params);

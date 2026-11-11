@@ -1830,14 +1830,31 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch, std::vector<input
         input->set_input(ubatch);
         const int64_t dt = ggml_time_us() - t0;
 
-        const char * name = typeid(*input).name();
-        while (*name >= '0' && *name <= '9') {
-            name++; // a type name from typeid starts with its length
+        // the class's own name from typeid's: "<len><name>", or "N<len><scope>...<len><name>E" for a nested class
+        const char * m = typeid(*input).name();
+        const char * p = m;
+        const bool nested = *p == 'N';
+        p += nested ? 1 : 0;
+        std::string name;
+        while (*p >= '0' && *p <= '9') {
+            size_t len = 0;
+            while (*p >= '0' && *p <= '9') {
+                len = len*10 + (size_t) (*p - '0');
+                p++;
+            }
+            name.assign(p, strnlen(p, len));
+            p += name.size();
+            if (!nested) {
+                break;
+            }
         }
-        if (strncmp(name, "llm_graph_input_", 16) == 0) {
-            name += 16;
+        if (name.empty()) {
+            name = m;
         }
-        auto it = std::find_if(times->begin(), times->end(), [&](const input_time & t) { return strcmp(t.name, name) == 0; });
+        if (name.rfind("llm_graph_input_", 0) == 0) {
+            name = name.substr(16);
+        }
+        auto it = std::find_if(times->begin(), times->end(), [&](const input_time & t) { return t.name == name; });
         if (it == times->end()) {
             times->push_back({ name, dt, 1 });
         } else {

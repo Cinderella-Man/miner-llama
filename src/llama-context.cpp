@@ -465,7 +465,8 @@ llama_context::llama_context(
             const uint64_t cap = (uint64_t) (std::max(0.0, pf_mb) * 1024.0 * 1024.0);
             ngram_pf = std::make_unique<llama_ngram_prefetch>(hparams, table, pf_on, cap, pf_stats);
             if (pf_on) {
-                LLAMA_LOG_INFO("%s: LLAMA_NGRAM_PREFETCH: the n-gram rows of a call's later micro-batches are prefetched by a "
+                // at WARN, as the context's closing C761 line: a run's log shows the switch at the default verbosity
+                LLAMA_LOG_WARN("%s: LLAMA_NGRAM_PREFETCH: the n-gram rows of a call's later micro-batches are prefetched by a "
                         "helper thread, at most %.1f MiB ahead\n", __func__, cap / 1024.0 / 1024.0);
             }
         } else if (pf_on && model.arch == LLM_ARCH_QWEN4EXP && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
@@ -3220,7 +3221,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // issued there and those the helper had issued (LLAMA_NGRAM_PREFETCH)
         std::string split;
         for (const auto & t : trace_inputs) {
-            split += format("%s%s:%lld", split.empty() ? "" : ",", t.name, (long long) t.us);
+            split += format("%s%s:%lld", split.empty() ? "" : ",", t.name.c_str(), (long long) t.us);
             if (t.n > 1) {
                 split += format("x%d", t.n);
             }
