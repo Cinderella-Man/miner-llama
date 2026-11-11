@@ -636,6 +636,404 @@ static void dmt_launch_type(const int nt, const int r, const dmt_args & p, const
     }
 }
 
+// K tiles (GGML_CUDA_MMVQ_PASCAL_DMT_KT, C728). At K = 6144 (L = 8 lanes per row, 3 iterations) four tokens' activations
+// staged whole take 28128 B (IQ4_XS) or 31296 B (Q4_K) of a block's 48 KB, which leaves 4 or 3 warps a block at R = 1
+// against 6 at K = 2560, and on a P106 four tokens then take 1.49 and 2.14 times one token's time against 1.14 to 1.24
+// at K = 2560 (R79): at 12 warps a SM the kernel is about at its load-store count, below that short of warps. This
+// kernel stages one iteration's activations at a time (a K tile: L super-block positions of every token), and the warps
+// of a block step through the tiles together:
+//   - A round: warp w of the block takes M warp row blocks, (c NW + w) M + m for the block's round c; for each tile
+//     t = 0, ..., niter - 1 the block stages tile t, then each warp adds iteration t of its M row blocks; after the last
+//     tile the warps add their lanes' sums and write their rows, and the block's next round starts at tile 0 again.
+//   - Each lane adds its super-blocks t L + sl in the order t = 0, 1, ... with dmt_superblock_*, the activations in the
+//     layout and with the values dmt_stage_act gives them, and the lanes' sums are added with the same xor shuffles: so
+//     each token's sums are the one-token kernel's, bit for bit, as above. The M row blocks' sums stay in registers,
+//     rotated after each step so that the step's code is there once.
+//   - The tile comes in with coalesced 128-bit loads into a raw buffer (each token's block_q8_1 run), then is converted
+//     into the tile, position fastest so that the 128-bit stores hit distinct banks; the next tile's loads are issued
+//     into registers before the current tile's products, so that their latency hides behind them. Two barriers a tile.
+//   - Shared memory at 4 tokens, K = 6144, 6 warps: 9376 B of tile, 9216 B raw and 26112 B of weight staging (IQ4_XS),
+//     10432 + 9216 + 27648 B (Q4_K): 2 blocks of 6 warps a SM, as at K = 2560.
+//   - The kernel takes only products the kernel above takes, at R = 1, so nothing outside this file changes.
+
+#define DMT_KT_NW_MAX 6 // warps per block, at most
+#define DMT_KT_EU     4 // 16-byte units of the raw tile a thread loads ahead, at most
+
+template <ggml_type type, int NT, int M, bool PF>
+__launch_bounds__(DMT_KT_NW_MAX*WARP_SIZE, 2)
+static __global__ void mul_mat_vec_q_pascal_dmt_kt(const dmt_args p, const int ngrp, const int raw_off, const int fault) {
+    constexpr int SB = dmt_traits<type>::SB;
+    constexpr int NU = (SB + 15) / 16;
+    constexpr int QW = dmt_q_words<NT>();
+    constexpr int DW = dmt_ds_words<type, NT>();
+    extern __shared__ uint4 dmt_sm[];
+    uint32_t * aq  = (uint32_t *) dmt_sm;           // the tile: L positions of int8 words, then their terms
+    float    * ads = (float *) dmt_sm + p.ds_off;
+    char     * raw = (char *) dmt_sm + raw_off;     // the tile's block_q8_1 run of each token
+
+    const int lane = threadIdx.x;
+    const int wid  = threadIdx.y;
+    const int nw   = blockDim.y;
+    const int tid  = wid * WARP_SIZE + lane;
+    const int nth  = nw * WARP_SIZE;
+
+    const int lpr_log2 = p.lpr_log2;
+    const int lpr      = 1 << lpr_log2;
+    const int sl       = lane & (lpr - 1);
+    const int grp      = lane >> lpr_log2;
+    const int gpw      = WARP_SIZE >> lpr_log2;
+    const int seg      = SB << lpr_log2;
+    const int tbytes   = 288 << lpr_log2;           // bytes of a token's raw tile: L x 8 blocks of 36 bytes
+    const int tunits   = 18 << lpr_log2;            // its 16-byte units
+    const int nru      = NT * tunits;
+    const int nel      = NT << (lpr_log2 + 3);      // activation blocks of a tile
+    char * smw = (char *) dmt_sm + p.stage_off + wid * p.wstage + grp * p.gstride;
+    const char * const sws[1] = { smw + sl * SB };
+
+    // the raw tile t of every token into registers (with GGML_CUDA_MMVQ_PASCAL_DMT_KT_FAULT=1 the next tile, a fault for
+    // the checks), and from there into shared memory
+    uint4 ru[DMT_KT_EU];
+    const auto load_raw = [&](const int t) {
+        const int ts = fault ? (t + 1 == p.niter ? 0 : t + 1) : t;
+#pragma unroll
+        for (int k = 0; k < DMT_KT_EU; ++k) {
+            const int u = tid + k * nth;
+            if (u < nru) {
+                const int j = u / tunits;
+                ru[k] = __ldg((const uint4 *) (p.vy + j * p.col_bytes_y + ts * tbytes) + (u - j * tunits));
+            }
+        }
+    };
+    const auto store_raw = [&]() {
+#pragma unroll
+        for (int k = 0; k < DMT_KT_EU; ++k) {
+            const int u = tid + k * nth;
+            if (u < nru) {
+                ((uint4 *) raw)[u] = ru[k];
+            }
+        }
+    };
+    // the raw tile into the tile, as dmt_stage_act stages each block (position sbl, sub-block s, token j)
+    const auto convert = [&]() {
+        for (int e = tid; e < nel; e += nth) {
+            const int sbl = e & (lpr - 1);
+            const int s   = (e >> lpr_log2) & 7;
+            const int j   = e >> (lpr_log2 + 3);
+            const uint32_t * src = (const uint32_t *) (raw + j * tbytes + ((sbl << 3) + s) * (int) sizeof(block_q8_1));
+            uint32_t w[9];
+#pragma unroll
+            for (int k = 0; k < 9; ++k) {
+                w[k] = src[k];
+            }
+            const float d8 = mmvqp_h2f_lo(w[0]);
+            uint32_t q[8];
+            if constexpr (type == GGML_TYPE_IQ4_XS) {
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    q[2*k + 0] = __byte_perm(w[1 + k], w[5 + k], 0x5140);
+                    q[2*k + 1] = __byte_perm(w[1 + k], w[5 + k], 0x7362);
+                }
+                ads[sbl * DW + s*NT + j] = d8;
+            } else {
+                int sum = 0;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    q[k] = w[1 + k];
+                    sum  = ggml_cuda_dp4a(0x01010101, (int) w[1 + k], sum);
+                }
+                *(float2 *) (ads + sbl * DW + (s*NT + j) * 2) = make_float2(d8, d8 * (float) sum);
+            }
+            uint4 * dq = (uint4 *) (aq + sbl * QW + (s*NT + j) * 8);
+            dq[0] = make_uint4(q[0], q[1], q[2], q[3]);
+            dq[1] = make_uint4(q[4], q[5], q[6], q[7]);
+        }
+    };
+
+    // the lane group's row in row block m of round c (clamped, so that the staging reads valid rows; their results are
+    // not written), and whether this lane has unit k of a segment (as above)
+    const auto row_ptr = [&](const int c, const int m) {
+        return p.vx + (int64_t) min(((c * nw + wid) * M + m) * gpw + grp, p.nrows - 1) * p.row_bytes;
+    };
+    const auto has_unit = [&](const int k) {
+        return k < NU - 1 || sl + (k << lpr_log2) < p.seg_units;
+    };
+
+    ggml_cuda_pdl_sync();
+
+    int c = blockIdx.x;
+    load_raw(0);
+    [[maybe_unused]] uint4 v[NU];
+    if constexpr (PF) {
+        const uint4 * src = (const uint4 *) row_ptr(c, 0);
+#pragma unroll
+        for (int k = 0; k < NU; ++k) {
+            if (has_unit(k)) {
+                v[k] = __ldg(src + sl + (k << lpr_log2));
+            }
+        }
+    }
+
+    float acc[M][NT];
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            acc[m][j] = 0.0f;
+        }
+    }
+
+    while (true) {
+        for (int t = 0; t < p.niter; ++t) {
+            // tile t: every warp is done with tile t - 1 when it stores its part of the raw tile
+            store_raw();
+            __syncthreads();
+            convert();
+            __syncthreads();
+            if (t + 1 < p.niter) {
+                load_raw(t + 1);
+            } else if (c + (int) gridDim.x < ngrp) {
+                load_raw(0);
+            }
+
+#pragma unroll 1
+            for (int m = 0; m < M; ++m) {
+                // the segment of row block m at iteration t into the warp's staging buffer
+                uint4 * dsm = (uint4 *) smw;
+                if constexpr (PF) {
+#pragma unroll
+                    for (int k = 0; k < NU; ++k) {
+                        if (has_unit(k)) {
+                            dsm[sl + (k << lpr_log2)] = v[k];
+                        }
+                    }
+                } else {
+                    const uint4 * src = (const uint4 *) (row_ptr(c, m) + t * seg);
+#pragma unroll
+                    for (int k = 0; k < NU; ++k) {
+                        if (has_unit(k)) {
+                            dsm[sl + (k << lpr_log2)] = __ldg(src + sl + (k << lpr_log2));
+                        }
+                    }
+                }
+                __syncwarp();
+
+                // the next segment: row block m + 1, else iteration t + 1, else the block's next round
+                if constexpr (PF) {
+                    int mn = m + 1;
+                    int tn = t;
+                    int cn = c;
+                    if (mn == M) {
+                        mn = 0;
+                        tn = t + 1;
+                        if (tn == p.niter) {
+                            tn = 0;
+                            cn = c + gridDim.x;
+                        }
+                    }
+                    if (cn < ngrp) {
+                        const uint4 * src = (const uint4 *) (row_ptr(cn, mn) + tn * seg);
+#pragma unroll
+                        for (int k = 0; k < NU; ++k) {
+                            if (has_unit(k)) {
+                                v[k] = __ldg(src + sl + (k << lpr_log2));
+                            }
+                        }
+                    }
+                }
+
+                // row block m's sums are acc[0]; after the step they go last, so that acc is in order after M steps
+                float a[1][NT];
+#pragma unroll
+                for (int j = 0; j < NT; ++j) {
+                    a[0][j] = acc[0][j];
+                }
+                if constexpr (type == GGML_TYPE_IQ4_XS) {
+                    dmt_superblock_iq4_xs<NT, 1>(sws, aq + sl * QW, ads + sl * DW, a);
+                } else {
+                    dmt_superblock_q4_K<NT, 1>(sws, aq + sl * QW, ads + sl * DW, a);
+                }
+#pragma unroll
+                for (int i = 0; i < M - 1; ++i) {
+#pragma unroll
+                    for (int j = 0; j < NT; ++j) {
+                        acc[i][j] = acc[i + 1][j];
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < NT; ++j) {
+                    acc[M - 1][j] = a[0][j];
+                }
+                __syncwarp();
+            }
+        }
+
+        // the round's rows: the lanes' sums added as above, written by the group's first lane
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+#pragma unroll
+                for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+                    if (off < lpr) {
+                        acc[m][j] += __shfl_xor_sync(0xFFFFFFFF, acc[m][j], off, WARP_SIZE);
+                    }
+                }
+            }
+            const int row = ((c * nw + wid) * M + m) * gpw + grp;
+            if (sl == 0 && row < p.nrows) {
+#pragma unroll
+                for (int j = 0; j < NT; ++j) {
+                    p.dst[j * p.stride_col_dst + row] = acc[m][j];
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                acc[m][j] = 0.0f;
+            }
+        }
+        c += gridDim.x;
+        if (c >= ngrp) {
+            break;
+        }
+    }
+}
+
+// GGML_CUDA_MMVQ_PASCAL_DMT_KT: 0 (default) off; 1 the K tiles where the whole activations leave the kernel above fewer
+// warps a block than the tiles do (at Flash-Next's widths: K = 6144 at 4 tokens, and Q4_K's at 3); 2 wherever the tiles
+// fit, for the checks. Only with GGML_CUDA_MMVQ_PASCAL_DMT on and at R = 1.
+static int dmt_kt_mode() {
+    static const int mode = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_KT", 0);
+    return mode;
+}
+
+// GGML_CUDA_MMVQ_PASCAL_DMT_KT_M: row blocks per warp and round, 1 (default) or 2 (half the tile staging per row, in
+// rounds twice as long)
+static int dmt_kt_m() {
+    static const int m = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_KT_M", 1) == 2 ? 2 : 1;
+    return m;
+}
+
+// Bytes of a tile: L positions of the int8 words, then of the terms, as dmt_act_bytes for L super-blocks
+static int dmt_kt_tile_bytes(const ggml_type type, const int nt, const int lpr_log2) {
+    return dmt_act_bytes(type, nt, 1 << lpr_log2);
+}
+
+// The warps per block of the K tiles for nt tokens and nsb super-blocks per row (R = 1) where they take the product, else
+// 0: GGML_CUDA_MMVQ_PASCAL_DMT_KT_NW (default and at most 6), fewer where the block's shared memory would pass 48 KB;
+// none where the threads can't load a tile ahead in DMT_KT_EU units each, or (with _KT=1) where the kernel above holds
+// as many warps (nw_full)
+static int dmt_kt_nw(const ggml_type type, const int nt, const int nsb, const int nw_full) {
+    static const int nw_env = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_KT_NW", DMT_KT_NW_MAX);
+    const int mode = dmt_kt_mode();
+    if (mode != 1 && mode != 2) {
+        return 0;
+    }
+    const int lpr_log2 = dmt_lpr_log2(nsb);
+    const int fixed    = dmt_kt_tile_bytes(type, nt, lpr_log2) + nt * (288 << lpr_log2);
+    const int ws       = dmt_wstage(type, 1, lpr_log2);
+    int nw = std::min(std::max(nw_env, 1), DMT_KT_NW_MAX);
+    while (nw > 0 && fixed + nw * ws > DMT_SMEM_MAX) {
+        nw--;
+    }
+    if (nw == 0 || nt * (18 << lpr_log2) > DMT_KT_EU * nw * WARP_SIZE) {
+        return 0;
+    }
+    return mode == 2 || nw > nw_full ? nw : 0;
+}
+
+template <ggml_type type, int NT, int M, bool PF>
+static int dmt_kt_blocks_regs(const int nw) {
+    // resident blocks per SM that the kernel's registers allow, per block size, queried once
+    static int cache[DMT_KT_NW_MAX + 1] = {};
+    if (cache[nw] == 0) {
+        int n = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, mul_mat_vec_q_pascal_dmt_kt<type, NT, M, PF>,
+                                                          nw * WARP_SIZE, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            n = 1;
+        }
+        cache[nw] = std::max(n, 1);
+    }
+    return cache[nw];
+}
+
+template <ggml_type type, int NT, int M, bool PF>
+static void dmt_kt_launch(const dmt_args & p, const int ngrp, const int raw_off, const int fault, const int nw,
+                          const int smem, cudaStream_t stream) {
+    // a persistent grid, as many blocks as the SMs hold at once by registers and shared memory, at most one per round
+    const int nsm  = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const int bps  = std::max(1, std::min(dmt_kt_blocks_regs<type, NT, M, PF>(nw), 96 * 1024 / smem));
+    const int nblk = std::min(ngrp, nsm * bps);
+    mul_mat_vec_q_pascal_dmt_kt<type, NT, M, PF><<<dim3(nblk, 1, 1), dim3(WARP_SIZE, nw, 1), smem, stream>>>(
+        p, ngrp, raw_off, fault);
+}
+
+template <ggml_type type, int M>
+static void dmt_kt_launch_nt(const int nt, const bool pf, const dmt_args & p, const int ngrp, const int raw_off,
+                             const int fault, const int nw, const int smem, cudaStream_t stream) {
+    switch (nt * 2 + (pf ? 1 : 0)) {
+        case 2*2 + 0: dmt_kt_launch<type, 2, M, false>(p, ngrp, raw_off, fault, nw, smem, stream); break;
+        case 2*2 + 1: dmt_kt_launch<type, 2, M, true >(p, ngrp, raw_off, fault, nw, smem, stream); break;
+        case 3*2 + 0: dmt_kt_launch<type, 3, M, false>(p, ngrp, raw_off, fault, nw, smem, stream); break;
+        case 3*2 + 1: dmt_kt_launch<type, 3, M, true >(p, ngrp, raw_off, fault, nw, smem, stream); break;
+        case 4*2 + 0: dmt_kt_launch<type, 4, M, false>(p, ngrp, raw_off, fault, nw, smem, stream); break;
+        default:      dmt_kt_launch<type, 4, M, true >(p, ngrp, raw_off, fault, nw, smem, stream); break;
+    }
+}
+
+// Launches the K tiles for a product the kernel above takes at R = 1 with nw_full warps a block, where
+// GGML_CUDA_MMVQ_PASCAL_DMT_KT says so; false (nothing launched) otherwise
+static bool dmt_kt(const ggml_type type, const void * vx, const void * vy, float * dst, const int nt, const int nsb,
+                   const int64_t nrows, const int64_t row_bytes, const int64_t col_bytes_y, const int64_t stride_col_dst,
+                   const int nw_full, cudaStream_t stream) {
+    static const int fault = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_KT_FAULT", 0) == 1 ? 1 : 0;
+    const int nw = dmt_kt_nw(type, nt, nsb, nw_full);
+    // the raw tiles are read with 16-byte loads
+    if (nw == 0 || (uintptr_t) vy % 16 != 0 || col_bytes_y % 16 != 0) {
+        return false;
+    }
+    const int m = dmt_kt_m();
+
+    dmt_args p;
+    p.vx             = (const char *) vx;
+    p.vy             = (const char *) vy;
+    p.dst            = dst;
+    p.nrows          = (int) nrows;
+    p.row_bytes      = (int) row_bytes;
+    p.nsb            = nsb;
+    p.lpr_log2       = dmt_lpr_log2(nsb);
+    p.niter          = nsb >> p.lpr_log2;
+    const int gpw    = WARP_SIZE >> p.lpr_log2; // rows per warp row block
+    p.nwrb           = (int) ((nrows + gpw - 1) / gpw);
+    p.seg_units      = (dmt_sb(type) << p.lpr_log2) / 16;
+    p.col_bytes_y    = (int) col_bytes_y;
+    p.stride_col_dst = (int) stride_col_dst;
+    p.ds_off         = (1 << p.lpr_log2) * (64 * nt + 4);
+    const int raw_off = dmt_kt_tile_bytes(type, nt, p.lpr_log2);
+    p.stage_off      = raw_off + nt * (288 << p.lpr_log2);
+    p.wstage         = dmt_wstage(type, 1, p.lpr_log2);
+    p.gstride        = dmt_gstride(dmt_sb(type), 1, p.lpr_log2);
+    const int smem   = p.stage_off + nw * p.wstage;
+    const int ngrp   = (p.nwrb + nw * m - 1) / (nw * m);
+    const bool pf    = dmt_pick_pf(type, nt, nsb, 1);
+
+    if (type == GGML_TYPE_IQ4_XS) {
+        if (m == 2) {
+            dmt_kt_launch_nt<GGML_TYPE_IQ4_XS, 2>(nt, pf, p, ngrp, raw_off, fault, nw, smem, stream);
+        } else {
+            dmt_kt_launch_nt<GGML_TYPE_IQ4_XS, 1>(nt, pf, p, ngrp, raw_off, fault, nw, smem, stream);
+        }
+    } else {
+        if (m == 2) {
+            dmt_kt_launch_nt<GGML_TYPE_Q4_K, 2>(nt, pf, p, ngrp, raw_off, fault, nw, smem, stream);
+        } else {
+            dmt_kt_launch_nt<GGML_TYPE_Q4_K, 1>(nt, pf, p, ngrp, raw_off, fault, nw, smem, stream);
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 } // namespace
 
 bool ggml_cuda_mmvq_pascal_dmt_takes(const ggml_type type, const int64_t K, const int64_t nrows, const int64_t ncols,
@@ -676,6 +1074,9 @@ bool ggml_cuda_mmvq_pascal_dmt(const ggml_type type, const void * vx, const void
     const int nsb = (int) (K / QK_K);
     const int r   = dmt_pick_r(type, nt, nsb);
     const int nw  = dmt_nw(type, nt, nsb, r);
+    if (r == 1 && dmt_kt(type, vx, vy, dst, nt, nsb, nrows, row_bytes, col_bytes_y, stride_col_dst, nw, stream)) {
+        return true;
+    }
 
     dmt_args p;
     p.vx             = (const char *) vx;

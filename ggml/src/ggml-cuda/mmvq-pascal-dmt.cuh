@@ -19,6 +19,11 @@
 // 1 to 3 at R = 2; fewer where the block's shared memory would pass 48 KB). GGML_CUDA_MMVQ_PASCAL_DMT_SKIP=q4_K: types
 // left to the k-column kernel. The kernels follow GGML_CUDA_MMVQ_PASCAL (0 off, 2 any NVIDIA GPU) and
 // GGML_CUDA_MMVQ_PASCAL_SKIP, as the one-token kernel does.
+// GGML_CUDA_MMVQ_PASCAL_DMT_KT (C728, with _DMT on, at R = 1): 0 (default) off; 1 the same products and sums with the
+// activations staged one K tile (one iteration of the lanes) at a time, which the block's warps step through together,
+// where staging them whole leaves fewer warps a block (at Flash-Next's widths K = 6144 at 4 tokens, Q4_K's also at 3);
+// 2 wherever the tiles fit. _KT_NW=n: warps per block at most (1 to 6); _KT_M=2: two row blocks per warp and round;
+// _KT_FAULT=1 stages the wrong tile (a fault for the checks).
 
 // Whether ggml_cuda_mmvq_pascal_dmt takes a product of ncols columns of a matrix of type with K weights per row, nrows
 // rows row_bytes apart from x, on the current device (the k-column kernels leave such products to it).
