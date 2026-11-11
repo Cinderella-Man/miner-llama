@@ -6630,7 +6630,9 @@ static ggml_cuda_profile_host_state * ggml_cuda_profile_host() {
         st->f = fopen(path, "w");
         GGML_ASSERT(st->f != nullptr);
         fprintf(st->f, "device,eval,host_enter_ms,host_exit_ms,gpu_us\n");
-        GGML_LOG_INFO("%s: timing every graph evaluation into %s\n", __func__, path);
+        // the steady clock's time of the file's 0 ms: LLAMA_STEP_TRACE's header gives its own on the same clock (C405)
+        GGML_LOG_INFO("%s: timing every graph evaluation into %s (its 0 ms is %.3f ms on the steady clock)\n", __func__,
+                path, std::chrono::duration<double, std::milli>(st->t0.time_since_epoch()).count());
         return st;
     }();
     return state;

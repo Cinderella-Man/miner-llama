@@ -43,6 +43,7 @@ set(LLAMA_CORE_SOURCES
     llama-pipe-drafter.cpp
     llama-quant.cpp
     llama-sampler.cpp
+    llama-step-trace.cpp
     llama-vocab.cpp
     unicode-data.cpp
     unicode.cpp
