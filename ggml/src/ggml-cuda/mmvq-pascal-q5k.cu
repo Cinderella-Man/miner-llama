@@ -14,10 +14,13 @@
 //     lanes per row (the largest power of two, at most 32, dividing the row's super-blocks), lane sl of a row's group
 //     taking super-blocks sl, sl + L, ... in that order, its 176-byte segment staged by the lane group into the warp's
 //     shared memory with 128-bit loads, and the lanes' sums added with the same xor shuffles. So every token's result is
-//     the one-token kernel's, bit for bit. A lane group owns R = 2 (default) or 1 consecutive rows; the rows of a group
+//     the one-token kernel's, bit for bit. A lane group owns R = 1 (default) or 2 consecutive rows; the rows of a group
 //     share every load of the activations, and R changes no row's sum. At R = 1 a lane issues the k-column kernel's 96
 //     shared loads of activations per super-block at 4 tokens (2 x 128 + 64 bits per sub-block and token), est. 320 of
-//     the 452 load-store clocks of a warp's iteration on a P106; R = 2 halves them per row.
+//     the 452 load-store clocks of a warp's iteration on a P106; R = 2 halves them per row. Measured on a P106 (R75),
+//     R = 1 is the faster all the same, at every token count (the output layer's four tokens 3,340.78 and 3,346.73 us
+//     at R = 1, 5,423.64 and 5,429.28 at R = 2, both without the prefetch), so it is the default since C766 (C690 chose
+//     R = 2).
 //   - Each 32-weight sub-block of a row is decoded once into eight words of 5-bit codes and multiplied with dp4a by
 //     every token's activations. The earlier multi-token kernel decodes it once per token (mul_mat_vec_q_pascal_mc).
 //   - The floating-point steps are mmvqp_dot_q5_K's: per sub-block s and token, sumd = fmaf(d8, (float) (isum * sc), sumd)
@@ -33,8 +36,10 @@
 //     its block sums serve many rows: K = 2560 at 4 tokens is 13 KB beside 34.5 KB of weight staging at R = 2 (3 warps)
 //     and 33 KB at R = 1 (6 warps). The k-column kernel stages each block's activation records again for every 64
 //     rows, in tiles.
-//   - By default each warp loads its next segments into registers before it computes the current ones (11 128-bit loads
-//     per lane and row in flight during the 64 x 4 dp4a of a super-block).
+//   - With GGML_CUDA_MMVQ_PASCAL_Q5K_MT_PF=1 each warp loads its next segments into registers before it computes the
+//     current ones (11 128-bit loads per lane and row in flight during the 64 x 4 dp4a of a super-block). C690 made it
+//     the default; on a P106 it costs time at R = 1 (four tokens 3,401.63 and 3,412.48 us with it, 3,340.78 and
+//     3,346.73 without, R75), so since C766 it is off unless asked for.
 
 #define Q5KMT_NW_MAX   6                    // warps per block at R = 1, at most (3 at R = 2)
 #define Q5KMT_MAX_COLS 4
@@ -363,10 +368,17 @@ static int q5kmt_mode() {
     return mode;
 }
 
-// GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R: rows per lane group, 2 (default) or 1
+// GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R: rows per lane group, 1 (default since C766) or 2
 static int q5kmt_r() {
-    static const int r = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R", 2) == 1 ? 1 : 2;
+    static const int r = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R", 1) == 2 ? 2 : 1;
     return r;
+}
+
+// GGML_CUDA_MMVQ_PASCAL_Q5K_MT_PF=1: the register prefetch of each warp's next segments (off by default since C766);
+// GGML_CUDA_MMVQ_PASCAL_Q5K_MT=2 keeps it off, as it did when the prefetch was the default
+static bool q5kmt_pf() {
+    static const bool pf = q5kmt_mode() != 2 && q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_MT_PF", 0) == 1;
+    return pf;
 }
 
 // log2 of the lanes per row: the largest power of two, at most 32, that divides the row's super-blocks (as
@@ -477,7 +489,7 @@ bool ggml_cuda_mmvq_pascal_q5k_mt(const void * vx, const void * vy, float * dst,
     const int nblk = (int) std::min<int64_t>((p.nwrb + nw - 1) / nw, (int64_t) nsm * bps);
     const dim3 grid(nblk, 1, 1);
     const dim3 block(WARP_SIZE, nw, 1);
-    const bool pf = q5kmt_mode() != 2;
+    const bool pf = q5kmt_pf();
 
     switch (nt * 4 + r) {
         case 2*4 + 1: q5kmt_launch<2, 1>(p, grid, block, smem, pf, stream); break;
