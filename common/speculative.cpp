@@ -2027,6 +2027,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // the draft's hidden rows kept on its layer's card between a step's passes (LLAMA_DRAFT_H_CARRY, Q961)
     bool h_carry_on = false;
+
+    // a sequence stops drafting at its slot's cap (LLAMA_MTP_DRAFT_CAP, C744), and the passes it leaves out of a step
+    bool                 cap_on = false;
+    std::vector<int32_t> n_stop; // [n_seq] the draft length a sequence stops at in this step
+    uint64_t             cap_n_saved = 0;
+    uint64_t             cap_n_rounds = 0;
+
     // target h rows on the device (llama_set_embeddings_nextn_dev): the catch-up in process() reads row k - 1 of the last
     // target decode in place, and row n_batch_tgt + seq_id for the first token of seq_id, uploaded from pending_h
     // pending_h stays on the host: process() and accept() fetch it before the next target decode overwrites the rows
@@ -2152,6 +2159,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         short_init();
         embd_cache_init();
         h_carry_init();
+        cap_init();
     }
 
     static bool overlap_wanted() {
@@ -2176,6 +2184,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         h_carry_on = true;
         SPC_INF("%s", "draft hidden rows: a step's drafting passes keep them on the device\n");
+    }
+
+    // LLAMA_MTP_DRAFT_CAP=1: a sequence stops drafting at min(n_max, its slot's cap) instead of n_max, so that at a reply's
+    // or the context's end no pass drafts a token common_speculative_draft cuts. Only where the passes left out change
+    // nothing else: a greedy draft (its sampler is reset at every draft; a probabilistic one carries its random state to
+    // the next step) whose cap keeps n_min (the length check sees the same answer)
+    void cap_init() {
+        n_stop.assign(n_seq, this->params.n_max);
+        const char * s = getenv("LLAMA_MTP_DRAFT_CAP");
+        if (s == nullptr || atoi(s) == 0) {
+            return;
+        }
+        cap_on = true;
+        SPC_INF("%s", "draft length: a greedy draft stops at its slot's cap\n");
+    }
+
+    void cap_report() const {
+        SPC_INF("draft length cap: %" PRIu64 " drafting passes left out in %" PRIu64 " drafts\n", cap_n_saved, cap_n_rounds);
     }
 
     // LLAMA_DRAFT_EMBD_CACHE=<rows>[,<max tokens>]: batches of up to max tokens (default 16: the draft passes and the
@@ -2290,6 +2316,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         if (overlap) {
             SPC_INF("LLAMA_MTP_CATCHUP_OVERLAP: %" PRIu64 " catch-ups ran after the next call was queued\n", n_deferred);
+        }
+        if (cap_on) {
+            cap_report();
         }
 
         auto * ctx_dft = this->params.ctx_dft;
@@ -2558,6 +2587,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
 
+        // C744: the drafting passes the slots' caps leave out at most (a p_min cut may stop a sequence before)
+        int64_t n_cap = 0;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
 
@@ -2582,6 +2614,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_reset(smpls[seq_id].get());
             }
 
+            // C744: the slot's cap, where leaving out the passes beyond it changes nothing else (cap_init)
+            n_stop[seq_id] = params.n_max;
+            if (cap_on && !dp.result_q && dp.n_max > 0 && dp.n_max >= params.n_min && dp.n_max < params.n_max) {
+                n_stop[seq_id] = dp.n_max;
+                n_cap += params.n_max - dp.n_max;
+            }
+
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
 
@@ -2594,6 +2633,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (embd_cache_on && n_drafting > 0 && ++embd_cache_n_rounds % 1000 == 0) {
             embd_cache_report();
+        }
+
+        if (n_cap > 0) {
+            cap_n_saved += (uint64_t) n_cap;
+            cap_n_rounds++;
+            llama_step_trace_count("cap", n_cap);
         }
 
         // the shortlisted head, unless a drafting sequence falls back: its target token (id_last) was outside the list
@@ -2695,7 +2740,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                if (n_stop[seq_id] <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
