@@ -17,6 +17,8 @@ foreach(dir src common tools ggml/src)
     endforeach()
 endforeach()
 list(TRANSFORM names REPLACE "\"" "")
+# prefixes such as "LLAMA_ARG_" are not names
+list(FILTER names EXCLUDE REGEX "_$")
 list(REMOVE_DUPLICATES names)
 list(SORT names)
 list(LENGTH names n)
