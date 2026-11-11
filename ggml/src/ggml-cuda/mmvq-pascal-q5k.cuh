@@ -2,12 +2,12 @@
 
 #include "common.cuh"
 
-// Plain Q5_K products of 2 to 4 tokens (MUL_MAT, no fusion) on compute capability 6.1 that read and decode each weight
+// Plain Q5_K products of 2 to 8 tokens (MUL_MAT, no fusion) on compute capability 6.1 that read and decode each weight
 // once for all tokens and give every token, bit for bit, the sums of the one-token Pascal kernel (mul_mat_vec_q_pascal,
 // mmvq-pascal.cu), for the output layer of a speculative-decoding verify: Qwen3.8-Flash-Next's 2560 x 248,320 head on
 // the last card, whose four-token product took 2.82 times its one-token time on the k-column kernel (Q1222, C690). The
 // design is at the top of mmvq-pascal-q5k.cu. Optionally one-token products too (C767), where at the head's shape two
-// tokens on this kernel took 0.85 of one token on the one-token kernel (R75).
+// tokens on this kernel took 0.85 of one token on the one-token kernel (R75). 5 to 8 tokens: GGML_CUDA_MMVQ_PASCAL_RO8.
 //
 // GGML_CUDA_MMVQ_PASCAL_Q5K_MT: 0 (default) off, the k-column and the earlier multi-token kernels as before; 1 on,
 // at one row per lane group without the register prefetch (since C766: on a P106 the fastest at 2 to 4 tokens, R75);

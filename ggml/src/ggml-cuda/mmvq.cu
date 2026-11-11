@@ -1751,14 +1751,15 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    // 2 to 4 tokens of a plain Q5_K product with GGML_CUDA_MMVQ_PASCAL_Q5K_MT (the output layer of a verify), one with
-    // _Q5K_1R: each weight decoded once for all tokens, each token's sums those of the one-token kernel
+    // 2 to 4 tokens of a plain Q5_K product with GGML_CUDA_MMVQ_PASCAL_Q5K_MT (the output layer of a verify), 5 to 8 with
+    // _RO8, one with _Q5K_1R: each weight decoded once for all tokens, each token's sums those of the one-token kernel
     if (!ids && !fusion && src0->type == GGML_TYPE_Q5_K && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmvq_pascal_q5k_mt(src0->data, src1_q8, dst_d, ne00, ne01, ne11, nb01, s11, s1, stream)) {
         return;
     }
-    // ... and of a plain IQ4_XS or Q4_K product with GGML_CUDA_MMVQ_PASCAL_DMT (the attention and recurrent projections
-    // of a verify), the same way, and of a Q6_K product with GGML_CUDA_MMVQ_PASCAL_Q6K_MT (C727)
+    // ... and of a plain IQ4_XS or Q4_K product with GGML_CUDA_MMVQ_PASCAL_DMT (5 to 8 with _RO8: the attention and
+    // recurrent projections of a verify and of the draft line's five-token passes), the same way, and of a Q6_K
+    // product with GGML_CUDA_MMVQ_PASCAL_Q6K_MT (C727)
     if (!ids && !fusion && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmvq_pascal_dmt(src0->type, src0->data, src1_q8, dst_d, ne00, ne01, ne11, nb01, s11, s1, stream)) {
         return;

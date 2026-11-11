@@ -58,9 +58,15 @@
 //     the lane groups' segments are padded so that those reads hit distinct banks. At 4 tokens and K = 6144 the
 //     activations take 33.6 KB, beside 2 warps at R = 1. A product of one warp a block is left to the k-column kernel,
 //     as C726's kernel leaves it (R79: one warp a block lost to the k-column kernel on a P106), unless _DMT_NW=1.
+//   - 5 to 8 tokens (GGML_CUDA_MMVQ_PASCAL_RO8, C729): the same kernel at NT = 5 to 8 and R = 1 only, so a token's sums
+//     are still the one-token kernel's. Its activations take about NT / 4 times the 4-token staging: at K = 2560 and 8
+//     tokens 20.6 KB of int8 words and 2.6 KB (IQ4_XS) or 5.2 KB (Q4_K) of terms, beside 5 warps' weight staging; K = 6144
+//     fits only 5 tokens (IQ4_XS 6), at 1 to 3 warps, and wider rows fewer (dmt_nw), the rest left to the k-column kernel.
+//     IQ4_XS and Q4_K only: Q6_K's products of 5 to 8 tokens stay with the k-column kernel (dmt_nt_mode; C795, Q1390).
 
 #define DMT_NW_MAX   6                    // warps per block at R = 1, at most (3 at R = 2)
-#define DMT_MAX_COLS 4
+#define DMT_MAX_COLS 4                    // tokens with GGML_CUDA_MMVQ_PASCAL_DMT and _Q6K_MT
+#define DMT_RO8_COLS 8                    // tokens with GGML_CUDA_MMVQ_PASCAL_RO8 (from 5)
 #define DMT_NU_MAX   14                   // 16-byte units of a super-block, rounded up (Q6_K 13.1, Q4_K 9, IQ4_XS 8.5)
 #define DMT_SMEM_MAX (48 * 1024)
 
@@ -660,6 +666,28 @@ static bool dmt_q6k_fault() {
     return fault;
 }
 
+// GGML_CUDA_MMVQ_PASCAL_RO8: 5 to 8 tokens (C729), 1 with the register prefetch, 2 without it
+static int dmt_ro8() {
+    static const int mode = dmt_env("GGML_CUDA_MMVQ_PASCAL_RO8", 0);
+    return mode;
+}
+
+// GGML_CUDA_MMVQ_PASCAL_RO8_FAULT=1: every token of the 5-8-token products takes the first token's activations (a check
+// that must fail)
+static bool dmt_ro8_fault() {
+    static const bool fault = dmt_env("GGML_CUDA_MMVQ_PASCAL_RO8_FAULT", 0) == 1;
+    return fault;
+}
+
+// the switch of type's products of nt tokens: 2 to 4 tokens dmt_type_mode's (_DMT, _Q6K_MT); 5 to 8
+// GGML_CUDA_MMVQ_PASCAL_RO8 for IQ4_XS and Q4_K, none for Q6_K (its kernels at 5 to 8 tokens are C795's)
+static int dmt_nt_mode(const ggml_type type, const int nt) {
+    if (nt <= DMT_MAX_COLS) {
+        return dmt_type_mode(type);
+    }
+    return type == GGML_TYPE_Q6_K ? 0 : dmt_ro8();
+}
+
 // GGML_CUDA_MMVQ_PASCAL_DMT_R: rows per lane group, 1 (default since C758) or 2; 0 chooses per product as C722 did
 // (dmt_pick_r); any other value 1
 static int dmt_r_env() {
@@ -761,8 +789,11 @@ static int dmt_nw(const ggml_type type, const int nt, const int nsb, const int r
 // least as many rows as R = 1's (it then halves the activation loads per row: 3 warps at K = 2560, 4 tokens), else 1
 // (Q4_K at K = 6144: 3 warps of one row per lane group against 1 of two). On a P106 R = 1 is the faster wherever the rule
 // takes 2 (R79: the four-token IQ4_XS attn_qkv, 10240 x 2560, 146.31 and 147.45 us at R = 1, 240.21 and 237.59 by the
-// rule), so since C758 it is the default.
+// rule), so since C758 it is the default. 5 to 8 tokens run at R = 1 only.
 static int dmt_pick_r(const ggml_type type, const int nt, const int nsb) {
+    if (nt > DMT_MAX_COLS) {
+        return 1;
+    }
     const int r = dmt_r_env();
     if (r > 0) {
         return r;
@@ -778,10 +809,11 @@ static int dmt_pick_r(const ggml_type type, const int nt, const int nsb) {
 // 180.89 against 135.00 and 136.04; at 3 and 4 tokens, at K = 6144 and at R = 2 it is faster, at Q4_K's 2 tokens at
 // K = 2560 within the spread). So since C758; GGML_CUDA_MMVQ_PASCAL_DMT_PF=1 keeps it there too, as C722 did. Q6_K's
 // products: with GGML_CUDA_MMVQ_PASCAL_Q6K_MT=1 at R = 1 (at R = 2 the two rows' prefetched segments pass the registers:
-// 255 and 24 bytes of stack at 4 tokens), =2 never.
+// 255 and 24 bytes of stack at 4 tokens), =2 never. At 5 to 8 tokens GGML_CUDA_MMVQ_PASCAL_RO8 says: 1 with it, 2
+// without.
 static bool dmt_pick_pf(const ggml_type type, const int nt, const int nsb, const int r) {
     static const bool pf_all = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_PF", 0) == 1;
-    if (dmt_type_mode(type) == 2) {
+    if (dmt_nt_mode(type, nt) == 2) {
         return false;
     }
     if (type == GGML_TYPE_Q6_K) {
@@ -793,7 +825,11 @@ static bool dmt_pick_pf(const ggml_type type, const int nt, const int nsb, const
 template <ggml_type type, int NT, int R>
 static void dmt_launch(const dmt_args & p, const dim3 grid, const dim3 block, const int smem, const bool pf,
                        cudaStream_t stream) {
-    if constexpr (type == GGML_TYPE_Q6_K && R == 2) {
+    if constexpr (type == GGML_TYPE_Q6_K && NT > DMT_MAX_COLS) {
+        // Q6_K's products of 5 to 8 tokens never come here (dmt_nt_mode), so their kernels aren't compiled (C795)
+        GGML_UNUSED_VARS(p, grid, block, smem, pf, stream);
+        GGML_ABORT("Q6_K products of more than %d tokens", DMT_MAX_COLS);
+    } else if constexpr (type == GGML_TYPE_Q6_K && R == 2) {
         GGML_UNUSED(pf); // dmt_pick_pf: never
         mul_mat_vec_q_pascal_dmt<type, NT, R, false><<<grid, block, smem, stream>>>(p);
     } else if (pf) {
@@ -812,6 +848,10 @@ static void dmt_launch_type(const int nt, const int r, const dmt_args & p, const
         case 4*4 + 1: dmt_launch<type, 4, 1>(p, grid, block, smem, pf, stream); break;
         case 2*4 + 2: dmt_launch<type, 2, 2>(p, grid, block, smem, pf, stream); break;
         case 3*4 + 2: dmt_launch<type, 3, 2>(p, grid, block, smem, pf, stream); break;
+        case 5*4 + 1: dmt_launch<type, 5, 1>(p, grid, block, smem, pf, stream); break;
+        case 6*4 + 1: dmt_launch<type, 6, 1>(p, grid, block, smem, pf, stream); break;
+        case 7*4 + 1: dmt_launch<type, 7, 1>(p, grid, block, smem, pf, stream); break;
+        case 8*4 + 1: dmt_launch<type, 8, 1>(p, grid, block, smem, pf, stream); break;
         default:      dmt_launch<type, 4, 2>(p, grid, block, smem, pf, stream); break;
     }
 }
@@ -1224,7 +1264,7 @@ static bool dmt_kt(const ggml_type type, const void * vx, const void * vy, float
 
 bool ggml_cuda_mmvq_pascal_dmt_takes(const ggml_type type, const int64_t K, const int64_t nrows, const int64_t ncols,
                                      const int64_t row_bytes, const void * x) {
-    if (dmt_type_mode(type) == 0 || ncols < 2 || ncols > DMT_MAX_COLS ||
+    if (ncols < 2 || ncols > DMT_RO8_COLS || dmt_nt_mode(type, (int) ncols) == 0 ||
             (type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q6_K)) {
         return false;
     }
@@ -1281,6 +1321,9 @@ bool ggml_cuda_mmvq_pascal_dmt(const ggml_type type, const void * vx, const void
     p.nwrb           = (int) ((nrows + rpw - 1) / rpw);
     p.seg_units      = (dmt_sb(type) << p.lpr_log2) / 16;
     p.col_bytes_y    = type == GGML_TYPE_Q6_K && dmt_q6k_fault() ? 0 : (int) col_bytes_y; // the fault: token 0's, for all
+    if (nt > DMT_MAX_COLS && dmt_ro8_fault()) {
+        p.col_bytes_y = 0; // the fault: every token stages the first token's activations
+    }
     p.stride_col_dst = (int) stride_col_dst;
     p.ds_off         = nsb * (64 * nt + 4);
     const int act    = dmt_act_bytes(type, nt, nsb);

@@ -222,13 +222,13 @@ bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tens
             dst->nb[1] / sizeof(float) > INT_MAX) {
         return false;
     }
-    // GGML_CUDA_MMVQ_PASCAL_Q5K_MT (_Q5K_1R): Q5_K's products of 2 to 4 columns (1) go to mmvq-pascal-q5k.cu (each
-    // token's sums those of the one-token kernel)
+    // GGML_CUDA_MMVQ_PASCAL_Q5K_MT (_Q5K_1R, _RO8): Q5_K's products of 2 to 4 columns (1, 5 to 8) go to
+    // mmvq-pascal-q5k.cu (each token's sums those of the one-token kernel)
     if (src0->type == GGML_TYPE_Q5_K && ggml_cuda_mmvq_pascal_q5k_mt_takes(K, nrows, ncols, src0->nb[1], src0->data)) {
         return false;
     }
-    // GGML_CUDA_MMVQ_PASCAL_DMT: IQ4_XS's and Q4_K's products of 2 to 4 columns go to mmvq-pascal-dmt.cu (the same), and
-    // with GGML_CUDA_MMVQ_PASCAL_Q6K_MT Q6_K's (C727)
+    // GGML_CUDA_MMVQ_PASCAL_DMT (_RO8): IQ4_XS's and Q4_K's products of 2 to 4 (5 to 8) columns go to mmvq-pascal-dmt.cu
+    // (the same), and with GGML_CUDA_MMVQ_PASCAL_Q6K_MT Q6_K's of 2 to 4 (C727)
     if (ggml_cuda_mmvq_pascal_dmt_takes(src0->type, K, nrows, ncols, src0->nb[1], src0->data)) {
         return false;
     }

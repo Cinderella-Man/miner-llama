@@ -46,9 +46,14 @@
 //     where the one-token kernel loads 288 bytes of block_q8_1 per lane and super-block from global memory and forms
 //     their 8 block sums with 64 dp4a in every warp; and the conversions skip I2F. At the output layer's shape on a
 //     P106, two tokens on this kernel took 2,575.94 and 2,574.12 us, one token on the one-token kernel 3,023.54 (R75).
+//   - 5 to 8 tokens (GGML_CUDA_MMVQ_PASCAL_RO8, C729): the same code at NT = 5 to 8 and R = 1 only, so every token's
+//     sums are still the one-token kernel's. At K = 2560 and 8 tokens the activations take 25.8 KB, beside 4 warps'
+//     weight staging (5 at 5 and 6 tokens); K = 6144 fits only 5 tokens, at 1 warp, the rest left to the k-column
+//     kernel.
 
 #define Q5KMT_NW_MAX   6                    // warps per block at R = 1, at most (3 at R = 2)
-#define Q5KMT_MAX_COLS 4
+#define Q5KMT_MAX_COLS 4                    // tokens with GGML_CUDA_MMVQ_PASCAL_Q5K_MT
+#define Q5KMT_RO8_COLS 8                    // tokens with GGML_CUDA_MMVQ_PASCAL_RO8 (from 5)
 #define Q5KMT_SB       176                  // bytes of a super-block (block_q5_K)
 #define Q5KMT_NU       (Q5KMT_SB / 16)      // its 16-byte units
 #define Q5KMT_SMEM_MAX (48 * 1024)
@@ -374,17 +379,31 @@ static int q5kmt_mode() {
     return mode;
 }
 
-// GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R: rows per lane group, 1 (default since C766) or 2
-static int q5kmt_r() {
+// GGML_CUDA_MMVQ_PASCAL_RO8: 5 to 8 tokens (C729), 1 with the prefetch where _Q5K_MT_PF=1 asks for it, 2 without it
+static int q5kmt_ro8() {
+    static const int mode = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_RO8", 0);
+    return mode;
+}
+
+// GGML_CUDA_MMVQ_PASCAL_RO8_FAULT=1: every token of the 5-8-token products takes the first token's activations (a check
+// that must fail)
+static bool q5kmt_ro8_fault() {
+    static const bool fault = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_RO8_FAULT", 0) == 1;
+    return fault;
+}
+
+// GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R: rows per lane group, 1 (default since C766) or 2; 5 to 8 tokens run at 1 only
+static int q5kmt_r(const int nt) {
     static const int r = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_MT_R", 1) == 2 ? 2 : 1;
-    return r;
+    return nt > Q5KMT_MAX_COLS ? 1 : r;
 }
 
 // GGML_CUDA_MMVQ_PASCAL_Q5K_MT_PF=1: the register prefetch of each warp's next segments (off by default since C766);
-// GGML_CUDA_MMVQ_PASCAL_Q5K_MT=2 keeps it off, as it did when the prefetch was the default
-static bool q5kmt_pf() {
-    static const bool pf = q5kmt_mode() != 2 && q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_MT_PF", 0) == 1;
-    return pf;
+// GGML_CUDA_MMVQ_PASCAL_Q5K_MT=2 keeps it off, as it did when the prefetch was the default, and at 5 to 8 tokens
+// GGML_CUDA_MMVQ_PASCAL_RO8=2
+static bool q5kmt_pf(const int nt) {
+    static const bool pf = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_MT_PF", 0) == 1;
+    return pf && (nt > Q5KMT_MAX_COLS ? q5kmt_ro8() : q5kmt_mode()) != 2;
 }
 
 // GGML_CUDA_MMVQ_PASCAL_Q5K_1R=1: one-token products too (C767), those of at least GGML_CUDA_MMVQ_PASCAL_Q5K_1R_ROWS
@@ -428,7 +447,7 @@ static int q5kmt_wstage(const int r, const int lpr_log2) {
 // 6 at R = 1, 3 at R = 2), fewer where the shared memory would pass 48 KB; 0 if not even one warp fits.
 static int q5kmt_nw(const int nt, const int nsb) {
     static const int nw_env = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_MT_NW", Q5KMT_NW_MAX);
-    const int r   = q5kmt_r();
+    const int r   = q5kmt_r(nt);
     int       nw  = std::min(std::max(nw_env, 1), Q5KMT_NW_MAX / r);
     const int act = q5kmt_act_bytes(nt, nsb);
     const int ws  = q5kmt_wstage(r, q5kmt_lpr_log2(nsb));
@@ -452,7 +471,8 @@ static void q5kmt_launch(const q5kmt_args & p, const dim3 grid, const dim3 block
 
 bool ggml_cuda_mmvq_pascal_q5k_mt_takes(const int64_t K, const int64_t nrows, const int64_t ncols, const int64_t row_bytes,
                                         const void * x) {
-    if (ncols < 1 || ncols > Q5KMT_MAX_COLS || (ncols == 1 ? !q5kmt_one_row(nrows) : q5kmt_mode() == 0)) {
+    if (ncols < 1 || ncols > Q5KMT_RO8_COLS ||
+            (ncols == 1 ? !q5kmt_one_row(nrows) : (ncols <= Q5KMT_MAX_COLS ? q5kmt_mode() : q5kmt_ro8()) == 0)) {
         return false;
     }
     if (!ggml_cuda_mmvq_pascal_active(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ||
@@ -480,7 +500,7 @@ bool ggml_cuda_mmvq_pascal_q5k_mt(const void * vx, const void * vy, float * dst,
 
     const int nt  = (int) ncols;
     const int nsb = (int) (K / QK_K);
-    const int r   = q5kmt_r();
+    const int r   = q5kmt_r(nt);
     const int nw  = q5kmt_nw(nt, nsb);
 
     q5kmt_args p;
@@ -498,6 +518,9 @@ bool ggml_cuda_mmvq_pascal_q5k_mt(const void * vx, const void * vy, float * dst,
         p.niter--; // the fault: every row's last L super-blocks left out
     }
     p.col_bytes_y    = (int) col_bytes_y;
+    if (nt > Q5KMT_MAX_COLS && q5kmt_ro8_fault()) {
+        p.col_bytes_y = 0; // the fault: every token stages the first token's activations
+    }
     p.stride_col_dst = (int) stride_col_dst;
     p.ds_off         = nsb * (64 * nt + 4);
     const int act    = q5kmt_act_bytes(nt, nsb);
@@ -513,7 +536,7 @@ bool ggml_cuda_mmvq_pascal_q5k_mt(const void * vx, const void * vy, float * dst,
     const int nblk = (int) std::min<int64_t>((p.nwrb + nw - 1) / nw, (int64_t) nsm * bps);
     const dim3 grid(nblk, 1, 1);
     const dim3 block(WARP_SIZE, nw, 1);
-    const bool pf = q5kmt_pf();
+    const bool pf = q5kmt_pf(nt);
 
     switch (nt * 4 + r) {
         case 1*4 + 1: q5kmt_launch<1, 1>(p, grid, block, smem, pf, stream); break;
@@ -523,6 +546,10 @@ bool ggml_cuda_mmvq_pascal_q5k_mt(const void * vx, const void * vy, float * dst,
         case 4*4 + 1: q5kmt_launch<4, 1>(p, grid, block, smem, pf, stream); break;
         case 2*4 + 2: q5kmt_launch<2, 2>(p, grid, block, smem, pf, stream); break;
         case 3*4 + 2: q5kmt_launch<3, 2>(p, grid, block, smem, pf, stream); break;
+        case 5*4 + 1: q5kmt_launch<5, 1>(p, grid, block, smem, pf, stream); break;
+        case 6*4 + 1: q5kmt_launch<6, 1>(p, grid, block, smem, pf, stream); break;
+        case 7*4 + 1: q5kmt_launch<7, 1>(p, grid, block, smem, pf, stream); break;
+        case 8*4 + 1: q5kmt_launch<8, 1>(p, grid, block, smem, pf, stream); break;
         default:      q5kmt_launch<4, 2>(p, grid, block, smem, pf, stream); break;
     }
     CUDA_CHECK(cudaGetLastError());
