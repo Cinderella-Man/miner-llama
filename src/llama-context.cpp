@@ -19,6 +19,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-ngram-prefetch.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama-step-trace.h"
@@ -510,6 +511,35 @@ llama_context::llama_context(
     // LLAMA_MTP_H_DEV (C693): where the h_nextn rows that an MTP draft reads go, see h_nextn_dev_mode
     if (const char * LLAMA_MTP_H_DEV = getenv("LLAMA_MTP_H_DEV")) {
         h_nextn_dev_mode = atoi(LLAMA_MTP_H_DEV);
+    }
+
+    // C761: LLAMA_NGRAM_PREFETCH=1 prefetches the n-gram rows of a call's later micro-batches from a helper thread, at most
+    // LLAMA_NGRAM_PREFETCH_MB (default 48) MiB ahead of set_input; with LLAMA_UBATCH_TRACE or LLAMA_NGRAM_PREFETCH_STATS=1
+    // every call's rows are counted, the switch off too. Only qwen4exp's n-gram input of a mapped (lazy) table reads it;
+    // read when the context is made
+    {
+        const char * LLAMA_NGRAM_PREFETCH       = getenv("LLAMA_NGRAM_PREFETCH");
+        const char * LLAMA_NGRAM_PREFETCH_MB    = getenv("LLAMA_NGRAM_PREFETCH_MB");
+        const char * LLAMA_NGRAM_PREFETCH_STATS = getenv("LLAMA_NGRAM_PREFETCH_STATS");
+        const bool pf_on    = LLAMA_NGRAM_PREFETCH ? atoi(LLAMA_NGRAM_PREFETCH) != 0 : false;
+        const bool pf_stats = (LLAMA_NGRAM_PREFETCH_STATS && atoi(LLAMA_NGRAM_PREFETCH_STATS) != 0) || llama_ubatch_trace() > 0;
+        const double pf_mb  = LLAMA_NGRAM_PREFETCH_MB ? atof(LLAMA_NGRAM_PREFETCH_MB) : 48.0;
+        const ggml_tensor * table = model.per_layer_tok_embd;
+        // (with M-RoPE the batch's first n_tokens positions are the temporal ones, which the n-gram input reads)
+        const bool pf_model = model.arch == LLM_ARCH_QWEN4EXP && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && table != nullptr &&
+            model.can_prefetch.count(table) > 0 && hparams.ple_n_heads > 0 && hparams.ple_ngram_size >= 2;
+        if ((pf_on || pf_stats) && pf_model) {
+            const uint64_t cap = (uint64_t) (std::max(0.0, pf_mb) * 1024.0 * 1024.0);
+            ngram_pf = std::make_unique<llama_ngram_prefetch>(hparams, table, pf_on, cap, pf_stats);
+            if (pf_on) {
+                // at WARN, as the context's closing C761 line: a run's log shows the switch at the default verbosity
+                LLAMA_LOG_WARN("%s: LLAMA_NGRAM_PREFETCH: the n-gram rows of a call's later micro-batches are prefetched by a "
+                        "helper thread, at most %.1f MiB ahead\n", __func__, cap / 1024.0 / 1024.0);
+            }
+        } else if (pf_on && model.arch == LLM_ARCH_QWEN4EXP && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            LLAMA_LOG_WARN("%s: LLAMA_NGRAM_PREFETCH is set, but the model has no mapped n-gram table (--lazy-mode): "
+                    "nothing to prefetch\n", __func__);
+        }
     }
 
     // screened output head: LLAMA_SCREEN_HEAD=1 enables it for models with an output_screen tensor,
@@ -3157,10 +3187,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_synchronize(sched.get());
         }
 
+        // LLAMA_UBATCH_TRACE: each input type's time (C761) and the n-gram input's own prefetch [TAG_UBATCH_TRACE]
+        if (trace && ngram_pf) {
+            ngram_pf->last_inline_us   = -1;
+            ngram_pf->last_rows_inline = 0;
+            ngram_pf->last_rows_helper = 0;
+        }
+
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         if (vprep_mode == 0) {
-            res->set_inputs(&ubatch);
+            res->set_inputs(&ubatch, trace ? &trace_inputs : nullptr);
         } else {
+            // (C773: a prepared call's inputs are not timed by type)
+            trace_inputs.clear();
             // C738: preparing sets the inputs that need no token id, submitting the others
             res->set_inputs_part(&ubatch, vprep_mode == 1);
         }
@@ -3193,14 +3232,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const int64_t t_dev0 = ggml_backend_sched_get_trace_t_dev0(sched_res());
         const int64_t t_end  = ggml_time_us();
         const bool    prep   = vprep_mode == 2;
+        // C761: inputs_by = each input type's time in set_input (<type>:<us>, xN for N inputs of the type), in the order
+        // they are set; ngram = the n-gram input's own prefetch call (us; -1 if the input did not run) and the rows it
+        // issued there and those the helper had issued (LLAMA_NGRAM_PREFETCH)
+        std::string split;
+        for (const auto & t : trace_inputs) {
+            split += format("%s%s:%lld", split.empty() ? "" : ",", t.name.c_str(), (long long) t.us);
+            if (t.n > 1) {
+                split += format("x%d", t.n);
+            }
+        }
+        if (ngram_pf) {
+            split += format(" ngram = %lld/%llu/%llu", (long long) ngram_pf->last_inline_us,
+                    (unsigned long long) ngram_pf->last_rows_inline, (unsigned long long) ngram_pf->last_rows_helper);
+        }
         LLAMA_LOG_WARN("ubatch-trace: %s n_tokens = %u n_seqs = %u n_outputs = %u graph = %s%s%s pre = %lld build = %lld "
-                "alloc = %lld inputs = %lld submit = %lld card0 = %lld total = %lld us\n",
+                "alloc = %lld inputs = %lld submit = %lld card0 = %lld total = %lld us inputs_by = %s\n",
                 gtype == LLM_GRAPH_TYPE_DECODER_MTP ? "mtp" : gtype == LLM_GRAPH_TYPE_ENCODER ? "enc" : "dec",
                 ubatch.n_tokens, ubatch.n_seqs, n_outputs, prep ? "prepared" : tt.why ? "rebuilt" : "reused",
                 !prep && tt.why ? " why = " : "", !prep && tt.why ? tt.why : "", (long long) (tt.pre - tt.t0),
                 (long long) (tt.build - tt.pre), (long long) (tt.alloc - tt.build), (long long) (t_trace_inputs - tt.alloc),
                 (long long) (t_end - t_trace_inputs), (long long) (t_dev0 ? t_dev0 - tt.t0 : -1),
-                (long long) (t_end - tt.t0));
+                (long long) (t_end - tt.t0), split.c_str());
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -4703,6 +4756,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return 0;
     }
 
+    // C761 (LLAMA_NGRAM_PREFETCH): the micro-batches are known now; the helper prefetches the n-gram rows of the call's
+    // later micro-batches once the first one's are issued. C773: a call being prepared (C738) is planned when it is
+    // submitted, with its token ids
+    if (ngram_pf && vprep_mode != 1) {
+        ngram_pf_begin(n_tokens_all, mctx->get_ubatch().n_tokens);
+    }
+
     const int64_t t_trace_wait = t_trace0 ? ggml_time_us() : 0;
 
     // reserve output buffer (C738: a prepared call did)
@@ -5043,6 +5103,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    // C761: the call's n-gram rows are all issued (the counts' line with LLAMA_UBATCH_TRACE)
+    if (ngram_pf) {
+        ngram_pf->end_call();
+    }
 
     if (layer_inp_dev && ev_layer_inp_written) {
         ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
@@ -5646,6 +5711,32 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+void llama_context::ngram_pf_begin(uint32_t n_tokens_all, uint32_t n_first) {
+    const llama_batch & b = balloc->get_batch();
+
+    // the n_gram - 1 tokens before the call, oldest first, as the n-gram input's get_prev_tokens reads them from the
+    // attention cells (the nearest cell at or before each position); empty: the call is not planned
+    std::vector<llama_token> hist;
+    if (ngram_pf->on() && b.token != nullptr && b.pos != nullptr && b.seq_id != nullptr && b.n_tokens > 0) {
+        const auto * hyb = dynamic_cast<const llama_memory_hybrid *>(memory.get());
+        const llama_kv_cache * kv = hyb ? hyb->get_mem_attn() : nullptr;
+        const llama_seq_id s = b.seq_id[0][0];
+        if (kv != nullptr && s >= 0 && (uint32_t) s < kv->get_n_seq_max()) {
+            const int64_t n_prev = (int64_t) model.hparams.ple_ngram_size - 1;
+            const auto & cells = kv->get_cells(s);
+            hist.assign(n_prev, LLAMA_TOKEN_NULL);
+            for (int64_t d = n_prev; d >= 1; --d) {
+                const llama_pos p = b.pos[0] - (llama_pos) d;
+                if (p >= 0) {
+                    hist[n_prev - d] = cells.seq_pos_tok_le(s, p);
+                }
+            }
+        }
+    }
+
+    ngram_pf->begin_call(b, n_tokens_all, n_first, hist);
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -5675,6 +5766,7 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.h_nextn_row0  =*/ &h_nextn_row0,
+        /*.ngram_pf      =*/ ngram_pf.get(),
     };
 }
 
@@ -7879,6 +7971,32 @@ void llama_memory_seq_rm_stats(const llama_memory_t mem, uint64_t out[5]) {
     for (const auto * kv : kvs) {
         kv->seq_rm_stats(out);
     }
+}
+
+bool llama_ngram_prefetch_stats(const llama_context * ctx, bool * on, uint64_t * cap, uint64_t * page, uint64_t * calls_planned,
+                                uint64_t * rows_helper, uint64_t * rows_inline, uint64_t * rows_mismatch, uint64_t * window_max,
+                                std::vector<std::array<uint64_t, 11>> * calls) {
+    const llama_ngram_prefetch * pf = ctx->get_ngram_pf();
+    if (pf == nullptr) {
+        return false;
+    }
+    const llama_ngram_prefetch_info st = pf->info();
+    if (on)            { *on            = st.on;            }
+    if (cap)           { *cap           = st.cap;           }
+    if (page)          { *page          = st.page;          }
+    if (calls_planned) { *calls_planned = st.calls_planned; }
+    if (rows_helper)   { *rows_helper   = st.rows_helper;   }
+    if (rows_inline)   { *rows_inline   = st.rows_inline;   }
+    if (rows_mismatch) { *rows_mismatch = st.rows_mismatch; }
+    if (window_max)    { *window_max    = st.window_max;    }
+    if (calls) {
+        calls->clear();
+        for (const auto & c : pf->calls()) {
+            calls->push_back({ c.n_tokens, c.n_ubatch, c.planned ? 1u : 0u, c.rows, c.rows_helper, c.rows_inline,
+                    c.rows_mismatch, c.pages, c.madv_bytes, c.digest, c.window_max });
+        }
+    }
+    return true;
 }
 
 void llama_set_nextn_carry(llama_context * ctx, bool in, bool out) {

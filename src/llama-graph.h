@@ -38,6 +38,7 @@ class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
+class llama_ngram_prefetch;
 
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
@@ -965,6 +966,10 @@ struct llm_graph_params {
     // the first row of h_nextn_dev this decode writes, read when the inputs are set (C703); nullptr for row 0
     const int64_t * h_nextn_row0 = nullptr;
 
+    // LLAMA_NGRAM_PREFETCH (C761): the context's n-gram row prefetch, which the n-gram input issues its rows through;
+    // nullptr when the context has none
+    llama_ngram_prefetch * ngram_pf = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1093,7 +1098,14 @@ public:
 
     void reset();
 
-    void set_inputs(const llama_ubatch * ubatch);
+    // times: LLAMA_UBATCH_TRACE's split of the inputs (C761): each input type's time in set_input, by type name in the
+    // order of the first input of each type, and how many inputs of that type
+    struct input_time {
+        std::string name; // the class name without llm_graph_input_ (a nested class: its own name)
+        int64_t     us;
+        int32_t     n;
+    };
+    void set_inputs(const llama_ubatch * ubatch, std::vector<input_time> * times = nullptr);
     // C738: set_inputs in two parts, each input once: the inputs that need no token id (sets_without_tokens), then the
     // others, each part in the inputs' order
     void set_inputs_part(const llama_ubatch * ubatch, bool without_tokens);
@@ -1269,6 +1281,7 @@ struct llm_graph_context {
     ggml_tensor * h_nextn_dev;
     ggml_tensor * h_nextn_src;
     const int64_t * h_nextn_row0;
+    llama_ngram_prefetch * ngram_pf; // C761
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

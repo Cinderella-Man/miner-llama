@@ -183,6 +183,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
+    LOG("  --ngram-prefetch         Check that LLAMA_NGRAM_PREFETCH changes only when the n-gram rows are read (CPU only)\n");
     LOG("  --mtp-kv-only            Check that LLAMA_MTP_KV_ONLY leaves the MTP draft's caches and drafts as they are (CPU only)\n");
     LOG("  --mtp-catchup-overlap    Check that LLAMA_MTP_CATCHUP_OVERLAP leaves the MTP draft's caches and drafts as they are (CPU only)\n");
     LOG("  --kv-seq-rm              Check that LLAMA_KV_SEQ_RM_BOUND leaves every memory as it is over random sequence edits (CPU only)\n");
@@ -2422,6 +2423,284 @@ static int test_mtp_kv_only(const std::string & arch_filter, const size_t seed, 
     return n_failed == 0 ? 0 : 1;
 }
 
+// LLAMA_NGRAM_PREFETCH (C761): the archs whose n-gram input issues its table rows through llama_ngram_prefetch
+static bool ngram_prefetch_arch(const llm_arch arch) {
+    return arch == LLM_ARCH_QWEN4EXP;
+}
+
+static void ngram_prefetch_setenv(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
+struct ngram_prefetch_arm {
+    const char * name;
+    const char * on; // LLAMA_NGRAM_PREFETCH, nullptr: unset
+    const char * mb; // LLAMA_NGRAM_PREFETCH_MB, nullptr: the default
+};
+
+struct ngram_prefetch_run {
+    std::vector<float> logits;
+    bool     stats         = false;
+    bool     on            = false;
+    uint64_t cap           = 0;
+    uint64_t page          = 0;
+    uint64_t planned       = 0;
+    uint64_t rows_helper   = 0;
+    uint64_t rows_inline   = 0;
+    uint64_t rows_mismatch = 0;
+    uint64_t window_max    = 0;
+    std::vector<std::array<uint64_t, 11>> calls;
+};
+
+// the model file loaded with its n-gram table mapped (--lazy-mode on) and the decode calls of a server: a one-token
+// warm-up (removed), a 120-token prompt and a 70-token continuation in micro-batches of 16, three one-token steps, a
+// 40-token call, then a second sequence's 50-token prompt; every token's logits
+static ngram_prefetch_run ngram_prefetch_sequence(const std::string & path, const ngram_prefetch_arm & arm,
+        const std::vector<llama_token> & tokens) {
+    // read once, when the context is made
+    ngram_prefetch_setenv("LLAMA_NGRAM_PREFETCH",       arm.on);
+    ngram_prefetch_setenv("LLAMA_NGRAM_PREFETCH_MB",    arm.mb);
+    ngram_prefetch_setenv("LLAMA_NGRAM_PREFETCH_STATS", "1");
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t no_devs[1] = { nullptr };
+    model_params.devices   = no_devs;
+    model_params.load_mode = LLAMA_LOAD_MODE_MMAP;
+    model_params.lazy_mode = LLAMA_LAZY_MODE_ON;
+    llama_model_ptr model(llama_model_load_from_file(path.c_str(), model_params));
+    if (!model) {
+        throw std::runtime_error("failed to load " + path);
+    }
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx           = 512;
+    ctx_params.n_batch         = 128;
+    ctx_params.n_ubatch        = 16;
+    ctx_params.n_seq_max       = 2;
+    ctx_params.kv_unified      = true;
+    ctx_params.n_threads       = 4;
+    ctx_params.n_threads_batch = 4;
+    llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+    ngram_prefetch_setenv("LLAMA_NGRAM_PREFETCH",       nullptr);
+    ngram_prefetch_setenv("LLAMA_NGRAM_PREFETCH_MB",    nullptr);
+    ngram_prefetch_setenv("LLAMA_NGRAM_PREFETCH_STATS", nullptr);
+    if (!lctx) {
+        throw std::runtime_error("failed to create the context");
+    }
+    llama_context * ctx = lctx.get();
+    llama_memory_t  mem = llama_get_memory(ctx);
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+
+    ngram_prefetch_run run;
+    common_batch batch(ctx);
+    // tokens[t0, t0 + n) at positions p0, p0 + 1, ... of sequence s, every logit kept
+    auto decode = [&](size_t t0, uint32_t n, llama_pos p0, llama_seq_id s, bool keep) {
+        batch.clear();
+        for (uint32_t i = 0; i < n; i++) {
+            batch.add(tokens[t0 + i], p0 + (llama_pos) i, s, true);
+        }
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            throw std::runtime_error("failed to decode");
+        }
+        if (keep) {
+            for (uint32_t i = 0; i < n; i++) {
+                const float * logits_ith = llama_get_logits_ith(ctx, i);
+                run.logits.insert(run.logits.end(), logits_ith, logits_ith + n_vocab);
+            }
+        }
+    };
+
+    decode(0, 1, 0, 1, false);                 // the warm-up: the n-gram input is seen from here on
+    llama_memory_seq_rm(mem, 1, -1, -1);
+    decode(1,   120,   0, 0, true);            // positions 0..119, 8 micro-batches
+    decode(121,  70, 120, 0, true);            // 120..189, 5 micro-batches
+    decode(191,   1, 190, 0, true);            // three steps
+    decode(192,   1, 191, 0, true);
+    decode(193,   1, 192, 0, true);
+    decode(194,  40, 193, 0, true);            // 193..232, 3 micro-batches
+    decode(234,  50,   0, 1, true);            // a second sequence, 4 micro-batches
+
+    run.stats = llama_ngram_prefetch_stats(ctx, &run.on, &run.cap, &run.page, &run.planned, &run.rows_helper,
+            &run.rows_inline, &run.rows_mismatch, &run.window_max, &run.calls);
+    return run;
+}
+
+static int test_ngram_prefetch(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    // off: the inline path, counted; on: the default cap; small: 64 KiB (a few tokens' rows of the test table);
+    // zero: no room at all, so set_input issues every row
+    const ngram_prefetch_arm arms[] = {
+        { "on",    "1", nullptr  },
+        { "small", "1", "0.0625" },
+        { "zero",  "1", "0"      },
+    };
+    const ngram_prefetch_arm arm_off = { "off", nullptr, nullptr };
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    common_log_flush(common_log_main());
+    LOG("|%10s|%6s|%6s|%9s|%5s|%7s|%15s|%13s|%13s|%11s|%9s|%19s|%s\n", "Model arch.", "Type", "Arm", "Logits", "Calls",
+            "Planned", "Rows off/on", "Helper rows", "Inline rows", "Pages", "Digests", "Window max/cap", "Status");
+
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !ngram_prefetch_arch(arch)) {
+            continue;
+        }
+        for (bool moe : {false, true}) {
+            if (moe && !moe_implemented(arch)) {
+                continue;
+            }
+            if (!moe && moe_mandatory(arch)) {
+                continue;
+            }
+
+            // the model written to a file, so that its n-gram table can be mapped
+            const std::string path = get_tmp_gguf_path();
+            ngram_prefetch_run off;
+            std::vector<llama_token> tokens;
+            try {
+                gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+                {
+                    llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+                    llama_model_save_to_file(model.get(), path.c_str());
+                    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+                    tokens = get_tokens(284, n_vocab, seed);
+                }
+                off = ngram_prefetch_sequence(path, arm_off, tokens);
+            } catch (const std::exception & err) {
+                LOG("|%10s|%6s|%6s|\033[1;31mERROR\033[0m (%s)\n", llama_arch_name(arch), moe ? "MoE" : "Dense", "off", err.what());
+                n_tests++;
+                n_failed++;
+                std::filesystem::remove(path);
+                continue;
+            }
+            for (size_t c = 0; c < off.calls.size(); ++c) {
+                const auto & r = off.calls[c];
+                LOG("ngram-call|%s|%s|off|%zu|%" PRIu64 "|%" PRIu64 "|%" PRIu64 "|%" PRIu64 "|%" PRIu64 "|%" PRIu64 "|%" PRIu64
+                        "|%" PRIu64 "|%" PRIu64 "|%016" PRIx64 "|%" PRIu64 "\n", llama_arch_name(arch), moe ? "MoE" : "Dense", c,
+                        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10]);
+            }
+
+            for (const ngram_prefetch_arm & arm : arms) {
+                n_tests++;
+                LOG("|%10s|%6s|%6s|", llama_arch_name(arch), moe ? "MoE" : "Dense", arm.name);
+                std::string status;
+                ngram_prefetch_run on;
+                try {
+                    on = ngram_prefetch_sequence(path, arm, tokens);
+
+                    const bool same_logits = !off.logits.empty() && off.logits.size() == on.logits.size() &&
+                        memcmp(off.logits.data(), on.logits.data(), off.logits.size()*sizeof(float)) == 0;
+
+                    // per call: the same rows (count and digest) and pages as the inline path, no helper row that differed
+                    // from set_input's, the helper's rows and set_input's adding up, and the window within the cap
+                    bool same_calls = off.stats && on.stats && !off.on && on.on && off.calls.size() == on.calls.size() &&
+                        !off.calls.empty();
+                    bool cap_ok = on.window_max <= on.cap;
+                    uint64_t rows_off = 0, rows_on = 0, pages_off = 0, pages_on = 0, n_dig = 0;
+                    for (size_t c = 0; same_calls && c < off.calls.size(); ++c) {
+                        const auto & a = off.calls[c];
+                        const auto & b = on.calls[c];
+                        same_calls = a[0] == b[0] && a[1] == b[1] && a[3] == b[3] && a[7] == b[7] && a[9] == b[9] &&
+                            b[6] == 0 && b[3] == b[4] + b[5] && a[4] == 0;
+                        cap_ok = cap_ok && b[10] <= on.cap;
+                        rows_off += a[3]; rows_on += b[3]; pages_off += a[7]; pages_on += b[7]; n_dig += a[9] == b[9];
+                    }
+                    // the default cap takes some rows off set_input; no room at all takes none
+                    const bool helper_ok = strcmp(arm.name, "zero") == 0 ? on.rows_helper == 0 : on.rows_helper > 0;
+                    // the planned calls: the four calls of several micro-batches
+                    const bool planned_ok = on.planned == 4;
+
+                    char rows_str[32], help_str[32], inl_str[32], pages_str[32], dig_str[32], win_str[32];
+                    snprintf(rows_str,  sizeof(rows_str),  "%" PRIu64 "/%" PRIu64, rows_off, rows_on);
+                    snprintf(help_str,  sizeof(help_str),  "%" PRIu64, on.rows_helper);
+                    snprintf(inl_str,   sizeof(inl_str),   "%" PRIu64, on.rows_inline);
+                    snprintf(pages_str, sizeof(pages_str), "%" PRIu64 "/%" PRIu64, pages_off, pages_on);
+                    snprintf(dig_str,   sizeof(dig_str),   "%" PRIu64 "/%zu", n_dig, off.calls.size());
+                    snprintf(win_str,   sizeof(win_str),   "%" PRIu64 "/%" PRIu64, on.window_max, on.cap);
+                    LOG("%9s|%5zu|%7" PRIu64 "|%15s|%13s|%13s|%11s|%9s|%19s|", same_logits ? "identical" : "DIFFERENT",
+                            on.calls.size(), on.planned, rows_str, help_str, inl_str, pages_str, dig_str, win_str);
+
+                    if (same_logits && same_calls && cap_ok && helper_ok && planned_ok && on.rows_mismatch == 0) {
+                        status = "\033[1;32mOK\033[0m";
+                    } else {
+                        n_failed++;
+                        status = "\033[1;31mFAIL\033[0m";
+                        if (!same_calls) {
+                            status += " (a call's rows, pages or digest differ from the inline path's)";
+                        }
+                        if (!cap_ok) {
+                            status += " (the helper read past the cap)";
+                        }
+                        if (!helper_ok) {
+                            status += " (the helper's share is not as the cap allows)";
+                        }
+                        if (!planned_ok) {
+                            status += " (not the four planned calls)";
+                        }
+                    }
+                } catch (const std::exception & err) {
+                    n_failed++;
+                    status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
+                }
+                LOG("%s\n", status.c_str());
+                // each call's counts: index, n_tokens, micro-batches, planned, rows, helper, inline, mismatch, pages,
+                // madvise bytes, digest, window max
+                for (size_t c = 0; c < on.calls.size(); ++c) {
+                    const auto & r = on.calls[c];
+                    LOG("ngram-call|%s|%s|%s|%zu|%" PRIu64 "|%" PRIu64 "|%" PRIu64 "|%" PRIu64 "|%" PRIu64 "|%" PRIu64
+                            "|%" PRIu64 "|%" PRIu64 "|%" PRIu64 "|%016" PRIx64 "|%" PRIu64 "\n", llama_arch_name(arch),
+                            moe ? "MoE" : "Dense", arm.name, c, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9],
+                            r[10]);
+                }
+            }
+            std::filesystem::remove(path);
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 // LLAMA_MTP_CATCHUP_OVERLAP (C703): the draft-mtp driver with the target, in the server's order, with the switch off and on
 struct mtp_overlap_config {
     const char * name;
@@ -4572,6 +4851,7 @@ int main(int argc, char ** argv) {
     bool mtp_catchup_overlap = false;
     bool kv_seq_rm = false;
     bool kv_seq_rm_time = false;
+    bool ngram_prefetch = false;
     bool mtp_graph_keep = false;
     bool verify_prepare = false;
     bool mtp_h_dev = false;
@@ -4663,6 +4943,8 @@ int main(int argc, char ** argv) {
             mtp_h_dev = true;
         } else if (strcmp(argv[i], "--mtp-incall-overlap") == 0) {
             mtp_incall_overlap = true;
+        } else if (strcmp(argv[i], "--ngram-prefetch") == 0) {
+            ngram_prefetch = true;
         } else if (strcmp(argv[i], "--mtp") == 0) {
             save_mtp = true;
         } else if (strcmp(argv[i], "--mtp-draft") == 0) {
@@ -4714,6 +4996,9 @@ int main(int argc, char ** argv) {
         }
         if (kv_seq_rm_time) {
             return test_kv_seq_rm_time(arch_filter, seed, stdev, verbosity);
+        }
+        if (ngram_prefetch) {
+            return test_ngram_prefetch(arch_filter, seed, stdev, verbosity);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {
