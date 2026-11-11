@@ -228,7 +228,7 @@ struct common_speculative_draft_params {
     // C738 (LLAMA_VERIFY_PREPARE): when set, draft-mtp calls it once per draft() after it has queued its last drafting
     // pass and before it waits for that pass, if the pass will add exactly one token to result (no p_min cut can stop
     // it): result then holds every other token of the draft. The caller may do host work meanwhile, on other contexts
-    std::function<void()> last_pass;
+    std::function<void()> last_pass = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
