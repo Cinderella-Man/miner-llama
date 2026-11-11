@@ -183,6 +183,7 @@ static void usage(char ** argv) {
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
     LOG("  --mtp-kv-only            Check that LLAMA_MTP_KV_ONLY leaves the MTP draft's caches and drafts as they are (CPU only)\n");
     LOG("  --mtp-catchup-overlap    Check that LLAMA_MTP_CATCHUP_OVERLAP leaves the MTP draft's caches and drafts as they are (CPU only)\n");
+    LOG("  --mtp-h-dev              Check that LLAMA_MTP_H_DEV's host and device rows give the MTP draft the same caches and drafts (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -2366,6 +2367,7 @@ struct mtp_overlap_run {
     std::vector<llama_token> drafts;       // each step's draft, its length first
     std::vector<float>       probs;        // the drafter's probability of each drafted token
     int                      n_pending = 0; // prompt calls whose catch-up waited for the next call
+    bool                     dev_rows  = false; // the target's h rows were in its device buffer (C693)
 };
 
 // set or (with nullptr) unset an environment variable for the next context or driver
@@ -2384,11 +2386,14 @@ static void test_setenv(const char * name, const char * value) {
 // a prompt of 100 tokens in four calls (32, 32, 32 and 4, the last one with an output), a checkpoint's draft part and
 // the cut of the memory past the batch's start as the server takes them between calls, three draft steps (each: the
 // draft, its region removed from the draft's memory, the verify batch through the target and the driver, an accepted
-// count of 0, 1, then all), a second turn of 45 tokens in two calls (32, 13) and a last draft step
+// count of 0, 1, then all), a second turn of 45 tokens in two calls (32, 13) and a last draft step; h_dev is the value
+// of LLAMA_MTP_H_DEV (C693) for the contexts, nullptr unsets it
 static mtp_overlap_run mtp_overlap_sequence(
-        llama_model * model, const std::vector<llama_token> & tokens, const mtp_overlap_config & cfg, const bool overlap) {
+        llama_model * model, const std::vector<llama_token> & tokens, const mtp_overlap_config & cfg, const bool overlap,
+        const char * h_dev = nullptr) {
     test_setenv("LLAMA_MTP_KV_ONLY", cfg.kv_only ? "1" : nullptr);
     test_setenv("LLAMA_MTP_CATCHUP_OVERLAP", overlap ? "1" : nullptr);
+    test_setenv("LLAMA_MTP_H_DEV", h_dev);
 
     auto ctx_params_for = [&](const bool mtp) {
         llama_context_params p = llama_context_default_params();
@@ -2409,6 +2414,7 @@ static mtp_overlap_run mtp_overlap_sequence(
     llama_context_ptr lctx_tgt(llama_init_from_model(model, ctx_params_for(false)));
     llama_context_ptr lctx_dft(llama_init_from_model(model, ctx_params_for(true)));
     test_setenv("LLAMA_MTP_KV_ONLY", nullptr);
+    test_setenv("LLAMA_MTP_H_DEV", nullptr);
     if (!lctx_tgt || !lctx_dft) {
         test_setenv("LLAMA_MTP_CATCHUP_OVERLAP", nullptr);
         throw std::runtime_error("failed to create the target or the MTP context");
@@ -2562,6 +2568,12 @@ static mtp_overlap_run mtp_overlap_sequence(
     run.state_end = state_dft();
     common_speculative_get_state(spec.get(), 0, run.spec_end);
 
+    // the rows can be read back only from the device buffer (the driver turns it off when it is freed)
+    {
+        std::vector<float> row(llama_model_n_embd_out(model));
+        run.dev_rows = llama_get_embeddings_nextn_rows(ctx_tgt, 0, 1, row.data());
+    }
+
     spec.reset();
     return run;
 }
@@ -2690,6 +2702,158 @@ static int test_mtp_catchup_overlap(const std::string & arch_filter, const size_
     return n_failed == 0 ? 0 : 1;
 }
 
+// LLAMA_MTP_H_DEV (C693): C703's draft-mtp sequence with the target's h rows on the host (0) as the reference, against
+// the default, the device buffer (2, which the CPU takes without events) and both with LLAMA_MTP_CATCHUP_OVERLAP; every
+// run must give the reference's caches, drafts and probabilities, with the rows where its arm puts them
+static int test_mtp_h_dev(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    const mtp_overlap_config configs[] = {
+        { "f16 fa",         GGML_TYPE_F16,  true,  false, true  },
+        { "f16",            GGML_TYPE_F16,  false, false, true  },
+        { "q8_0 fa",        GGML_TYPE_Q8_0, true,  false, true  },
+        { "f16 fa kv-only", GGML_TYPE_F16,  true,  true,  true  },
+        { "f16 fa host",    GGML_TYPE_F16,  true,  false, false },
+    };
+
+    struct h_dev_arm {
+        const char * name;
+        const char * h_dev;     // LLAMA_MTP_H_DEV, nullptr: unset
+        bool         overlap;   // LLAMA_MTP_CATCHUP_OVERLAP=1
+        bool         dev_rows;  // expected: the rows in the target's device buffer
+        int          n_pending; // expected: prompt calls whose catch-up waited
+    };
+    const h_dev_arm ref = { "host", "0", false, false, 0 };
+    const h_dev_arm arms[] = {
+        { "default",  nullptr, false, false, 0 }, // the CPU has no events: the host rows, as before C693
+        { "dev",      "2",     false, true,  0 },
+        { "ovl",      nullptr, true,  true,  4 }, // C703's two halves
+        { "host+ovl", "0",     true,  false, 0 }, // the overlap needs the device rows: off
+        { "dev+ovl",  "2",     true,  true,  4 },
+    };
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    common_log_flush(common_log_main());
+    LOG("|%10s|%15s|", "Model arch.", "Config");
+    for (const h_dev_arm & arm : arms) {
+        LOG("%11s|", arm.name);
+    }
+    LOG("%16s|%13s|%s\n", "Device rows", "Waited", "Status");
+
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !mtp_kv_only_arch(arch)) {
+            continue;
+        }
+        const bool moe = moe_mandatory(arch) || moe_implemented(arch);
+
+        gguf_context_ptr gguf_ctx = get_gguf_ctx_mtp(arch, moe);
+
+        llama_model_ptr model;
+        try {
+            model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, nullptr, /*load_mtp*/ true);
+        } catch (const std::exception & err) {
+            LOG("|%10s|%15s|\033[1;31mERROR\033[0m (model load: %s)\n", llama_arch_name(arch), "", err.what());
+            n_tests++;
+            n_failed++;
+            continue;
+        }
+
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const std::vector<llama_token> tokens = get_tokens(160, n_vocab, seed);
+
+        for (const mtp_overlap_config & cfg : configs) {
+            n_tests++;
+            LOG("|%10s|%15s|", llama_arch_name(arch), cfg.name);
+            std::string status;
+            try {
+                // the driver's own log lines stay out of the table
+                struct log_pause {
+                    log_pause()  { common_log_pause(common_log_main()); }
+                    ~log_pause() { common_log_resume(common_log_main()); }
+                };
+                mtp_overlap_run base;
+                std::vector<mtp_overlap_run> runs;
+                {
+                    log_pause pause;
+                    base = mtp_overlap_sequence(model.get(), tokens, cfg, ref.overlap, ref.h_dev);
+                    for (const h_dev_arm & arm : arms) {
+                        runs.push_back(mtp_overlap_sequence(model.get(), tokens, cfg, arm.overlap, arm.h_dev));
+                    }
+                }
+
+                auto same = [](const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) {
+                    return !a.empty() && a == b;
+                };
+                bool all_same = true;
+                bool where_ok = base.dev_rows == ref.dev_rows && base.n_pending == ref.n_pending;
+                std::string rows_str    = base.dev_rows ? "d" : "h";
+                std::string waited_str  = std::to_string(base.n_pending);
+                for (size_t a = 0; a < runs.size(); ++a) {
+                    const mtp_overlap_run & r = runs[a];
+                    const bool identical =
+                        same(base.state_ckpt, r.state_ckpt) && same(base.spec_ckpt, r.spec_ckpt) &&
+                        same(base.state_prompt, r.state_prompt) && same(base.spec_prompt, r.spec_prompt) &&
+                        same(base.state_end, r.state_end) && same(base.spec_end, r.spec_end) &&
+                        !base.drafts.empty() && base.drafts == r.drafts && base.probs.size() == r.probs.size() &&
+                        memcmp(base.probs.data(), r.probs.data(), base.probs.size()*sizeof(float)) == 0;
+                    LOG("%11s|", identical ? "identical" : "DIFFERENT");
+                    all_same = all_same && identical;
+                    where_ok = where_ok && r.dev_rows == arms[a].dev_rows && r.n_pending == arms[a].n_pending;
+                    rows_str   += std::string(" ") + (r.dev_rows ? "d" : "h");
+                    waited_str += " " + std::to_string(r.n_pending);
+                }
+                LOG("%16s|%13s|", rows_str.c_str(), waited_str.c_str());
+
+                if (all_same && where_ok) {
+                    status = "\033[1;32mOK\033[0m";
+                } else {
+                    n_failed++;
+                    status = "\033[1;31mFAIL\033[0m";
+                    if (!where_ok) {
+                        status += " (the rows or the waits are not where the arms put them)";
+                    }
+                }
+            } catch (const std::exception & err) {
+                n_failed++;
+                status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
+            }
+            LOG("%s\n", status.c_str());
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -2706,6 +2870,7 @@ int main(int argc, char ** argv) {
     bool kv_shift = false;
     bool mtp_kv_only = false;
     bool mtp_catchup_overlap = false;
+    bool mtp_h_dev = false;
     bool save_mtp = false;
 
     int verbosity = LOG_LEVEL_ERROR;
@@ -2780,6 +2945,8 @@ int main(int argc, char ** argv) {
             mtp_kv_only = true;
         } else if (strcmp(argv[i], "--mtp-catchup-overlap") == 0) {
             mtp_catchup_overlap = true;
+        } else if (strcmp(argv[i], "--mtp-h-dev") == 0) {
+            mtp_h_dev = true;
         } else if (strcmp(argv[i], "--mtp") == 0) {
             save_mtp = true;
         } else {
@@ -2808,6 +2975,9 @@ int main(int argc, char ** argv) {
         }
         if (mtp_catchup_overlap) {
             return test_mtp_catchup_overlap(arch_filter, seed, stdev, verbosity);
+        }
+        if (mtp_h_dev) {
+            return test_mtp_h_dev(arch_filter, seed, stdev, verbosity);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {
