@@ -792,8 +792,11 @@ struct case_one_slot_no_swap : ctx_test {
 // C217: a state saved into a device store inside a decode call (llama_state_seq_store_at), at the end of the micro-batch
 // that ends where a call would have been cut, is the state of the calls cut there, byte for byte: the call cuts its
 // micro-batches as those calls are cut (llama_set_ubatch_cuts, n_keep_tail of the rollback snapshots too), so it computes
-// what they compute. Prompt [0, 60) in micro-batches of 16; the cut calls end at 18 (with rollback snapshots for 3 drafted
-// tokens: 14 + 4 tokens, the last 4 kept together) and 34
+// what they compute. Prompt [0, 60) in micro-batches of 16; the cut calls end at 17 and 34. Without rollback snapshots
+// they take the one-token micro-batches [16, 17) and [33, 34), which round a recurrent state differently from longer
+// ones; with snapshots for 3 drafted tokens they take 13 + 4 and 13 + 4 tokens (a call's last 4 kept together), where the
+// cuts alone, without that rule, would take one-token micro-batches again. The controls report whether one call without
+// cuts, and with snapshots the cuts without the rule (cuts at 16, 17, 33, 34), end elsewhere
 struct case_store_at : ctx_test {
     explicit case_store_at(bool partial_) : partial(partial_) {}
 
@@ -810,7 +813,7 @@ struct case_store_at : ctx_test {
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
 
         constexpr llama_pos n_prompt = 60;
-        const std::vector<llama_pos> cuts = { 18, 34 };
+        const std::vector<llama_pos> cuts = { 17, 34 };
 
         const llama_state_seq_flags flags = partial ? LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY : LLAMA_STATE_SEQ_FLAGS_NONE;
 
@@ -830,11 +833,12 @@ struct case_store_at : ctx_test {
             opts.n_seq_max = 1;
             opts.n_rs_seq  = n_rs;
 
-            auto ctx_ref = mr.ctx(opts);
-            auto ctx_at  = mr.ctx(opts);
-            auto ctx_cut = mr.ctx(opts);
-            auto ctx_one = mr.ctx(opts);
-            if (!ctx_ref || !ctx_at || !ctx_cut || !ctx_one) {
+            auto ctx_ref  = mr.ctx(opts);
+            auto ctx_at   = mr.ctx(opts);
+            auto ctx_cut  = mr.ctx(opts);
+            auto ctx_one  = mr.ctx(opts);
+            auto ctx_rule = mr.ctx(opts);
+            if (!ctx_ref || !ctx_at || !ctx_cut || !ctx_one || !ctx_rule) {
                 return case_result::fail();
             }
             if (n_rs > 0 && llama_n_rs_seq(ctx_ref.get()) < n_rs) {
@@ -938,6 +942,13 @@ struct case_store_at : ctx_test {
             // the control: one call without cuts takes other micro-batches (reported, not required)
             CTX_REQUIRE(decode_seq(ctx_one.get(), tokens, 0, n_prompt, 0, true), tag + "the control call failed");
             report += " " + tag + (same_end(ctx_one.get()) ? "an uncut call ends the same;" : "an uncut call ends elsewhere;");
+            if (n_rs > 0) {
+                const uint32_t rcuts[] = { 16, 17, 33, 34 };
+                llama_set_ubatch_cuts(ctx_rule.get(), rcuts, 4);
+                CTX_REQUIRE(decode_seq(ctx_rule.get(), tokens, 0, n_prompt, 0, true), tag + "the control call without the rule failed");
+                llama_set_ubatch_cuts(ctx_rule.get(), nullptr, 0);
+                report += std::string(" cuts without the rule end ") + (same_end(ctx_rule.get()) ? "the same;" : "elsewhere;");
+            }
         }
 
         TLOG_INF("%s:%s\n", name(), report.c_str());

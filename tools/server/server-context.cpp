@@ -4237,6 +4237,9 @@ private:
         ckpt->store   = store;
 
         ckpt_incall.push_back({ ckpt, slot.id, i_batch });
+
+        // a later checkpoint of the same batch may evict it before the call fills it: then it costs no copy at all
+        SLT_TRC(slot, "context checkpoint at n_tokens = %" PRId64 " goes inside the call (store %d)\n", n_tokens_new, store);
     }
 
     // whether create_checkpoint_incall will find a free device store: one is free now, or every checkpoint of the list
@@ -4340,7 +4343,7 @@ private:
         slot.stats.n_ckpt_incall++;
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, on the devices %.3f MiB, store %d, %.1f ms) inside the call\n",
+                "created context checkpoint %d of %d inside the call (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, on the devices %.3f MiB, store %d, %.1f ms)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, (float) cur.size_dev / 1024 / 1024, cur.store, t_save_us / 1000.0);
 
