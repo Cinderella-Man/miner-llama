@@ -752,6 +752,9 @@ private:
     ggml_backend_event_ptr  ev_h_nextn_read[2];
     bool ev_h_nextn_written_recorded[2] = { false, false };
     bool ev_h_nextn_read_recorded[2]    = { false, false };
+    // LLAMA_MTP_H_DEV (C693): 1 (default) the buffer above where the output device has events (upstream #31927), 0 the
+    // rows extracted to host memory (the path before #31927), 2 as 1 and also on the CPU without events (checks)
+    int32_t                 h_nextn_dev_mode  = 1;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
