@@ -2905,10 +2905,12 @@ static int test_verify_prepare(const std::string & arch_filter, const size_t see
                     // the context's own log lines stay out of the table
                     ud.verbosity = LOG_LEVEL_OUTPUT;
                     verify_prepare_run off;
+                    verify_prepare_run off2;
                     verify_prepare_run on;
                     try {
-                        off = verify_prepare_sequence(model.get(), tokens, cfg.smpl, false, seed);
-                        on  = verify_prepare_sequence(model.get(), tokens, cfg.smpl, true,  seed);
+                        off  = verify_prepare_sequence(model.get(), tokens, cfg.smpl, false, seed);
+                        off2 = verify_prepare_sequence(model.get(), tokens, cfg.smpl, false, seed);
+                        on   = verify_prepare_sequence(model.get(), tokens, cfg.smpl, true,  seed);
                     } catch (...) {
                         ud.verbosity = verbosity;
                         throw;
@@ -2919,13 +2921,24 @@ static int test_verify_prepare(const std::string & arch_filter, const size_t see
                         n_tests--;
                         continue;
                     }
-                    const bool same_out   = !off.out.empty() && off.out.size() == on.out.size() &&
-                        memcmp(off.out.data(), on.out.data(), off.out.size()*sizeof(float)) == 0 && off.tok == on.tok;
-                    const bool same_state = !off.state.empty() && off.state == on.state;
+                    auto same_out = [](const verify_prepare_run & a, const verify_prepare_run & b) {
+                        return !a.out.empty() && a.out.size() == b.out.size() &&
+                            memcmp(a.out.data(), b.out.data(), a.out.size()*sizeof(float)) == 0 && a.tok == b.tok;
+                    };
+                    auto same_state = [](const verify_prepare_run & a, const verify_prepare_run & b) {
+                        return !a.state.empty() && a.state == b.state;
+                    };
+                    const bool out_ok   = same_out(off, on);
+                    const bool state_ok = same_state(off, on);
+                    // the control: two plain runs that differ are the model's own spread, against which nothing is judged
+                    const bool spread   = !same_out(off, off2) || !same_state(off, off2);
                     char prep_str[32];
                     snprintf(prep_str, sizeof(prep_str), "%d/%d", on.n_prepared, on.n_rounds);
-                    LOG("%10s|%10s|%10s|", prep_str, same_out ? "identical" : "DIFFERENT", same_state ? "identical" : "DIFFERENT");
-                    if (same_out && same_state) {
+                    LOG("%10s|%10s|%10s|", prep_str, out_ok ? "identical" : "DIFFERENT", state_ok ? "identical" : "DIFFERENT");
+                    if (spread) {
+                        status = "\033[1;33mSPREAD\033[0m (two plain runs differ, not judged)";
+                        n_tests--;
+                    } else if (out_ok && state_ok) {
                         status = "\033[1;32mOK\033[0m";
                     } else {
                         n_failed++;
