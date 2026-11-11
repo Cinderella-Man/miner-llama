@@ -22,7 +22,7 @@
 //     counter) merges every split, adds the sinks and writes the output.
 // FP32 throughout. Results match the dense kernels to rounding (a different summation order), not bit for bit.
 //
-// Union lists (GGML_CUDA_FATTN_SPARSE_PASCAL_UNION, a second instance of the same kernel): a block takes tpb consecutive
+// Union lists (GGML_CUDA_FATTN_SPARSE_PASCAL_UNION, flash_attn_ext_sparse_pascal_union): a block takes tpb consecutive
 // query tokens of a sequence (fasp_union_tokens: as many as FASP_UNION_WARPS warps hold) and one list, the union of
 // their finite mask columns (upstream's compaction with ncols1 = tpb). Warp y takes the heads of warp y % (G/4) for
 // token y / (G/4), every warp walks the same cells in the same order, so a K or V row comes from DRAM once per block
@@ -294,46 +294,251 @@ static __device__ __forceinline__ float fasp_transpose_reduce(float v[32]) {
 }
 
 // grid (splits, KV heads, query rows z), block (32, G/4): warp y takes query heads 4y .. 4y + 3 of KV head blockIdx.y.
-// uni (the union kernel): grid (splits, KV heads, lists: ceil(n_q/tpb) per sequence), block (32, G/4 x tpb): warp y
-// takes query heads 4(y % (G/4)) .. + 3 of the list's token y / (G/4); warps past the call's last token only wait.
-template <int D, int type, bool uni>
-__launch_bounds__(FASP_WARP*(uni ? FASP_UNION_WARPS : 4), 1)
+template <int D, int type>
+__launch_bounds__(FASP_WARP*4, 1)
 static __global__ void flash_attn_ext_sparse_pascal(const fasp_args a) {
     constexpr int DPL  = D/FASP_WARP;
     constexpr int PART = fasp_part_floats(D);
-    constexpr int NWB  = uni ? FASP_UNION_WARPS : 4; // warps a block holds at most
 
     const int lane = threadIdx.x;
-    const int wy   = threadIdx.y;                   // this warp's slot in the block
-    const int w    = uni ? wy % (a.G/FASP_HPW) : wy; // its group of 4 heads
+    const int w    = threadIdx.y;
     const int S    = gridDim.x;
     const int s    = blockIdx.x;
     const int g    = blockIdx.y;
-    int z, iq, i3, list, iq_mask;
-    int n_lists = 0;
-    bool valid = true;
-    if constexpr (uni) {
-        const int tpb = blockDim.y/(a.G/FASP_HPW); // query tokens per list
-        const fasp_union_warp uw = fasp_union_map(blockIdx.z, wy, a.G/FASP_HPW, tpb, a.n_q, a.m_ne3);
-        n_lists = (a.n_q + tpb - 1)/tpb;
-        iq      = uw.iq;
-        i3      = uw.i3;
-        list    = uw.list;
-        valid   = uw.valid;
-        z       = i3*a.n_q + iq;
-        iq_mask = a.fault == 4 && iq + 1 < a.n_q ? iq + 1 : iq;
-    } else {
-        z       = blockIdx.z;
-        iq      = z % a.n_q;
-        i3      = z / a.n_q;
-        list    = (i3 % a.m_ne3)*a.n_q + iq;
-        iq_mask = iq;
-    }
+    const int z    = blockIdx.z;
+    const int iq   = z % a.n_q;
+    const int i3   = z / a.n_q;
     const int hq0  = g*a.G + FASP_HPW*w; // first query head of this warp
     const int hl   = lane % FASP_HPW;    // the head (of the warp's 4) whose scores this lane keeps
 
-    __shared__                int   cell_sm[NWB][FASP_TILE];
-    __shared__ __align__(16) float p_sm[NWB][FASP_TILE*FASP_HPW];
+    __shared__                int   cell_sm[4][FASP_TILE];
+    __shared__ __align__(16) float p_sm[4][FASP_TILE*FASP_HPW];
+    __shared__                bool  last_block;
+
+    float q[FASP_HPW][DPL];
+#pragma unroll
+    for (int h = 0; h < FASP_HPW; ++h) {
+        const float * qh = (const float *) (a.Q + iq*a.q_nb1 + (int64_t) (hq0 + h)*a.q_nb2 + i3*a.q_nb3) + DPL*lane;
+#pragma unroll
+        for (int j = 0; j < DPL; j += 4) {
+            const float4 t = *(const float4 *) (qh + j);
+            q[h][j + 0] = t.x*a.scale_log2;
+            q[h][j + 1] = t.y*a.scale_log2;
+            q[h][j + 2] = t.z*a.scale_log2;
+            q[h][j + 3] = t.w*a.scale_log2;
+        }
+    }
+
+    float acc[FASP_HPW][DPL];
+#pragma unroll
+    for (int h = 0; h < FASP_HPW; ++h) {
+#pragma unroll
+        for (int j = 0; j < DPL; ++j) {
+            acc[h][j] = 0.0f;
+        }
+    }
+    float M = -FLT_MAX/2.0f; // running maximum (base 2) of head hl
+    float L = 0.0f;          // running sum of head hl
+
+    const int     list  = (i3 % a.m_ne3)*a.n_q + iq;
+    const int32_t * idx = a.idx + (int64_t) list*a.n_kv_max;
+    const half  * mrow  = a.mask + (i3 % a.m_ne3)*a.m_nb3 + iq*a.m_nb1;
+    const int     count = a.counts[list];
+
+    int e_begin, e_end;
+    fasp_split_range(count, s, S, e_begin, e_end);
+    if (a.fault == 3 && e_end > e_begin) {
+        --e_end;
+    }
+
+    const int  ikv = i3 % a.kv_ne3;
+    const char * Kg = a.K + (int64_t) g*a.k_nb2 + ikv*a.k_nb3;
+    const char * Vg = a.V + (int64_t) g*a.v_nb2 + ikv*a.v_nb3;
+
+    for (int e0 = e_begin; e0 < e_end; e0 += FASP_TILE) {
+        // one entry per lane: its cell and its mask value in base 2; entries past the split's end score -inf
+        int   cell = -1;
+        float mk   = -INFINITY;
+        if (e0 + lane < e_end) {
+            cell = idx[e0 + lane];
+            mk   = a.fault == 2 ? 0.0f : __half2float(mrow[cell])*FASP_LOG2_E;
+        }
+        cell_sm[w][lane] = cell;
+        __syncwarp();
+
+        // scores: s[j8] of lane l belongs to key 8*j8 + l/4 of the tile and head l%4
+        float sc[FASP_TILE/FASP_KPR];
+#pragma unroll
+        for (int j8 = 0; j8 < FASP_TILE/FASP_KPR; ++j8) {
+            float v[32];
+#pragma unroll
+            for (int j = 0; j < FASP_KPR; ++j) {
+                const int c = cell_sm[w][FASP_KPR*j8 + j];
+                float kf[DPL];
+                if (c >= 0) {
+                    fasp_load_row<type, DPL>(Kg + (int64_t) c*a.k_nb1, lane, kf);
+                } else {
+#pragma unroll
+                    for (int d = 0; d < DPL; ++d) {
+                        kf[d] = 0.0f;
+                    }
+                }
+#pragma unroll
+                for (int h = 0; h < FASP_HPW; ++h) {
+                    float t = q[h][0]*kf[0];
+#pragma unroll
+                    for (int d = 1; d < DPL; ++d) {
+                        t = fmaf(q[h][d], kf[d], t);
+                    }
+                    v[j*FASP_HPW + h] = t;
+                }
+            }
+            sc[j8] = fasp_transpose_reduce(v) +
+                __shfl_sync(0xFFFFFFFF, mk, FASP_KPR*j8 + fasp_tr_key(lane), FASP_WARP);
+        }
+
+        // online softmax of head hl over the tile: the 8 lanes l with l%4 == hl share a head
+        float m_tile = sc[0];
+#pragma unroll
+        for (int j8 = 1; j8 < FASP_TILE/FASP_KPR; ++j8) {
+            m_tile = fmaxf(m_tile, sc[j8]);
+        }
+        m_tile = fmaxf(m_tile, __shfl_xor_sync(0xFFFFFFFF, m_tile,  4, FASP_WARP));
+        m_tile = fmaxf(m_tile, __shfl_xor_sync(0xFFFFFFFF, m_tile,  8, FASP_WARP));
+        m_tile = fmaxf(m_tile, __shfl_xor_sync(0xFFFFFFFF, m_tile, 16, FASP_WARP));
+        const float M_new     = fmaxf(M, m_tile);
+        const float scale_old = exp2f(M - M_new);
+        M = M_new;
+
+        float l_tile = 0.0f;
+#pragma unroll
+        for (int j8 = 0; j8 < FASP_TILE/FASP_KPR; ++j8) {
+            const float p = exp2f(sc[j8] - M);
+            l_tile += p;
+            p_sm[w][(FASP_KPR*j8 + fasp_tr_key(lane))*FASP_HPW + hl] = p;
+        }
+        l_tile += __shfl_xor_sync(0xFFFFFFFF, l_tile,  4, FASP_WARP);
+        l_tile += __shfl_xor_sync(0xFFFFFFFF, l_tile,  8, FASP_WARP);
+        l_tile += __shfl_xor_sync(0xFFFFFFFF, l_tile, 16, FASP_WARP);
+        L = L*scale_old + l_tile;
+
+        // the accumulators of each head, rescaled by their head's factor (held by lane h)
+#pragma unroll
+        for (int h = 0; h < FASP_HPW; ++h) {
+            const float f = __shfl_sync(0xFFFFFFFF, scale_old, h, FASP_WARP);
+#pragma unroll
+            for (int d = 0; d < DPL; ++d) {
+                acc[h][d] *= f;
+            }
+        }
+        __syncwarp();
+
+        // P*V: each V row once for the 4 heads; an empty entry ends the tile (entries are filled from lane 0)
+#pragma unroll 4
+        for (int kk = 0; kk < FASP_TILE; ++kk) {
+            const int c = cell_sm[w][kk];
+            if (c < 0) {
+                break;
+            }
+            float vf[DPL];
+            fasp_load_row<type, DPL>(Vg + (int64_t) c*a.v_nb1, lane, vf);
+            const float4 p4 = *(const float4 *) &p_sm[w][kk*FASP_HPW];
+            const float p[FASP_HPW] = { p4.x, p4.y, p4.z, p4.w };
+#pragma unroll
+            for (int h = 0; h < FASP_HPW; ++h) {
+#pragma unroll
+                for (int d = 0; d < DPL; ++d) {
+                    acc[h][d] = fmaf(p[h], vf[d], acc[h][d]);
+                }
+            }
+        }
+        __syncwarp();
+    }
+
+    // this warp's partial outputs, maxima and sums
+    const int     n_cols       = gridDim.y*gridDim.z;
+    const int     col          = z*gridDim.y + g;
+    const int64_t split_stride = (int64_t) n_cols*a.G*PART;
+    float * part = a.part + (int64_t) s*split_stride + ((int64_t) col*a.G + FASP_HPW*w)*PART;
+#pragma unroll
+    for (int h = 0; h < FASP_HPW; ++h) {
+#pragma unroll
+        for (int j = 0; j < DPL; j += 4) {
+            *(float4 *) (part + h*PART + DPL*lane + j) = make_float4(acc[h][j], acc[h][j + 1], acc[h][j + 2], acc[h][j + 3]);
+        }
+    }
+    if (lane < FASP_HPW) {
+        part[lane*PART + D + 0] = M;
+        part[lane*PART + D + 1] = L;
+    }
+
+    // the last block of this column merges every split's partials
+    __threadfence();
+    __syncthreads();
+    if (lane == 0 && w == 0) {
+        last_block = atomicAdd(&a.counter[col], 1u) == (unsigned) S - 1;
+    }
+    __syncthreads();
+    if (!last_block) {
+        return;
+    }
+    __threadfence();
+
+#pragma unroll
+    for (int h = 0; h < FASP_HPW; ++h) {
+        const int hq = hq0 + h;
+        float o[DPL];
+        float m_all, l;
+        fasp_merge_lane<DPL>(a.part + ((int64_t) col*a.G + FASP_HPW*w + h)*PART, split_stride, S, D, lane, o, m_all, l);
+        float f = 1.0f;
+        if (a.sinks) {
+            f = fasp_add_sink(a.sinks[hq]*FASP_LOG2_E, m_all, l);
+        }
+        const float inv = l > 0.0f ? (a.fault == 1 ? 1.01f : 1.0f)*f/l : 0.0f;
+        float * out = a.dst + ((int64_t) z*a.n_head + hq)*D + DPL*lane;
+#pragma unroll
+        for (int j = 0; j < DPL; j += 4) {
+            *(float4 *) (out + j) = make_float4(o[j]*inv, o[j + 1]*inv, o[j + 2]*inv, o[j + 3]*inv);
+        }
+    }
+
+    __syncthreads();
+    if (lane == 0 && w == 0) {
+        a.counter[col] = 0;
+    }
+}
+
+// The union kernel: the kernel above for tpb query tokens a block, all reading one union list (a kernel of its own, so
+// that the per-token kernel keeps its source and machine code). grid (splits, KV heads, lists: ceil(n_q/tpb) per
+// sequence), block (32, G/4 x tpb): warp y takes query heads 4(y % (G/4)) .. + 3 of the list's token y / (G/4); warps
+// past the call's last token only wait at the barriers.
+template <int D, int type>
+__launch_bounds__(FASP_WARP*FASP_UNION_WARPS, 1)
+static __global__ void flash_attn_ext_sparse_pascal_union(const fasp_args a) {
+    constexpr int DPL  = D/FASP_WARP;
+    constexpr int PART = fasp_part_floats(D);
+
+    const int lane    = threadIdx.x;
+    const int wy      = threadIdx.y;          // this warp's slot in the block
+    const int nw      = a.G/FASP_HPW;         // warps a token
+    const int w       = wy % nw;              // its group of 4 heads
+    const int tpb     = blockDim.y/nw;        // query tokens a list
+    const int n_lists = (a.n_q + tpb - 1)/tpb; // lists a sequence
+    const int S       = gridDim.x;
+    const int s       = blockIdx.x;
+    const int g       = blockIdx.y;
+    const fasp_union_warp uw = fasp_union_map(blockIdx.z, wy, nw, tpb, a.n_q, a.m_ne3);
+    const int  iq      = uw.iq;
+    const int  i3      = uw.i3;
+    const int  list    = uw.list;
+    const bool valid   = uw.valid;
+    const int  z       = i3*a.n_q + iq;
+    const int  iq_mask = a.fault == 4 && iq + 1 < a.n_q ? iq + 1 : iq;
+    const int  hq0     = g*a.G + FASP_HPW*w; // first query head of this warp
+    const int  hl      = lane % FASP_HPW;    // the head (of the warp's 4) whose scores this lane keeps
+
+    __shared__                int   cell_sm[FASP_UNION_WARPS][FASP_TILE];
+    __shared__ __align__(16) float p_sm[FASP_UNION_WARPS][FASP_TILE*FASP_HPW];
     __shared__                bool  last_block;
 
     float q[FASP_HPW][DPL];
@@ -386,11 +591,9 @@ static __global__ void flash_attn_ext_sparse_pascal(const fasp_args a) {
             cell = idx[e0 + lane];
             mk   = a.fault == 2 ? 0.0f : __half2float(mrow[cell])*FASP_LOG2_E;
         }
-        if constexpr (uni) {
-            // a tile without any of this token's cells would leave its state exactly as it is: skip its reads
-            if (__all_sync(0xFFFFFFFF, mk == -INFINITY)) {
-                continue;
-            }
+        // a tile without any of this token's cells would leave its state exactly as it is: skip its reads
+        if (__all_sync(0xFFFFFFFF, mk == -INFINITY)) {
+            continue;
         }
         cell_sm[wy][lane] = cell;
         __syncwarp();
@@ -484,10 +687,10 @@ static __global__ void flash_attn_ext_sparse_pascal(const fasp_args a) {
         __syncwarp();
     }
 
-    // this warp's partial outputs, maxima and sums; the union kernel counts its blocks per list column (list, KV head)
-    const int     n_cols       = uni ? gridDim.y*a.n_q*(gridDim.z/n_lists) : gridDim.y*gridDim.z;
+    // this warp's partial outputs, maxima and sums (per query token's column); the blocks are counted per list column
+    const int     n_cols       = gridDim.y*a.n_q*(gridDim.z/n_lists);
     const int     col          = z*gridDim.y + g;
-    const int     ctr          = uni ? blockIdx.z*gridDim.y + g : col;
+    const int     ctr          = blockIdx.z*gridDim.y + g;
     const int64_t split_stride = (int64_t) n_cols*a.G*PART;
     float * part = a.part + (int64_t) s*split_stride + ((int64_t) col*a.G + FASP_HPW*w)*PART;
     if (valid) {
@@ -548,7 +751,7 @@ template <int D, int type>
 static void fasp_launch(const fasp_args & a, const int S, const int n_head_kv, const int n_z, cudaStream_t stream) {
     const dim3 grid(S, n_head_kv, n_z);
     const dim3 block(FASP_WARP, a.G/FASP_HPW, 1);
-    flash_attn_ext_sparse_pascal<D, type, false><<<grid, block, 0, stream>>>(a);
+    flash_attn_ext_sparse_pascal<D, type><<<grid, block, 0, stream>>>(a);
 }
 
 // Launches the union kernel for tpb query tokens a list (block (32, G/4 x tpb), grid (S, n_head_kv, ceil(n_q/tpb)*ne3));
@@ -558,7 +761,7 @@ static void fasp_launch_union(const fasp_args & a, const int tpb, const int S, c
         cudaStream_t stream) {
     const dim3 grid(S, n_head_kv, (a.n_q + tpb - 1)/tpb*ne3);
     const dim3 block(FASP_WARP, a.G/FASP_HPW*tpb, 1);
-    flash_attn_ext_sparse_pascal<D, type, true><<<grid, block, 0, stream>>>(a);
+    flash_attn_ext_sparse_pascal_union<D, type><<<grid, block, 0, stream>>>(a);
 }
 
 #endif // defined(__CUDACC__)
