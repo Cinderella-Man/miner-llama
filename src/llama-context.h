@@ -68,6 +68,16 @@ struct llama_state_store {
     std::vector<ggml_backend_event_ptr> fences;
 };
 
+// LLAMA_TENSOR_HASH=<prefix>[,<prefix>...] (C762, checks): every graph node whose name starts with one of the prefixes is
+// hashed (FNV-1a over its bytes) once it is computed, through the scheduler's eval callback, and logged with the buffer
+// that holds it, so that two runs' intermediate tensors can be compared byte for byte; unused when the caller sets
+// cb_eval. The callback makes the scheduler compute each split in pieces that end at those nodes
+struct llama_tensor_hash {
+    std::vector<std::string> prefixes;
+    char     role = 'v'; // 'v' a target context, 'd' an MTP draft context
+    uint64_t n    = 0;   // tensors hashed so far
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -727,6 +737,9 @@ private:
     // that runs the graphs reading them
     std::unique_ptr<llama_embd_cache> embd_cache;
     ggml_backend_t                    embd_cache_backend = nullptr;
+
+    // LLAMA_TENSOR_HASH: the nodes hashed after they are computed, cparams.cb_eval's user data when set (checks)
+    llama_tensor_hash tensor_hash;
 
     // the exact bound and the full-head fallback for the main model's shortlist head (head_bound_init); requested with
     // set_head_bound, used by the decodes with one output

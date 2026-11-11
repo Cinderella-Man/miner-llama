@@ -179,6 +179,7 @@ static void usage(char ** argv) {
     LOG("  -d, --stdev <stdev>      Set the standard deviation of the tensor initialization distribution (default: 0.1f)\n");
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  --mtp                    With -o: save qwen4exp's MoE model with one MTP block as <dir>/qwen4exp-moe-mtp.gguf\n");
+    LOG("  --mtp-draft              With -o: --mtp, and its MTP block alone as <dir>/qwen4exp-moe-mtp-draft.gguf (for -md)\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
@@ -1294,8 +1295,70 @@ static gguf_context_ptr get_gguf_ctx_nextn(const llm_arch arch, const bool moe) 
     return ret;
 }
 
+// --mtp-draft: an MTP-only draft file written from the --mtp model, as Flash-Next's separate MTP draft holds no trunk
+// layer: every tensor but those of the trunk blocks (blk.0 to blk.<n_layer - 1>), under the same keys, with the token
+// embeddings in Q8_0 when their rows allow it (that draft's type); llama-server loads it with -md (C762's check of
+// LLAMA_DRAFT_EMBD_DEV)
+static void save_mtp_draft(const llm_arch arch, const std::string & path_model, const std::string & path_draft) {
+    ggml_context * ctx_data = nullptr;
+    gguf_init_params ip = { /*.no_alloc =*/ false, /*.ctx =*/ &ctx_data };
+    gguf_context_ptr src(gguf_init_from_file(path_model.c_str(), ip));
+    if (!src) {
+        throw std::runtime_error("failed to read " + path_model);
+    }
+    ggml_context_ptr ctx_data_ptr(ctx_data);
+
+    const int64_t kid_n = gguf_find_key(src.get(), llama_arch_kv_name(arch, LLM_KV_BLOCK_COUNT).c_str());
+    const int64_t kid_m = gguf_find_key(src.get(), llama_arch_kv_name(arch, LLM_KV_NEXTN_PREDICT_LAYERS).c_str());
+    GGML_ASSERT(kid_n >= 0 && kid_m >= 0);
+    const uint32_t n_trunk = gguf_get_val_u32(src.get(), kid_n) - gguf_get_val_u32(src.get(), kid_m);
+
+    gguf_context_ptr dst(gguf_init_empty());
+    gguf_set_kv(dst.get(), src.get());
+
+    ggml_tensor * embd = ggml_get_tensor(ctx_data, "token_embd.weight");
+    GGML_ASSERT(embd != nullptr && ggml_n_dims(embd) == 2);
+    const bool to_q8 = (embd->type == GGML_TYPE_F32 || embd->type == GGML_TYPE_F16) && embd->ne[0] % ggml_blck_size(GGML_TYPE_Q8_0) == 0;
+    ggml_init_params cp = {
+        /*.mem_size   =*/ ggml_tensor_overhead() + ggml_row_size(GGML_TYPE_Q8_0, embd->ne[0])*embd->ne[1] + 64,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    ggml_context_ptr ctx_q(ggml_init(cp));
+
+    int n_kept = 0;
+    for (int64_t i = 0; i < gguf_get_n_tensors(src.get()); ++i) {
+        const std::string name = gguf_get_tensor_name(src.get(), i);
+        unsigned il = 0;
+        if (sscanf(name.c_str(), "blk.%u.", &il) == 1 && il < n_trunk) {
+            continue;
+        }
+        ggml_tensor * t = ggml_get_tensor(ctx_data, name.c_str());
+        GGML_ASSERT(t != nullptr);
+        if (t == embd && to_q8) {
+            std::vector<float> f32(ggml_nelements(embd));
+            if (embd->type == GGML_TYPE_F16) {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) embd->data, f32.data(), f32.size());
+            } else {
+                memcpy(f32.data(), embd->data, ggml_nbytes(embd));
+            }
+            ggml_tensor * q = ggml_new_tensor_2d(ctx_q.get(), GGML_TYPE_Q8_0, embd->ne[0], embd->ne[1]);
+            ggml_set_name(q, name.c_str());
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, f32.data(), q->data, 0, embd->ne[1], embd->ne[0], nullptr);
+            t = q;
+        }
+        gguf_add_tensor(dst.get(), t);
+        n_kept++;
+    }
+    if (!gguf_write_to_file(dst.get(), path_draft.c_str(), false)) {
+        throw std::runtime_error("failed to write " + path_draft);
+    }
+    LOG_INF("%s: %s: %d tensors (no block below %u), token embeddings %s\n", __func__, path_draft.c_str(), n_kept,
+            n_trunk, to_q8 ? "in Q8_0" : ggml_type_name(embd->type));
+}
+
 static int save_models(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const std::string & dir,
-        const bool mtp = false) {
+        const bool mtp = false, const bool mtp_draft = false) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -1349,6 +1412,10 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
             llama_model_save_to_file(model.get(), path.c_str());
             const std::uintmax_t size = std::filesystem::file_size(path);
             LOG_CNT(" (%.2f MB)\n", (double) size / (1024.0 * 1024.0));
+            if (mtp && mtp_draft) {
+                const std::string path_draft = dir + "/" + llama_arch_name(arch) + (moe ? "-moe" : "-dense") + "-mtp-draft.gguf";
+                save_mtp_draft(arch, path, path_draft);
+            }
         }
     }
     llama_log_set(ud.log_old.callback, ud.log_old.user_data);
@@ -4510,6 +4577,7 @@ int main(int argc, char ** argv) {
     bool mtp_h_dev = false;
     bool mtp_incall_overlap = false;
     bool save_mtp = false;
+    bool save_mtp_draft_file = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -4597,6 +4665,9 @@ int main(int argc, char ** argv) {
             mtp_incall_overlap = true;
         } else if (strcmp(argv[i], "--mtp") == 0) {
             save_mtp = true;
+        } else if (strcmp(argv[i], "--mtp-draft") == 0) {
+            save_mtp            = true;
+            save_mtp_draft_file = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -4613,7 +4684,7 @@ int main(int argc, char ** argv) {
 
     try {
         if (!out.empty()) {
-            return save_models(arch_filter, seed, stdev, verbosity, out, save_mtp);
+            return save_models(arch_filter, seed, stdev, verbosity, out, save_mtp, save_mtp_draft_file);
         }
         if (kv_shift) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);

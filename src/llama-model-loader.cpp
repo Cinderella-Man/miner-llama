@@ -1353,6 +1353,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
         }
 
+        // LLAMA_DRAFT_EMBD_DEV=layer (C762): the token embeddings in the buffer types the model chose for them, ahead of
+        // the input layer's and of every override
+        const bool tok_embd_fixed = buft_list_tok_embd != nullptr && tn.tensor == LLM_TENSOR_TOKEN_EMBD &&
+                !(flags & TENSOR_DUPLICATED);
+        if (tok_embd_fixed) {
+            buft_list = buft_list_tok_embd;
+        }
+
         ggml_backend_buffer_type_t buft = nullptr;
 
         // check overrides
@@ -1361,6 +1369,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
+                    if (tok_embd_fixed) {
+                        LLAMA_LOG_INFO("llama_model_loader: %s: the override to %s is not applied, LLAMA_DRAFT_EMBD_DEV places it\n",
+                                tensor_name.c_str(), ggml_backend_buft_name(overrides->buft));
+                        break;
+                    }
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
@@ -1398,6 +1411,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 throw std::runtime_error("no CPU backend found");
             }
             buft = ggml_backend_dev_buffer_type(cpu_dev);
+        }
+
+        if (tok_embd_fixed) {
+            LLAMA_LOG_INFO("llama_model_loader: %s (%.2f MiB %s) in %s (LLAMA_DRAFT_EMBD_DEV)\n", tn.str().c_str(),
+                    ggml_nbytes(t_meta) / 1024.0 / 1024.0, ggml_type_name(t_meta->type), ggml_backend_buft_name(buft));
         }
 
         if (buft != buft_list->front().second) {
