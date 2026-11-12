@@ -66,6 +66,19 @@ static void server_keepalive_kick() {
     }
 }
 
+// GGML_CUDA_KEEPALIVE_EAGER (C811): the keep-alive's counts since the start as one line, empty while the switch is unset
+static std::string server_keepalive_counts() {
+    static size_t (*counts)(char *, size_t) = [] {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        return reg ? (size_t (*)(char *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_keepalive_counts") : nullptr;
+    }();
+    if (counts == nullptr) {
+        return {};
+    }
+    char buf[640];
+    return counts(buf, sizeof(buf)) > 0 ? std::string(buf) : std::string();
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
         const auto mcaps = mtmd_get_cap_from_file(params.mmproj.path.c_str());
@@ -1234,6 +1247,13 @@ struct server_slot {
         SLT_INF(*this,
                 "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
                 llama_perf_context(ctx_tgt).n_reallocs_same, llama_perf_context(ctx_tgt).n_reallocs_diff);
+
+        {
+            const std::string ka = server_keepalive_counts();
+            if (!ka.empty()) {
+                SLT_INF(*this, "      keep-alive = %s\n", ka.c_str());
+            }
+        }
 
         const int32_t n_draft_total       = stats.n_draft_tokens;
         const int32_t n_draft_accepted    = stats.n_draft_accepted;

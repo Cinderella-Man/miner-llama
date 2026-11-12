@@ -23,6 +23,17 @@
 //                                controller is not told about.
 //   GGML_CUDA_KEEPALIVE_POLL_US  the block's back-off between two reads of the word, 1..100000 us (default 50): the
 //                                longest a stop waits, and one PCIe read per back-off
+//   GGML_CUDA_KEEPALIVE_EAGER    (C811) unset or empty: as before. Under CUDA 12's lazy module loading the first launch
+//                                of a kernel on a card waits until every kernel running on the card has ended, so a
+//                                first launch while the card's block runs waits for the block's timeout (FN85: about
+//                                1 s at a decode or verify graph's first call, which runs kernel by kernel).
+//                                1: the card's block is ended before an evaluation that runs kernel by kernel (not a
+//                                  capture, not a replay) whose shapes the card has not run before, and before a copy,
+//                                  set, get or memset the backend runs on the card outside a graph at a size new to the
+//                                  card; the block's next start is ordered on the card after the next evaluation's work
+//                                2: as 1, and before every evaluation that runs kernel by kernel, new shapes or not
+//                                0 (or any other value): no stop, only the counts
+//                                Whenever it is set, llama-server prints the counts after each reply (keep-alive = ...)
 // When a context is freed, each card's runs are logged with the SM clock the block measured while it ran.
 
 #include <chrono>
@@ -30,6 +41,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unordered_set>
 
 #if defined(__CUDACC__)
 #define GGML_CUDA_KEEPALIVE_HD __host__ __device__
@@ -48,7 +60,36 @@ struct ggml_cuda_keepalive_config {
     ggml_cuda_keepalive_mode mode    = GGML_CUDA_KEEPALIVE_OFF;
     uint32_t                 idle_ms = 1000;
     uint32_t                 poll_us = 50;
+    int                      eager   = -1; // GGML_CUDA_KEEPALIVE_EAGER: -1 unset, 0 counts only, 1 new shapes, 2 every
 };
+
+// GGML_CUDA_KEEPALIVE_EAGER's value (nullptr: unset): -1 unset or empty, 1 and 2 as written, any other value 0
+static inline int ggml_cuda_keepalive_parse_eager(const char * v) {
+    if (v == nullptr || v[0] == '\0') {
+        return -1;
+    }
+    if (strcmp(v, "1") == 0) {
+        return 1;
+    }
+    if (strcmp(v, "2") == 0) {
+        return 2;
+    }
+    return 0;
+}
+
+// what the backend runs on a card outside a graph (GGML_CUDA_KEEPALIVE_EAGER): a kind and a size, as one key
+enum ggml_cuda_keepalive_outside_kind {
+    GGML_CUDA_KEEPALIVE_OUT_SET     = 1, // host to card (a tensor set, sync or async, 1D or 2D, or a batch of sets)
+    GGML_CUDA_KEEPALIVE_OUT_GET     = 2, // card to host
+    GGML_CUDA_KEEPALIVE_OUT_MEMSET  = 3, // a memset or a buffer clear
+    GGML_CUDA_KEEPALIVE_OUT_COPY    = 4, // card to card on one card
+    GGML_CUDA_KEEPALIVE_OUT_SEND    = 5, // the source card of a copy between cards
+    GGML_CUDA_KEEPALIVE_OUT_RECV    = 6, // the destination card of a copy between cards
+};
+
+static inline uint64_t ggml_cuda_keepalive_outside_key(int kind, uint64_t size) {
+    return ((uint64_t) kind << 56) ^ size;
+}
 
 // The three variables' values (nullptr: unset). An unknown mode is off; out-of-range numbers are clamped.
 static inline ggml_cuda_keepalive_config ggml_cuda_keepalive_parse(const char * mode, const char * ms, const char * poll_us) {
@@ -186,10 +227,27 @@ struct ggml_cuda_keepalive_stats {
     }
 };
 
+// What GGML_CUDA_KEEPALIVE_EAGER has done since the start, and every run, over the cards (never reset).
+struct ggml_cuda_keepalive_counts {
+    uint64_t starts   = 0;
+    uint64_t stopped  = 0;
+    uint64_t timeouts = 0;
+    uint64_t lost     = 0;
+    uint64_t running  = 0; // blocks launched and not yet seen to end
+    uint64_t eager       = 0; // evaluations that ran kernel by kernel
+    uint64_t eager_new   = 0; // of them, the ones the switch acted on (new shapes; at 2 every one)
+    uint64_t eager_stops = 0; // of those, the ones before which a running block was ended
+    uint64_t out_new     = 0; // sets, gets, memsets and copies outside a graph at a size new to the card
+    uint64_t out_stops   = 0; // of them, the ones before which a running block was ended
+    uint64_t held        = 0; // blocks started after the card's evaluation, not at once
+};
+
 // Starts and stops the cards' blocks. Ops is what a card does (keepalive.cu on CUDA, a thread in the test):
 //   void     write(int dev, uint64_t word)          the word into the card's mapped host memory
-//   bool     launch(int dev, uint32_t gen, uint32_t beat, uint32_t idle_ms, uint32_t poll_us)
-//                                                   a block on the card's keep-alive stream; false if it failed
+//   bool     launch(int dev, uint32_t gen, uint32_t beat, uint32_t idle_ms, uint32_t poll_us, void * after)
+//                                                   a block on the card's keep-alive stream; false if it failed. after:
+//                                                   nullptr, or the stream (cudaStream_t) of the card whose work so far
+//                                                   the block must not start before (GGML_CUDA_KEEPALIVE_EAGER)
 //   bool     done(int dev)                          the block has ended (does not wait)
 //   void     wait(int dev)                          until the block has ended
 //   const ggml_cuda_keepalive_report & report(int dev)
@@ -210,6 +268,11 @@ struct ggml_cuda_keepalive_ctl {
         clock::time_point last_beat;       // when the host last wrote a beat to a running block
         clock::time_point last_check;      // when the host last asked whether the block has ended
         ggml_cuda_keepalive_stats stats;
+        // GGML_CUDA_KEEPALIVE_EAGER
+        bool                         hold = false; // the next start waits for the card's evaluation (its stream)
+        std::unordered_set<uint64_t> shapes;       // the shapes of the evaluations run kernel by kernel on the card
+        std::unordered_set<uint64_t> sizes;        // the kinds and sizes of the work outside a graph on the card
+        ggml_cuda_keepalive_counts   counts;       // since the start (stopped, timeouts and lost by the reports)
     };
     dev_state devs[MAX_DEVICES];
     uint32_t  next_gen = 1;
@@ -227,14 +290,90 @@ struct ggml_cuda_keepalive_ctl {
         stop_locked(dev);
     }
 
-    // after a graph's work is enqueued on the card: a beat for its block, which is started if it is not running
-    void graph_end(int dev) {
+    // after a graph's work is enqueued on the card: a beat for its block, which is started if it is not running.
+    // after: the stream the graph ran on (cudaStream_t), or nullptr; a start the switch holds waits for its work so far
+    void graph_end(int dev, void * after = nullptr) {
         if (!on() || dev < 0 || dev >= MAX_DEVICES) {
             return;
         }
         std::lock_guard<std::mutex> lock(mutex);
         devs[dev].seen = true;
-        beat_locked(dev);
+        beat_locked(dev, after);
+    }
+
+    // GGML_CUDA_KEEPALIVE_EAGER: before an evaluation that runs kernel by kernel on the card, shape: its shapes as one
+    // number. When the switch acts on it (a shape new to the card at 1, every one at 2), the card's block is ended and
+    // its next start held until this evaluation's work is done (graph_end's stream), so that no kernel launched by the
+    // evaluation finds the block running. Returns whether the switch acted.
+    bool eager_begin(int dev, uint64_t shape) {
+        if (!on() || cfg.eager < 0 || dev < 0 || dev >= MAX_DEVICES) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        dev_state & d = devs[dev];
+        d.counts.eager++;
+        if (cfg.eager < 1) {
+            return false;
+        }
+        const bool fresh = d.shapes.insert(shape).second;
+        if (!fresh && cfg.eager < 2) {
+            return false;
+        }
+        d.counts.eager_new++;
+        if (d.running) {
+            d.counts.eager_stops++;
+            stop_locked(dev);
+        }
+        d.hold = true;
+        return true;
+    }
+
+    // GGML_CUDA_KEEPALIVE_EAGER at 1 or 2: before a set, get, memset or copy the backend runs on the card outside a
+    // graph, key: its kind and size (ggml_cuda_keepalive_outside_key). At a key new to the card, the card's block is
+    // ended and its next start held until the card's next evaluation. Returns whether the switch acted.
+    bool outside(int dev, uint64_t key) {
+        if (!on() || cfg.eager < 1 || dev < 0 || dev >= MAX_DEVICES) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        dev_state & d = devs[dev];
+        if (!d.sizes.insert(key).second) {
+            return false;
+        }
+        d.counts.out_new++;
+        if (d.running) {
+            d.counts.out_stops++;
+            stop_locked(dev);
+        }
+        d.hold = true;
+        return true;
+    }
+
+    // every card's counts since the start, summed; a block found ended is read first (as the beats' check does)
+    ggml_cuda_keepalive_counts counts(int dev_only = -1) {
+        std::lock_guard<std::mutex> lock(mutex);
+        ggml_cuda_keepalive_counts c;
+        for (int dev = 0; dev < MAX_DEVICES; ++dev) {
+            if (dev_only >= 0 && dev != dev_only) {
+                continue;
+            }
+            dev_state & d = devs[dev];
+            if (d.running && ops.done(dev)) {
+                finish_locked(dev);
+            }
+            c.starts      += d.counts.starts;
+            c.stopped     += d.counts.stopped;
+            c.timeouts    += d.counts.timeouts;
+            c.lost        += d.counts.lost;
+            c.running     += d.running;
+            c.eager       += d.counts.eager;
+            c.eager_new   += d.counts.eager_new;
+            c.eager_stops += d.counts.eager_stops;
+            c.out_new     += d.counts.out_new;
+            c.out_stops   += d.counts.out_stops;
+            c.held        += d.counts.held;
+        }
+        return c;
     }
 
     // llama-server took a request (request mode): the block of every card that has computed a graph (the warm-up's
@@ -246,7 +385,7 @@ struct ggml_cuda_keepalive_ctl {
         std::lock_guard<std::mutex> lock(mutex);
         for (int dev = 0; dev < MAX_DEVICES; ++dev) {
             if (devs[dev].seen) {
-                beat_locked(dev);
+                beat_locked(dev, nullptr);
             }
         }
     }
@@ -300,13 +439,16 @@ struct ggml_cuda_keepalive_ctl {
         const ggml_cuda_keepalive_report & r = ops.report(dev);
         if (r.gen == d.gen) {
             d.stats.add(r);
+            d.counts.stopped  += r.reason == GGML_CUDA_KEEPALIVE_STOPPED;
+            d.counts.timeouts += r.reason == GGML_CUDA_KEEPALIVE_TIMEOUT;
         } else {
             d.stats.lost++;
+            d.counts.lost++;
         }
         d.running = false;
     }
 
-    void beat_locked(int dev) {
+    void beat_locked(int dev, void * after) {
         if (dev < 0 || dev >= MAX_DEVICES) {
             return;
         }
@@ -337,11 +479,18 @@ struct ggml_cuda_keepalive_ctl {
                 next_gen = 1;
             }
             ops.write(dev, ggml_cuda_keepalive_word(gen, d.beat));
-            if (ops.launch(dev, gen, d.beat, cfg.idle_ms, cfg.poll_us)) {
+            // GGML_CUDA_KEEPALIVE_EAGER: a held start waits for the card's work so far (only a graph's end has a stream)
+            void * wait_for = d.hold ? after : nullptr;
+            if (ops.launch(dev, gen, d.beat, cfg.idle_ms, cfg.poll_us, wait_for)) {
                 d.gen        = gen;
                 d.running    = true;
                 d.last_check = now;
                 d.stats.starts++;
+                d.counts.starts++;
+                if (wait_for != nullptr) {
+                    d.hold = false;
+                    d.counts.held++;
+                }
             }
         }
         d.last_beat = now;
