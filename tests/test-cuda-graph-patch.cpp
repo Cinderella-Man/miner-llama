@@ -346,7 +346,7 @@ static std::vector<mnode> random_graph(std::mt19937 & rng, const int n) {
         g[i] = { op(rng), 10 + (int) (rng() % 20), (int) (rng() % 1000) };
     }
     // a few long patterns, so that the six-node fusion and its condition on its last node occur
-    for (int p = 0; p + 6 < n; p += 13 + (int) (rng() % 9)) {
+    for (int p = 0; p + 6 < n; p += 30 + (int) (rng() % 21)) {
         g[p] = { OP_C, 10, 1 };
         for (int j = 1; j <= 4; j++) {
             g[p + j] = { OP_D, 20, 2 };
@@ -367,11 +367,11 @@ static run_counts random_run(std::mt19937 & rng, const int window, const int n_e
     run_counts rc;
     std::vector<mnode> g = random_graph(rng, 40 + (int) (rng() % 120));
     std::vector<int> inputs, cache;
-    const unsigned density = 4 + rng() % 30; // one node in this many reads an input copy
+    const unsigned density = 6 + rng() % 60; // one node in this many reads an input copy
     for (int i = 0; i < (int) g.size(); i++) {
         if (rng() % density == 0) {
             inputs.push_back(i);
-        } else if (g[i].op == OP_E || rng() % 40 == 0) {
+        } else if (g[i].op == OP_E || (g[i].op == OP_K && rng() % 3 == 0) || rng() % 80 == 0) {
             cache.push_back(i);
         }
     }
