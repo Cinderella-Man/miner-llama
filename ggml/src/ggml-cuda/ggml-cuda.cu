@@ -758,6 +758,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
     }
+
+    size_t used() const override {
+        return pool_used;
+    }
 };
 #endif // defined(GGML_USE_VMM)
 
@@ -3390,6 +3394,145 @@ static bool ggml_cuda_graph_force_capture(ggml_backend_cuda_context * cuda_ctx, 
            ggml_cuda_graph_force_eligible(cgraph->nodes, cgraph->n_nodes, MMVQ_MAX_BATCH_SIZE);
 }
 
+// GGML_CUDA_GRAPHS_PATCH reads capture chains with the CUDA 12 graph API and sets kernel nodes through the driver API
+// (linked with VMM; not mapped for HIP or MUSA)
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12000 && CUDART_VERSION < 13000
+#define GGML_CUDA_GRAPHS_PATCH_API
+#endif
+
+// GGML_CUDA_GRAPHS_PATCH=1 (C779, graph-patch.h; with GGML_CUDA_GRAPHS_FORCE=1): a graph the force switch would capture
+// again, whose properties changed in a few nodes, has those nodes' groups re-dispatched into a scratch capture and their
+// CUDA nodes' parameters set in the executables, which then replay. GGML_CUDA_GRAPHS_PATCH_WINDOW (32): a group is
+// re-dispatched when a changed node lies within this many nodes after its first one (a fusion decision reads ahead);
+// GGML_CUDA_GRAPHS_PATCH_MAX (60): the most nodes, in percent of the graph's, re-dispatched instead of a full capture.
+// Off by default; without the force switch it does nothing
+static bool ggml_cuda_graphs_patch() {
+    static const bool enabled = [] {
+#ifdef GGML_CUDA_GRAPHS_PATCH_API
+        const bool on = ggml_cuda_env_flag("GGML_CUDA_GRAPHS_PATCH") && ggml_cuda_graphs_force();
+#else
+        const bool on = false;
+#endif // GGML_CUDA_GRAPHS_PATCH_API
+        if (on) {
+            GGML_LOG_INFO("%s: GGML_CUDA_GRAPHS_PATCH: a forced graph whose properties changed in a few nodes is patched "
+                          "and replayed (window %d nodes, at most %d%% of the nodes re-dispatched)\n", __func__,
+                          ggml_cuda_env_int("GGML_CUDA_GRAPHS_PATCH_WINDOW", 32), ggml_cuda_env_int("GGML_CUDA_GRAPHS_PATCH_MAX", 60));
+        } else if (ggml_cuda_env_flag("GGML_CUDA_GRAPHS_PATCH")) {
+            GGML_LOG_WARN("%s: GGML_CUDA_GRAPHS_PATCH needs GGML_CUDA_GRAPHS_FORCE=1 and a CUDA 12 build: ignored\n", __func__);
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+static int ggml_cuda_graphs_patch_window() {
+    static const int w = std::max(0, ggml_cuda_env_int("GGML_CUDA_GRAPHS_PATCH_WINDOW", 32));
+    return w;
+}
+
+static int ggml_cuda_graphs_patch_max() {
+    static const int m = std::min(100, std::max(0, ggml_cuda_env_int("GGML_CUDA_GRAPHS_PATCH_MAX", 60)));
+    return m;
+}
+
+// GGML_CUDA_GRAPHS_PATCH: the process's counts, logged every 64 decisions: evaluations patched (and the groups, ggml
+// nodes and CUDA nodes they re-dispatched) and full captures by reason (the first is a patch-mode capture's recording)
+struct ggml_cuda_graphs_patch_stats {
+    std::mutex mutex;
+    uint64_t   by_reason[GGML_CUDA_GRAPH_PATCH_REASON_COUNT] = {};
+    uint64_t   n_groups = 0, n_nodes = 0, n_cuda_nodes = 0, n_decisions = 0;
+};
+
+static ggml_cuda_graphs_patch_stats & ggml_cuda_graphs_patch_stats_get() {
+    static ggml_cuda_graphs_patch_stats s;
+    return s;
+}
+
+static void ggml_cuda_graphs_patch_count(const int reason, const uint64_t groups, const uint64_t nodes, const uint64_t cuda_nodes) {
+    ggml_cuda_graphs_patch_stats & s = ggml_cuda_graphs_patch_stats_get();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.by_reason[reason]++;
+    s.n_groups     += groups;
+    s.n_nodes      += nodes;
+    s.n_cuda_nodes += cuda_nodes;
+    if (++s.n_decisions % 64 == 0) {
+        std::string why;
+        for (int r = GGML_CUDA_GRAPH_PATCH_NOT_READY; r < GGML_CUDA_GRAPH_PATCH_REASON_COUNT; r++) {
+            why += " " + std::string(ggml_cuda_graph_patch_reason_name(r)) + " " + std::to_string(s.by_reason[r]);
+        }
+        GGML_LOG_INFO("GGML_CUDA_GRAPHS_PATCH: %" PRIu64 " of %" PRIu64 " captures patched (%" PRIu64 " groups, %" PRIu64
+                      " ggml nodes, %" PRIu64 " CUDA nodes set); captured in full:%s\n",
+                      s.by_reason[GGML_CUDA_GRAPH_PATCH_NONE], s.n_decisions, s.n_groups, s.n_nodes, s.n_cuda_nodes, why.c_str());
+    }
+}
+
+// GGML_CUDA_GRAPHS_PATCH: whether this evaluation's profiling leaves the captures as the loop makes them (none, or only
+// the events around the whole evaluation)
+static bool ggml_cuda_graphs_patch_profile_ok() {
+    const ggml_cuda_profile_state * prof = ggml_cuda_profile();
+    return prof == nullptr || prof->mode == GGML_CUDA_PROFILE_MODE_GRAPH;
+}
+
+#ifdef GGML_CUDA_GRAPHS_PATCH_API
+// GGML_CUDA_GRAPHS_PATCH: the chain's last node now, while the stream captures (null before its first node); false
+// when the capture is not a chain (more than one node to depend on)
+static bool ggml_cuda_graph_capture_tail(cudaStream_t stream, cudaGraphNode_t & tail) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    const cudaGraphNode_t * deps = nullptr;
+    size_t n_deps = 0;
+    if (cudaStreamGetCaptureInfo(stream, &status, nullptr, nullptr, &deps, &n_deps) != cudaSuccess ||
+            status != cudaStreamCaptureStatusActive || n_deps > 1) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    tail = n_deps == 1 ? deps[0] : nullptr;
+    return true;
+}
+
+// GGML_CUDA_GRAPHS_PATCH: a captured graph's nodes in launch order; false unless they form one chain (a single root,
+// each node with at most one dependent), as a single stream's capture does
+static bool ggml_cuda_graph_chain(cudaGraph_t g, std::vector<cudaGraphNode_t> & chain) {
+    chain.clear();
+    size_t n = 0;
+    if (cudaGraphGetNodes(g, nullptr, &n) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (n == 0) {
+        return true;
+    }
+    size_t n_roots = 0;
+    if (cudaGraphGetRootNodes(g, nullptr, &n_roots) != cudaSuccess || n_roots != 1) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    cudaGraphNode_t node = nullptr;
+    CUDA_CHECK(cudaGraphGetRootNodes(g, &node, &n_roots));
+    chain.reserve(n);
+    while (node != nullptr && chain.size() < n) {
+        chain.push_back(node);
+        size_t n_dep = 0;
+        if (cudaGraphNodeGetDependentNodes(node, nullptr, &n_dep) != cudaSuccess || n_dep > 1) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        cudaGraphNode_t next = nullptr;
+        if (n_dep == 1) {
+            CUDA_CHECK(cudaGraphNodeGetDependentNodes(node, &next, &n_dep));
+        }
+        node = next;
+    }
+    return node == nullptr && chain.size() == n;
+}
+#else
+static bool ggml_cuda_graph_capture_tail(cudaStream_t, cudaGraphNode_t &) {
+    return false;
+}
+static bool ggml_cuda_graph_chain(cudaGraph_t, std::vector<cudaGraphNode_t> &) {
+    return false;
+}
+#endif // GGML_CUDA_GRAPHS_PATCH_API
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -3444,10 +3587,18 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     graph->uid = cgraph->uid;
 
+    // GGML_CUDA_GRAPHS_PATCH (C779): which nodes changed, and whether only their parameters did (graph-patch.h)
+    const bool track = ggml_cuda_graphs_patch();
+    if (track) {
+        graph->node_changed.assign(cgraph->n_nodes, 0);
+        graph->node_structure_changed = false;
+    }
+
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
         res = true;
         graph->node_props.resize(cgraph->n_nodes);
+        graph->node_structure_changed = track;
     }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -3462,7 +3613,21 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             }
         }
 
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+        if (track) {
+            if (graph->node_structure_changed || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+                const ggml_tensor & a = graph->node_props[i].node;
+                const ggml_tensor & b = prop.node;
+                bool same = !graph->node_structure_changed && a.op == b.op && a.type == b.type && a.flags == b.flags &&
+                            a.view_src == b.view_src;
+                for (int j = 0; same && j < GGML_MAX_SRC; ++j) {
+                    same = a.src[j] == b.src[j];
+                }
+                graph->node_structure_changed = graph->node_structure_changed || !same;
+                graph->node_changed[i] = 1;
+                graph->node_props[i] = prop;
+                res = true;
+            }
+        } else if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
             graph->node_props[i] = prop;
             res = true;
         }
@@ -3506,10 +3671,45 @@ static int ggml_cuda_graph_chunk_size() {
     return chunk_size;
 }
 
-// end the capture of chunk `idx`, update or create its executable and launch it
-static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, size_t idx) {
+// GGML_CUDA_GRAPHS_PATCH: a full capture's recording of its groups, chunk by chunk
+struct ggml_cuda_graph_patch_rec {
+    bool                         ok = false; // recording, and every chunk so far was a chain cut into its groups
+    size_t                       g0 = 0;     // the current chunk's first group
+    std::vector<cudaGraphNode_t> tails;      // after each of the current chunk's groups, the chain's last node
+};
+
+// end the capture of chunk `idx`, update or create its executable and launch it. While rec records (patch mode), the
+// executable is instantiated anew from the captured graph, which is kept (its nodes name the executable's), and the
+// chunk's chain is cut into the groups recorded since the last chunk
+static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, size_t idx,
+        ggml_cuda_graph_patch_rec * rec = nullptr) {
     cudaGraph_t cuda_graph = nullptr;
     CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
+
+    if (rec != nullptr && rec->ok) {
+        if (idx < graph->instances.size()) {
+            CUDA_CHECK(cudaGraphExecDestroy(graph->instances[idx]));
+            graph->instances[idx] = nullptr;
+        } else {
+            GGML_ASSERT(idx == graph->instances.size());
+            graph->instances.emplace_back(nullptr);
+        }
+        CUDA_CHECK(cudaGraphInstantiate(&graph->instances[idx], cuda_graph, nullptr, nullptr, 0));
+        if (graph->patch_templates.size() <= idx) {
+            graph->patch_templates.resize(idx + 1, nullptr);
+            graph->patch_chains.resize(idx + 1);
+        }
+        if (graph->patch_templates[idx] != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph->patch_templates[idx]));
+        }
+        graph->patch_templates[idx] = cuda_graph;
+        rec->ok = ggml_cuda_graph_chain(cuda_graph, graph->patch_chains[idx]) &&
+                  ggml_cuda_graph_patch_ranges(graph->patch_chains[idx], rec->tails, graph->patch_groups, rec->g0);
+        rec->g0 = graph->patch_groups.size();
+        rec->tails.clear();
+        CUDA_CHECK(cudaGraphLaunch(graph->instances[idx], cuda_ctx->stream()));
+        return;
+    }
 
     if (idx < graph->instances.size()) {
         ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph);
@@ -6366,7 +6566,15 @@ struct ggml_cuda_profile_loop {
     }
 };
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key, ggml_cuda_profile_graph * prof_light_graph, const int prof_phase) {
+// GGML_CUDA_GRAPHS_PATCH: the bytes the stream's pool holds now (0 before its first use, which this does not cause)
+static size_t ggml_cuda_pool_used_now(const ggml_backend_cuda_context * cuda_ctx) {
+    const std::unique_ptr<ggml_cuda_pool> & p = cuda_ctx->pools[cuda_ctx->device][cuda_ctx->curr_stream_no];
+    return p ? p->used() : 0;
+}
+
+// patch_record (GGML_CUDA_GRAPHS_PATCH, a capture only): the capture records each dispatch group's nodes, the pool's use
+// before it and the CUDA nodes it made, so that later evaluations can be patched (ggml_cuda_graph_patch)
+static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key, ggml_cuda_profile_graph * prof_light_graph, const int prof_phase, const bool patch_record = false) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -6382,6 +6590,46 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     const int         chunk_size = ggml_cuda_graph_chunk_size();
     int               chunk_end  = chunk_size;
     size_t            n_chunks   = 0;
+
+    // GGML_CUDA_GRAPHS_PATCH: the recording of this capture; a capture that does not record leaves no templates, and
+    // the executables it updates are not patched until a recording capture
+    ggml_cuda_graph_patch_rec patch_rec;
+    if (use_cuda_graph && cuda_graph_update_required && ggml_cuda_graphs_patch()) {
+        graph->patch_ready = false;
+        graph->patch_groups.clear();
+        graph->patch_node_group.clear();
+        graph->patch_gather.clear();
+        if (patch_record) {
+            patch_rec.ok = true;
+            graph->patch_node_group.assign(cgraph->n_nodes, -1);
+            graph->patch_gather.assign(cgraph->n_nodes, 0);
+        } else if (!graph->patch_templates.empty()) {
+            graph->patch_drop_templates(0);
+        }
+    }
+    // a dispatch group [i, i + k] made while recording; pool_before: the pool's use before it
+    const auto patch_note = [&](const int i, const int k, const size_t pool_before, const bool q8_clean) {
+        if (!patch_rec.ok) {
+            return;
+        }
+        cudaGraphNode_t tail = nullptr;
+        if (!q8_clean || pool_before == SIZE_MAX || !ggml_cuda_graph_capture_tail(cuda_ctx->stream(), tail)) {
+            patch_rec.ok = false;
+            return;
+        }
+        ggml_cuda_graph_patch_group g;
+        g.start     = i;
+        g.end       = i + k;
+        g.chunk     = (uint32_t) n_chunks;
+        g.pool_used = pool_before;
+        for (int j = i; j <= i + k; j++) {
+            graph->patch_node_group[j] = (int32_t) graph->patch_groups.size();
+        }
+        graph->patch_groups.push_back(g);
+        patch_rec.tails.push_back(tail);
+    };
+#else
+    GGML_UNUSED(patch_record);
 #endif // USE_CUDA_GRAPH
 
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
@@ -6510,7 +6758,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // fused nodes are skipped together, so a cut never splits a fusion
                 // a concurrent region must join before its capture can end
                 if (use_cuda_graph && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active) {
-                    ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
+                    ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++, &patch_rec);
                     CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
                     chunk_end = i + chunk_size;
                 }
@@ -6557,10 +6805,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // a recurrent state gather whose gated_delta_net reads the cache row itself
                 if (ggml_cuda_gdn_state_gather_skipped(cgraph, i)) {
+#ifdef USE_CUDA_GRAPH
+                    if (patch_record) {
+                        graph->patch_gather[i] = 1;
+                    }
+#endif // USE_CUDA_GRAPH
                     continue;
                 }
 
                 const ggml_tensor * q8_1_row_before = cuda_ctx->q8_1_row.src;
+#ifdef USE_CUDA_GRAPH
+                const size_t patch_pool = patch_rec.ok ? ggml_cuda_pool_used_now(cuda_ctx) : 0;
+#endif // USE_CUDA_GRAPH
                 prof_loop.before(cgraph, i);
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
@@ -6580,6 +6836,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         prof_graph->labels.push_back(ggml_cuda_profile_label(cgraph, i, i + nodes_to_skip));
                         ggml_cuda_profile_record(*prof_graph, prof_graph->labels.size(), cuda_ctx->stream());
                     }
+#ifdef USE_CUDA_GRAPH
+                    patch_note(i, nodes_to_skip, patch_pool, q8_1_row_before == nullptr);
+#endif // USE_CUDA_GRAPH
                     i += nodes_to_skip;
                     continue;
                 }
@@ -6606,6 +6865,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
                 prof_loop.after(cgraph, i, i);
+#ifdef USE_CUDA_GRAPH
+                patch_note(i, 0, patch_pool, q8_1_row_before == nullptr);
+#endif // USE_CUDA_GRAPH
                 q8_1_row_check(i, i, q8_1_row_before);
                 if (cuda_ctx->moe_persistent.check_dst) {
                     ggml_cuda_moe_persistent_check_node(*cuda_ctx, node);
@@ -6638,13 +6900,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #ifdef USE_CUDA_GRAPH
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
-            ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
+            ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++, &patch_rec);
 
             // drop the chunks left over from a longer graph
             for (size_t i = n_chunks; i < graph->instances.size(); ++i) {
                 CUDA_CHECK(cudaGraphExecDestroy(graph->instances[i]));
             }
             graph->instances.resize(n_chunks);
+            // GGML_CUDA_GRAPHS_PATCH: ready when every chunk was recorded and no persistent MoE layer ran (its kernel
+            // keeps state on the host); otherwise nothing is patched until the next recording capture
+            if (patch_record) {
+                if (patch_rec.ok && cuda_ctx->moe_persistent.n_layers == 0 && graph->patch_templates.size() >= n_chunks) {
+                    if (graph->patch_templates.size() > n_chunks) {
+                        graph->patch_drop_templates(n_chunks);
+                    }
+                    graph->patch_ready = true;
+                } else {
+                    graph->patch_drop_templates(0);
+                }
+            }
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -6671,6 +6945,179 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         ggml_cuda_profile_write(prof, cuda_ctx, graph_key);
     }
 }
+
+#ifdef USE_CUDA_GRAPH
+// GGML_CUDA_GRAPHS_PATCH (C779, graph-patch.h): an evaluation the force plan would capture again is patched instead.
+// The groups near its changed nodes (ggml_cuda_graph_patch_dirty) are re-dispatched, in order, into one scratch capture;
+// each must fuse the nodes it fused and make CUDA nodes of the kinds it made, from the pool use it had, and their
+// parameters are set in the executables, which then replay as if captured from this evaluation's properties. Returns
+// GGML_CUDA_GRAPH_PATCH_NONE when they do, else why not: the caller captures in full, which records again. n_groups,
+// n_nodes and n_cuda: the groups, ggml nodes and CUDA nodes re-dispatched and set
+static int ggml_cuda_graph_patch(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, ggml_cuda_graph * graph,
+        int & n_groups, int & n_nodes, int & n_cuda) {
+    n_groups = n_nodes = n_cuda = 0;
+#ifdef GGML_CUDA_GRAPHS_PATCH_API
+    const int n = cgraph->n_nodes;
+    if (graph->patch_node_group.size() != (size_t) n || graph->patch_gather.size() != (size_t) n ||
+            graph->node_changed.size() != (size_t) n) {
+        return graph->node_structure_changed ? GGML_CUDA_GRAPH_PATCH_STRUCTURE : GGML_CUDA_GRAPH_PATCH_NOT_READY;
+    }
+    int n_dirty_nodes = 0;
+    const std::vector<int> dirty = ggml_cuda_graph_patch_dirty(graph->patch_groups, graph->patch_node_group,
+        graph->node_changed, ggml_cuda_graphs_patch_window(), n_dirty_nodes);
+    int r = ggml_cuda_graph_patch_precheck(graph->patch_ready, graph->node_structure_changed, graph->instances.size(),
+        graph->patch_templates.size(), n_dirty_nodes, n, ggml_cuda_graphs_patch_max());
+    if (r != GGML_CUDA_GRAPH_PATCH_NONE) {
+        return r;
+    }
+
+    // the loop's skips stay as recorded: a changed node it skipped is skipped still, and every state gather (whose
+    // decision reads nodes up to 256 ahead) is or is not skipped as before
+    for (int i = 0; i < n; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        const bool passive = ggml_cuda_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+        if (graph->node_changed[i] && graph->patch_node_group[i] < 0 && !graph->patch_gather[i] && !passive) {
+            return GGML_CUDA_GRAPH_PATCH_SKIP;
+        }
+        if (node->op == GGML_OP_GET_ROWS && graph->patch_node_group[i] < 0 && !passive) {
+            if (ggml_cuda_gdn_state_gather_skipped(cgraph, i) != (graph->patch_gather[i] != 0)) {
+                return GGML_CUDA_GRAPH_PATCH_SKIP;
+            }
+        } else if (node->op == GGML_OP_GET_ROWS && graph->patch_node_group[i] >= 0 &&
+                   graph->patch_groups[graph->patch_node_group[i]].start == i && ggml_cuda_gdn_state_gather_skipped(cgraph, i)) {
+            return GGML_CUDA_GRAPH_PATCH_SKIP;
+        }
+    }
+
+    cudaStream_t stream = cuda_ctx->stream();
+    ggml_cuda_keepalive_graph_begin(ggml_cuda_get_physical_device(cuda_ctx->device), true);
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+
+    std::vector<cudaGraphNode_t> tails;
+    tails.reserve(dirty.size());
+    for (const int g : dirty) {
+        const ggml_cuda_graph_patch_group & grp = graph->patch_groups[g];
+        const int i = grp.start;
+        ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_cuda_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                ggml_cuda_gdn_state_gather_skipped(cgraph, i)) {
+            r = GGML_CUDA_GRAPH_PATCH_SKIP;
+            break;
+        }
+        if (ggml_cuda_pool_used_now(cuda_ctx) != grp.pool_used) {
+            r = GGML_CUDA_GRAPH_PATCH_POOL;
+            break;
+        }
+        cuda_ctx->q8_1_row.src = nullptr;
+        const int k = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+        if (k == 0) {
+            const bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+            if (!ok) {
+                GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+            }
+            GGML_ASSERT(ok);
+        }
+        cudaGraphNode_t tail = nullptr;
+        if (k != grp.end - grp.start || cuda_ctx->moe_persistent.n_layers != 0) {
+            r = GGML_CUDA_GRAPH_PATCH_FUSE;
+            break;
+        }
+        if (!ggml_cuda_graph_capture_tail(stream, tail)) {
+            r = GGML_CUDA_GRAPH_PATCH_NODES;
+            break;
+        }
+        tails.push_back(tail);
+    }
+    cuda_ctx->q8_1_row.src = nullptr;
+
+    cudaGraph_t scratch = nullptr;
+    CUDA_CHECK(cudaStreamEndCapture(stream, &scratch));
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+            ggml_cuda_lock_cv.notify_all();
+        }
+    }
+
+    if (r == GGML_CUDA_GRAPH_PATCH_NONE) {
+        std::vector<cudaGraphNode_t> chain;
+        std::vector<ggml_cuda_graph_patch_group> made(dirty.size());
+        if (!ggml_cuda_graph_chain(scratch, chain) || !ggml_cuda_graph_patch_ranges(chain, tails, made, 0)) {
+            r = GGML_CUDA_GRAPH_PATCH_NODES;
+        }
+        // the kinds first, so that no executable is touched unless every node maps
+        for (size_t d = 0; r == GGML_CUDA_GRAPH_PATCH_NONE && d < dirty.size(); d++) {
+            const ggml_cuda_graph_patch_group & grp = graph->patch_groups[dirty[d]];
+            if (made[d].count != grp.count || grp.chunk >= graph->instances.size() ||
+                    grp.chunk >= graph->patch_chains.size() || grp.first + grp.count > graph->patch_chains[grp.chunk].size()) {
+                r = GGML_CUDA_GRAPH_PATCH_NODES;
+                break;
+            }
+            for (uint32_t j = 0; j < grp.count; j++) {
+                cudaGraphNodeType ts = cudaGraphNodeTypeEmpty, td = cudaGraphNodeTypeEmpty;
+                CUDA_CHECK(cudaGraphNodeGetType(chain[made[d].first + j], &ts));
+                CUDA_CHECK(cudaGraphNodeGetType(graph->patch_chains[grp.chunk][grp.first + j], &td));
+                if (ts != td || (ts != cudaGraphNodeTypeKernel && ts != cudaGraphNodeTypeMemset && ts != cudaGraphNodeTypeMemcpy)) {
+                    r = GGML_CUDA_GRAPH_PATCH_NODES;
+                    break;
+                }
+            }
+        }
+        // the parameters: kernels through the driver API, whose node calls also take the kernels that libraries
+        // launch with it (cuBLAS), which the runtime's cudaGraphKernelNodeGetParams refuses
+        for (size_t d = 0; r == GGML_CUDA_GRAPH_PATCH_NONE && d < dirty.size(); d++) {
+            const ggml_cuda_graph_patch_group & grp = graph->patch_groups[dirty[d]];
+            cudaGraphExec_t exec = graph->instances[grp.chunk];
+            for (uint32_t j = 0; j < grp.count; j++) {
+                cudaGraphNode_t src = chain[made[d].first + j];
+                cudaGraphNode_t dst = graph->patch_chains[grp.chunk][grp.first + j];
+                cudaGraphNodeType t = cudaGraphNodeTypeEmpty;
+                CUDA_CHECK(cudaGraphNodeGetType(src, &t));
+                bool ok = false;
+                if (t == cudaGraphNodeTypeKernel) {
+                    CUDA_KERNEL_NODE_PARAMS p;
+                    ok = cuGraphKernelNodeGetParams(src, &p) == CUDA_SUCCESS &&
+                         cuGraphExecKernelNodeSetParams(exec, dst, &p) == CUDA_SUCCESS;
+                } else if (t == cudaGraphNodeTypeMemset) {
+                    cudaMemsetParams p;
+                    ok = cudaGraphMemsetNodeGetParams(src, &p) == cudaSuccess &&
+                         cudaGraphExecMemsetNodeSetParams(exec, dst, &p) == cudaSuccess;
+                } else {
+                    cudaMemcpy3DParms p;
+                    ok = cudaGraphMemcpyNodeGetParams(src, &p) == cudaSuccess &&
+                         cudaGraphExecMemcpyNodeSetParams(exec, dst, &p) == cudaSuccess;
+                }
+                if (!ok) {
+                    (void) cudaGetLastError();
+                    r = GGML_CUDA_GRAPH_PATCH_API;
+                    break;
+                }
+                n_cuda++;
+            }
+        }
+    }
+    CUDA_CHECK(cudaGraphDestroy(scratch));
+
+    if (r != GGML_CUDA_GRAPH_PATCH_NONE) {
+        // an executable may hold some of the new parameters: the full capture that follows instantiates anew
+        graph->patch_ready = false;
+        return r;
+    }
+    n_groups = (int) dirty.size();
+    n_nodes  = n_dirty_nodes;
+    return GGML_CUDA_GRAPH_PATCH_NONE;
+#else
+    GGML_UNUSED(cuda_ctx);
+    GGML_UNUSED(cgraph);
+    GGML_UNUSED(graph);
+    return GGML_CUDA_GRAPH_PATCH_NOT_READY;
+#endif // GGML_CUDA_GRAPHS_PATCH_API
+}
+#endif // USE_CUDA_GRAPH
 
 // GGML_CUDA_PROFILE_HOST=<file>: one CSV line per graph evaluation: device, evaluation, the host time at entry to and
 // exit from the backend's graph_compute (ms since the first evaluation) and the GPU time between two CUDA events around
@@ -6824,6 +7271,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
+    bool patch_mode                 = false; // GGML_CUDA_GRAPHS_PATCH: this capture records its groups (C779)
     const void * graph_key = nullptr;
 
     // GGML_CUDA_PROFILE_MODE other than group: sample mode's phase of this evaluation
@@ -6854,6 +7302,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     [graph](uint64_t gen) { return graph->profile_phases.stale(gen); });
                 use_cuda_graph             = plan.use_graph;
                 cuda_graph_update_required = plan.capture;
+                // GGML_CUDA_GRAPHS_PATCH (C779): a capture of a few changed nodes becomes a patch and a replay; a full
+                // capture records its groups for the next one. Not while a profile adds events inside the captures
+                patch_mode = use_cuda_graph && cuda_graph_update_required && ggml_cuda_graphs_patch() &&
+                             ggml_cuda_graphs_patch_profile_ok();
             } else if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
@@ -6880,6 +7332,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     cuda_graph_update_required = graph->instances.empty() || graph->profile_phases.stale(graph->capture_gen);
                 }
             }
+        }
+    }
+    if (ggml_cuda_graphs_patch()) {
+        if (!use_cuda_graph) {
+            // an eager evaluation records its properties but leaves the executables as they were
+            graph->patch_ready = false;
+        } else if (patch_mode) {
+            int n_groups = 0, n_nodes = 0, n_cuda = 0;
+            const int reason = ggml_cuda_graph_patch(cuda_ctx, cgraph, graph, n_groups, n_nodes, n_cuda);
+            if (reason == GGML_CUDA_GRAPH_PATCH_NONE) {
+                cuda_graph_update_required = false; // the executables replay
+                patch_mode = false;
+            }
+            ggml_cuda_graphs_patch_count(reason, n_groups, n_nodes, n_cuda);
         }
     }
 #else
@@ -6934,7 +7400,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key, prof_light_graph, prof_phase);
+    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key, prof_light_graph, prof_phase,
+                                         patch_mode && use_cuda_graph && cuda_graph_update_required);
 
 #ifdef USE_CUDA_GRAPH
     if (use_cuda_graph && cuda_graph_update_required) {

@@ -341,6 +341,9 @@ llama_build_and_test(test-cuda-keepalive.cpp  LABEL behavior)
 
 # GGML_CUDA_GRAPHS_FORCE's choice of graphs and its capture decisions, in a model of the warm-up and capture logic
 llama_build_and_test(test-cuda-graph-force.cpp  LABEL behavior)
+
+# GGML_CUDA_GRAPHS_PATCH's dirty groups, chain cutting and decision, in a model of the recording capture and the patch
+llama_build_and_test(test-cuda-graph-patch.cpp  LABEL behavior)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
