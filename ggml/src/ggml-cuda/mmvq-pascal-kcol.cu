@@ -173,6 +173,36 @@ static int kcol_blocks(const int t, const int ncols, const int R) {
     }
 }
 
+// GGML_CUDA_MMVQ_PASCAL_KCOL_EXACT (C805): 0 (default) as before; 1 or 2: a product of 2 to 8 columns of a type whose
+// one-token sums are this kernel's (kcol_one_token_sums) is never left to another kernel for the dispatch table (Q824)
+// or for shared memory: where its activations do not fit the budget (GGML_CUDA_MMVQ_PASCAL_KCOL_SMEM, or the default
+// rule's 48 KB), it runs as kcol::pick_exact plans it (1: within 48 KB, in one launch where all columns fit; 2: launches
+// within the budget first). Elsewhere such a product runs on llama.cpp's mul_mat_vec_q (5 to 8 columns, and Q3_K and
+// IQ4_NL at every count), whose sums are not the one-token sums, or on mmvq-pascal.cu's kernel of 2 to 4 tokens (Q2_0,
+// Q8_0); here each token's sums stay the one-token ones at every token count. The one-column products this kernel runs
+// (Q3_K, IQ4_NL, those Q8_0 rows; in mode 2 every type) stay here too, so that a budget under one column's needs
+// (29 KB for Q3_K's 32-lane rows) cannot move the one-token sums themselves to another kernel.
+// GGML_CUDA_MMVQ_PASCAL_KCOL_EXACT_FAULT=1 (checks only): every launch after a split product's first reads the first
+// launch's activations, so a split product must differ.
+static int kcol_exact() {
+    static const int v = kcol_env_int("GGML_CUDA_MMVQ_PASCAL_KCOL_EXACT", 0);
+    return v == 1 || v == 2 ? v : 0;
+}
+
+static bool kcol_exact_fault() {
+    static const bool f = kcol_env_int("GGML_CUDA_MMVQ_PASCAL_KCOL_EXACT_FAULT", 0) != 0;
+    return f;
+}
+
+// C805: the types whose one-token products have this kernel's sums: Q3_K and IQ4_NL, whose one-token products it runs;
+// Q8_0 in rows whose 64-weight chunks aren't a multiple of 4, the same; and Q2_0, whose one-token Pascal kernel
+// (mmvq-pascal.cu) sums the same 128-weight chunks (two blocks per lane) over the same lanes in the same order with the
+// same integer and FP32 operations.
+static bool kcol_one_token_sums(const int t, const int64_t K) {
+    return t == kcol::KQ3_K || t == kcol::KIQ4_NL || t == kcol::KQ2_0 ||
+        (t == kcol::KQ8_0 && K % 64 == 0 && (K / 64) % 4 != 0);
+}
+
 // shared memory per SM of device dev, read once
 static int kcol_smem_sm(const int dev) {
     static int smem[GGML_CUDA_MAX_DEVICES] = {};
@@ -245,18 +275,26 @@ bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tens
         }
     }
 
+    // C805: products whose one-token sums are this kernel's stay here (GGML_CUDA_MMVQ_PASCAL_KCOL_EXACT)
+    const bool exact = kcol_exact() != 0 && kcol_one_token_sums(t, K);
+
     // Q824: where the other kernels are faster (mode 1, 2 or more columns)
-    const bool table = mode == 1 && ncols >= 2 && kcol_table_on();
+    const bool table = mode == 1 && ncols >= 2 && kcol_table_on() && !exact;
     if (table && kcol_table_declines(src0->type, K, ncols)) {
         return false;
     }
 
     const kcol_overrides & o = kcol_shape_env();
     const int nsm = o.nsm > 0 ? o.nsm : ggml_cuda_info().devices[ctx.device].nsm;
+    const int smsm = o.smsm > 0 ? o.smsm : kcol_smem_sm(ctx.device);
     kcol::shape s;
+    int cols = 0; // C805: columns per launch (0: all)
     if (!kcol::pick_shape(t, (int) K, (int) nrows, (int) ncols, (int) src0->nb[1], (uintptr_t) src0->data, nsm, o.r, o.itt,
-                          o.smem, s, o.smsm > 0 ? o.smsm : kcol_smem_sm(ctx.device), kcol_blocks)) {
-        return false;
+                          o.smem, s, smsm, kcol_blocks)) {
+        if (!exact || !kcol::pick_exact(t, (int) K, (int) nrows, (int) ncols, (int) src0->nb[1], (uintptr_t) src0->data, nsm,
+                                        o.r, o.itt, o.smem, kcol_exact(), s, cols, smsm, kcol_blocks)) {
+            return false;
+        }
     }
     if (table && s.fallback) {
         return false;
@@ -276,6 +314,8 @@ bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tens
     p.stride_col_y   = (int) (src1->nb[1] / sizeof(float));
     p.stride_col_dst = (int) (dst->nb[1] / sizeof(float));
     p.s              = s;
+    p.cols           = cols;
+    p.fault          = cols > 0 && kcol_exact_fault() ? 1 : 0;
 
     cudaStream_t stream = ctx.stream();
     switch (t) {

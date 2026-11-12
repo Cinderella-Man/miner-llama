@@ -1316,6 +1316,41 @@ inline bool pick_shape(const int t, const int K, const int nrows, const int ncol
     return true;
 }
 
+// C805 (GGML_CUDA_MMVQ_PASCAL_KCOL_EXACT): a launch plan for a product of ncols columns that pick_shape declined
+// (one iteration of the columns' activation records and the staging buffers pass the budget). A column's sums depend on
+// the row width only (above), not on the launch shape or the column count, so the product may run as several launches
+// of cols columns each (the last one may have fewer), all with shape s, from the one quantizer launch: ncols split into
+// k launches of ceil(ncols / k) columns, k the smallest that fits. mode 1: the budget of 48 KB (all ncols in one launch
+// where they fit: the default rule's 48 KB step, pick_old above); mode 2: first launches whose shape fits smem_budget
+// (0: the default rule), from 2 launches on, then as mode 1. r_force and itt_force as for pick_shape; where the forced R
+// leaves nothing, R is chosen as without it. Returns false where not even one column fits (row width, alignment).
+inline bool pick_exact(const int t, const int K, const int nrows, const int ncols, const int row_bytes, const uintptr_t x_addr,
+                       const int nsm, const int r_force, const int itt_force, const int smem_budget, const int mode,
+                       shape & s, int & cols, const int smem_sm = 0, const blocks_fn blocks = nullptr) {
+    const auto try_cols = [&](const int c, const int budget) {
+        if (pick_shape(t, K, nrows, c, row_bytes, x_addr, nsm, r_force, itt_force, budget, s, smem_sm, blocks) ||
+                (r_force > 0 && pick_shape(t, K, nrows, c, row_bytes, x_addr, nsm, 0, itt_force, budget, s, smem_sm, blocks))) {
+            cols = c;
+            return true;
+        }
+        return false;
+    };
+    for (int pass = mode == 2 ? 0 : 1; pass < 2; ++pass) {
+        int prev = 0;
+        for (int k = pass == 0 ? 2 : 1; k <= ncols; ++k) {
+            const int c = (ncols + k - 1) / k;
+            if (c == prev) {
+                continue;
+            }
+            prev = c;
+            if (try_cols(c, pass == 0 ? smem_budget : KCOL_SMEM_MAX)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 #ifdef __CUDACC__
 // Resident blocks per SM that the registers and threads of mul_mat_kcol<T, NC, R> allow on the current device
 // (cudaOccupancyMaxActiveBlocksPerMultiprocessor without dynamic shared memory), queried once per kernel; 0 if the query
@@ -1372,6 +1407,8 @@ struct params {
     int           stride_col_dst;
     shape         s;
     const uint32_t * grid = nullptr; // grid types and IQ1_M: args::grid
+    int           cols  = 0;       // C805: columns per launch (pick_exact; 0: all ncols in one launch)
+    int           fault = 0;       // C805's check: every launch after the first reads the first launch's records
 };
 
 template <int T, int NC, int R>
@@ -1414,10 +1451,18 @@ inline void launch(const params & p, cudaStream_t stream) {
     a.seg_log2       = p.s.seg_log2;
     a.stride_col_dst = p.stride_col_dst;
     a.grid           = p.grid;
-    if (p.s.R == 1) {
-        launch_cols<T, 1>(a, p.s, p.ncols, stream);
-    } else {
-        launch_cols<T, 2>(a, p.s, p.ncols, stream);
+    // C805: p.cols columns per launch (one launch for all ncols where p.cols is 0 or ncols)
+    const int step = p.cols > 0 && p.cols < p.ncols ? p.cols : p.ncols;
+    for (int j0 = 0; j0 < p.ncols; j0 += step) {
+        const int nc = p.ncols - j0 < step ? p.ncols - j0 : step;
+        args aj = a;
+        aj.rec = p.rec + (p.fault ? 0 : (size_t) j0 * nunits * rec_words<T>());
+        aj.dst = p.dst + (int64_t) j0 * p.stride_col_dst;
+        if (p.s.R == 1) {
+            launch_cols<T, 1>(aj, p.s, nc, stream);
+        } else {
+            launch_cols<T, 2>(aj, p.s, nc, stream);
+        }
     }
 }
 
