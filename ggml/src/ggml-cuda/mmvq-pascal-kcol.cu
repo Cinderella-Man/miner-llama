@@ -179,7 +179,9 @@ static int kcol_blocks(const int t, const int ncols, const int R) {
 // rule's 48 KB), it runs as kcol::pick_exact plans it (1: within 48 KB, in one launch where all columns fit; 2: launches
 // within the budget first). Elsewhere such a product runs on llama.cpp's mul_mat_vec_q (5 to 8 columns, and Q3_K and
 // IQ4_NL at every count), whose sums are not the one-token sums, or on mmvq-pascal.cu's kernel of 2 to 4 tokens (Q2_0,
-// Q8_0); here each token's sums stay the one-token ones at every token count.
+// Q8_0); here each token's sums stay the one-token ones at every token count. The one-column products this kernel runs
+// (Q3_K, IQ4_NL, those Q8_0 rows; in mode 2 every type) stay here too, so that a budget under one column's needs
+// (29 KB for Q3_K's 32-lane rows) cannot move the one-token sums themselves to another kernel.
 // GGML_CUDA_MMVQ_PASCAL_KCOL_EXACT_FAULT=1 (checks only): every launch after a split product's first reads the first
 // launch's activations, so a split product must differ.
 static int kcol_exact() {
@@ -273,8 +275,8 @@ bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tens
         }
     }
 
-    // C805: products of 2 to 8 columns whose one-token sums are this kernel's stay here (GGML_CUDA_MMVQ_PASCAL_KCOL_EXACT)
-    const bool exact = ncols >= 2 && kcol_exact() != 0 && kcol_one_token_sums(t, K);
+    // C805: products whose one-token sums are this kernel's stay here (GGML_CUDA_MMVQ_PASCAL_KCOL_EXACT)
+    const bool exact = kcol_exact() != 0 && kcol_one_token_sums(t, K);
 
     // Q824: where the other kernels are faster (mode 1, 2 or more columns)
     const bool table = mode == 1 && ncols >= 2 && kcol_table_on() && !exact;

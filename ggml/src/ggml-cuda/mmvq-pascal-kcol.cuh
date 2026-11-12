@@ -28,8 +28,8 @@
 // rows of chunks not a multiple of 4 (the types whose one-token sums are these kernels') are never left to the other
 // kernels, whose sums differ: not by the table, and not where the columns' activations pass the shared-memory budget,
 // where they run within 48 KB (in one launch where all columns fit, else in launches of fewer columns); =2 tries
-// launches within the budget first. _KCOL_EXACT_FAULT=1 (checks): a split product's later launches read the first one's
-// activations.
+// launches within the budget first. The one-column products these kernels run stay with them the same way.
+// _KCOL_EXACT_FAULT=1 (checks): a split product's later launches read the first one's activations.
 
 // Runs dst = src0 * src1 if these kernels take it; returns false (nothing launched) otherwise.
 bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,

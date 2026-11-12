@@ -1316,7 +1316,7 @@ inline bool pick_shape(const int t, const int K, const int nrows, const int ncol
     return true;
 }
 
-// C805 (GGML_CUDA_MMVQ_PASCAL_KCOL_EXACT): a launch plan for a product of ncols >= 2 columns that pick_shape declined
+// C805 (GGML_CUDA_MMVQ_PASCAL_KCOL_EXACT): a launch plan for a product of ncols columns that pick_shape declined
 // (one iteration of the columns' activation records and the staging buffers pass the budget). A column's sums depend on
 // the row width only (above), not on the launch shape or the column count, so the product may run as several launches
 // of cols columns each (the last one may have fewer), all with shape s, from the one quantizer launch: ncols split into
