@@ -77,6 +77,9 @@ struct llama_cparams {
     const llama_head_shortlist * head_short    = nullptr;
     bool                         head_short_on = false;
     uint32_t                     head_short_n  = 0;
+    // LLAMA_SCHED_PER_SIZE_RESERVE (C803): set only in the graph a per-size scheduler is planned with, which builds the
+    // shortlist head's further ids for this many ids (its whole room) instead of the list's, 0 otherwise
+    uint32_t                     head_short_n_plan = 0;
 
     // a draft's token embedding rows on its layer's card (llama_embd_cache_init, Q961); embd_cache_on is set per micro-
     // batch, when the batch's tokens read their rows from it, so that the two kinds of batch keep separate graphs

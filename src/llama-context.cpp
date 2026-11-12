@@ -784,6 +784,17 @@ llama_context::llama_context(
                 LLAMA_LOG_INFO("%s: LLAMA_MTP_GRAPH_KEEP: the draft keeps a graph and a scheduler per batch shape of up to 8 tokens\n", __func__);
             }
         }
+
+        // LLAMA_SCHED_PER_SIZE_RESERVE=1 (C803): each per-size scheduler is planned once over the whole memory
+        const char * env_plan = getenv("LLAMA_SCHED_PER_SIZE_RESERVE");
+        if (env_plan && atoi(env_plan) != 0) {
+            if (!sched_per_size) {
+                LLAMA_LOG_WARN("%s: LLAMA_SCHED_PER_SIZE_RESERVE=1 needs per-size schedulers (LLAMA_MTP_GRAPH_KEEP=1 or LLAMA_SCHED_PER_SIZE=1), ignored\n", __func__);
+            } else {
+                sched_small_reserve = true;
+                LLAMA_LOG_INFO("%s: LLAMA_SCHED_PER_SIZE_RESERVE: each per-size scheduler is planned once, over the whole memory\n", __func__);
+            }
+        }
     }
 
     // Q771: the micro-batch taper, off unless LLAMA_UBATCH_TAPER sets it (llama_set_ubatch_taper can change it later)
@@ -3313,7 +3324,8 @@ llm_graph_result * llama_context::process_ubatch_graph(const llama_ubatch & ubat
         }
         if (ss == nullptr) {
             sched_small.push_back({ key, ggml_backend_sched_ptr(ggml_backend_sched_new(
-                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), graph_max_nodes(8), false, cparams.op_offload)), nullptr, false });
+                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), graph_max_nodes(8), false, cparams.op_offload)), nullptr, false,
+                    false, false });
             ss = &sched_small.back();
             ggml_backend_sched_set_copy_callback(ss->sched.get(), sched_copy_experts, this);
             ggml_backend_sched_set_realloc_callback(ss->sched.get(), sched_graph_realloc, this);
@@ -3329,6 +3341,24 @@ llm_graph_result * llama_context::process_ubatch_graph(const llama_ubatch & ubat
     if (embd_cache) {
         cparams.embd_cache_on = gtype == LLM_GRAPH_TYPE_DECODER_MTP && ubatch.token != nullptr && ubatch.embd == nullptr &&
                 embd_cache->prepare(ubatch.token, ubatch.n_tokens, embd_cache_backend);
+    }
+
+    // LLAMA_SCHED_PER_SIZE_RESERVE (C803): a new per-size scheduler is planned once from this batch's graph over the whole
+    // memory, before its first graph is allocated, so the plan holds every later graph of its shape (the key fixes the
+    // tokens, the outputs, the head's shortlist and the carry); again only when the shortlist head's part for further ids
+    // first appears, which adds nodes (the list is empty until the first such id joins)
+    if (ss && sched_small_reserve) {
+        const bool extra = cparams.head_short_on && cparams.head_short && cparams.head_short->n_extra() > 0;
+        if (!ss->planned || ss->planned_extra != extra) {
+            if (!sched_small_plan(*ss, ubatch, gtype)) {
+                LLAMA_LOG_WARN("%s: LLAMA_SCHED_PER_SIZE_RESERVE: the %u-token scheduler could not be planned over the whole memory\n",
+                        __func__, ubatch.n_tokens);
+            }
+            ss->planned       = true;
+            ss->planned_extra = extra;
+            // the reserve reset the scheduler: its graph has to be allocated again
+            ss->ready = nullptr;
+        }
     }
 
     // the new graph parameters
@@ -5793,6 +5823,51 @@ llm_graph_params llama_context::graph_params(
         /*.h_nextn_row0  =*/ &h_nextn_row0,
         /*.ngram_pf      =*/ ngram_pf.get(),
     };
+}
+
+bool llama_context::sched_small_plan(sched_small_entry & ss, const llama_ubatch & ubatch, llm_graph_type gtype) {
+    // C803: the shared scheduler is planned at the start from a graph over the whole memory (sched_reserve), so later
+    // graphs, whose memory views and masks are no longer than the whole memory's, fit its plan. A per-size scheduler
+    // made later was planned from its first graph, sized for the memory at that time: once the context grew past it
+    // (the QSA mask over the cells, n_kv), or the head shortlist's further ids did, every graph of that size needed a new
+    // plan, after a sync of the scheduler's backends, and a larger compute buffer. This plans it the shared scheduler's
+    // way: this batch's graph, built over the whole memory (init_full) and with the shortlist head's part for its whole
+    // room, reserved in the scheduler and never computed. The batch's own graph is built next, as without the switch.
+    if (memory == nullptr) {
+        return false;
+    }
+    const int64_t t0 = ggml_time_us();
+
+    llama_memory_context_ptr mctx_full = memory->init_full();
+    if (!mctx_full) {
+        return false;
+    }
+    if (!gf_res_plan) {
+        gf_res_plan.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+    }
+    auto * res = gf_res_plan.get();
+
+    auto gparams = graph_params(res, ubatch, mctx_full.get(), gtype);
+    if (gparams.cparams.head_short_on && gparams.cparams.head_short && gparams.cparams.head_short->n_extra() > 0) {
+        gparams.cparams.head_short_n_plan = std::max<uint32_t>(gparams.cparams.head_short->m_cap, 1);
+    }
+    gparams.sched = ss.sched.get();
+
+    res->reset();
+    ggml_cgraph * gf = model.build_graph(gparams);
+    if (gf == nullptr) {
+        return false;
+    }
+    const int  n_nodes = ggml_graph_n_nodes(gf);
+    const bool ok      = ggml_backend_sched_reserve(ss.sched.get(), gf);
+    // the graph refers to the whole memory's context, which goes now: nothing may reuse it
+    res->reset();
+
+    LLAMA_LOG_INFO("%s: the %u-token scheduler (%s outputs%s) planned over the whole memory: %d nodes, %.3f ms\n", __func__,
+            ubatch.n_tokens, n_outputs > 0 ? "with" : "without",
+            gparams.cparams.head_short_n_plan > 0 ? ", the shortlist head's whole room" : "",
+            n_nodes, (ggml_time_us() - t0)/1000.0);
+    return ok;
 }
 
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {

@@ -49,5 +49,8 @@ struct llama_head_shortlist {
 };
 
 // The shortlist's logits [n_vocab, 1] for one hidden state h [n_embd, 1] and the head output [n_embd, n_vocab]: the same
-// values as ggml_mul_mat(output, h) for the ids in the list, -INFINITY for the others.
-ggml_tensor * llama_head_shortlist_logits(ggml_context * ctx, const llama_head_shortlist & sl, ggml_tensor * output, ggml_tensor * h);
+// values as ggml_mul_mat(output, h) for the ids in the list, -INFINITY for the others. n_extra_plan > 0 builds the further
+// ids' part for that many ids instead of the list's (at most m_cap): a graph that is only planned, never computed
+// (LLAMA_SCHED_PER_SIZE_RESERVE, C803), so that its plan holds every later list
+ggml_tensor * llama_head_shortlist_logits(ggml_context * ctx, const llama_head_shortlist & sl, ggml_tensor * output, ggml_tensor * h,
+        uint32_t n_extra_plan = 0);

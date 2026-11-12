@@ -189,6 +189,7 @@ static void usage(char ** argv) {
     LOG("  --kv-seq-rm              Check that LLAMA_KV_SEQ_RM_BOUND leaves every memory as it is over random sequence edits (CPU only)\n");
     LOG("  --kv-seq-rm-time         Time one seq_rm call without and with LLAMA_KV_SEQ_RM_BOUND at 65,536 cells (CPU only)\n");
     LOG("  --mtp-graph-keep         Check that LLAMA_MTP_GRAPH_KEEP leaves the MTP draft's caches and drafts as they are and builds fewer graphs (CPU only)\n");
+    LOG("  --mtp-replan             Check that LLAMA_SCHED_PER_SIZE_RESERVE plans the MTP draft's per-size schedulers once, so a growing context never re-plans them (CPU only)\n");
     LOG("  --verify-prepare         Check that a decode prepared before its last token id (llama_decode_prepare, C738) gives the plain decode's results\n");
     LOG("  --mtp-h-dev              Check that LLAMA_MTP_H_DEV's host and device rows give the MTP draft the same caches and drafts (CPU only)\n");
     LOG("  --mtp-incall-overlap     Check that checkpoints inside a call (C217) give the MTP draft's parts and drafts of separate calls,\n");
@@ -4263,6 +4264,422 @@ static int test_mtp_graph_keep(const std::string & arch_filter, const size_t see
     return n_failed == 0 ? 0 : 1;
 }
 
+// --mtp-replan (C803): the MTP draft context's allocator plans over a multi-turn run of the draft-mtp driver, whose
+// context grows past many 256-cell steps. Three arms of the same run: the shared scheduler alone (base), per-size
+// schedulers (LLAMA_MTP_GRAPH_KEEP=1, keep) and per-size schedulers planned once over the whole memory
+// (LLAMA_SCHED_PER_SIZE_RESERVE=1, plan). The allocator's trace (LLAMA_UBATCH_TRACE=1) logs a line for every graph that
+// does not fit its scheduler's plan ("galloc-trigger"), before that evaluation's own trace line ("ubatch-trace: mtp" for
+// the draft, "dec" for the target). plan must re-plan the draft 0 times, keep more than 0 times (the control: the run
+// does outgrow plans made on the way), and all three must give the same drafts, probabilities and draft states
+struct mtp_replan_config {
+    const char * name;
+    ggml_type    type_kv;
+    const char * shortlist; // LLAMA_DRAFT_SHORTLIST
+    const char * kpool;     // LLAMA_QSA_KPOOL_DEV and LLAMA_QSA_INDEXER_ROWS
+};
+
+struct mtp_replan_run {
+    std::vector<uint8_t>     state_end;
+    std::vector<uint8_t>     spec_end;
+    std::vector<llama_token> drafts;
+    std::vector<float>       probs;
+    int    replan_prompt = 0; // the draft's evaluations that needed a new plan, in prompt calls
+    int    replan_steps  = 0; // and in speculative steps
+    int    replan_tgt    = 0; // the target's
+    int    grow          = 0; // the draft's compute buffer growths at evaluations
+    int    plans         = 0; // the per-size schedulers planned over the whole memory (sched_small_plan)
+    int    evals         = 0; // the draft's evaluations
+    bool   short_on      = false;
+    size_t compute       = 0; // the draft context's compute buffers at the end, bytes
+    std::string first;        // the first re-plan's reason
+};
+
+static struct {
+    bool          on       = false;
+    bool          steps    = false;
+    int           pending  = 0;
+    int           pend_grw = 0;
+    std::string   pend_why;
+    mtp_replan_run * run   = nullptr;
+} g_mtp_replan;
+
+static void mtp_replan_log(const char * text) {
+    auto & g = g_mtp_replan;
+    if (!g.on || g.run == nullptr) {
+        return;
+    }
+    if (strncmp(text, "galloc-trigger: ", 16) == 0) {
+        if (g.pending++ == 0) {
+            g.pend_why = text + 16;
+            while (!g.pend_why.empty() && g.pend_why.back() == '\n') {
+                g.pend_why.pop_back();
+            }
+        }
+    } else if (strncmp(text, "galloc-grow: ", 13) == 0) {
+        g.pend_grw++;
+    } else if (strstr(text, "sched_small_plan: ") != nullptr) {
+        g.run->plans++;
+        g.pend_grw = 0; // the plan's own buffer
+    } else if (strncmp(text, "ubatch-trace: mtp ", 18) == 0) {
+        g.run->evals++;
+        if (g.pending > 0) {
+            (g.steps ? g.run->replan_steps : g.run->replan_prompt)++;
+            if (g.run->first.empty()) {
+                g.run->first = g.pend_why;
+            }
+        }
+        g.run->grow += g.pend_grw;
+        g.pending = 0;
+        g.pend_grw = 0;
+    } else if (strncmp(text, "ubatch-trace: ", 14) == 0) {
+        g.run->replan_tgt += g.pending > 0;
+        g.pending = 0;
+        g.pend_grw = 0;
+    }
+}
+
+// turns of new tokens, each in the server's calls of up to n_batch tokens (the last one with an output), each followed
+// by 10 speculative steps as in mtp_keep_sequence (catch-ups of every width from 1 to 4)
+static mtp_replan_run mtp_replan_sequence(
+        llama_model * model, const std::vector<llama_token> & tokens, const mtp_replan_config & cfg, const int arm) {
+    static const char * names[] = { "LLAMA_MTP_GRAPH_KEEP", "LLAMA_SCHED_PER_SIZE_RESERVE", "LLAMA_DRAFT_SHORTLIST",
+        "LLAMA_QSA_KPOOL_DEV", "LLAMA_QSA_INDEXER_ROWS" };
+    test_setenv(names[0], arm >= 1 ? "1" : nullptr);
+    test_setenv(names[1], arm >= 2 ? "1" : nullptr);
+    test_setenv(names[2], cfg.shortlist);
+    test_setenv(names[3], cfg.kpool);
+    test_setenv(names[4], cfg.kpool);
+    auto unset = [&]() {
+        for (const char * n : names) {
+            test_setenv(n, nullptr);
+        }
+    };
+
+    auto ctx_params_for = [&](const bool mtp) {
+        llama_context_params p = llama_context_default_params();
+        p.ctx_type        = mtp ? LLAMA_CONTEXT_TYPE_MTP : LLAMA_CONTEXT_TYPE_DEFAULT;
+        p.n_ctx           = 0;
+        p.n_batch         = 128;
+        p.n_ubatch        = mtp ? 48 : 64;
+        p.n_threads       = 4;
+        p.n_threads_batch = 4;
+        p.type_k          = cfg.type_kv;
+        p.type_v          = cfg.type_kv;
+        p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        p.n_outputs_max_per_seq = 4;
+        return p;
+    };
+
+    mtp_replan_run run;
+    // the log callback writes into run only while this function runs, an exception included
+    struct trace_guard {
+        ~trace_guard() { g_mtp_replan.on = false; g_mtp_replan.run = nullptr; }
+    } guard;
+    g_mtp_replan.run      = &run;
+    g_mtp_replan.on       = false;
+    g_mtp_replan.steps    = false;
+    g_mtp_replan.pending  = 0;
+    g_mtp_replan.pend_grw = 0;
+
+    llama_context_ptr lctx_tgt(llama_init_from_model(model, ctx_params_for(false)));
+    llama_context_ptr lctx_dft(llama_init_from_model(model, ctx_params_for(true)));
+    if (!lctx_tgt || !lctx_dft) {
+        unset();
+        g_mtp_replan.run = nullptr;
+        throw std::runtime_error("failed to create the target or the MTP context");
+    }
+    llama_context * ctx_tgt = lctx_tgt.get();
+    llama_context * ctx_dft = lctx_dft.get();
+
+    common_params_speculative sp;
+    sp.types                  = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    sp.draft.ctx_tgt          = ctx_tgt;
+    sp.draft.ctx_dft          = ctx_dft;
+    sp.draft.n_max            = 3;
+    sp.draft.n_min            = 0;
+    sp.draft.p_min            = 0.0f;
+    sp.draft.backend_sampling = true;
+    common_speculative_ptr spec(common_speculative_init(sp, 1));
+    unset();
+    if (!spec) {
+        g_mtp_replan.run = nullptr;
+        throw std::runtime_error("failed to create the draft-mtp driver");
+    }
+    run.short_on = llama_head_shortlist_size(ctx_dft) > 0;
+
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int n_batch = 128;
+
+    auto argmax = [&](int32_t i) {
+        const float * logits = llama_get_logits_ith(ctx_tgt, i);
+        GGML_ASSERT(logits != nullptr);
+        return (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
+    };
+
+    llama_tokens context;
+    llama_pos    pos = 0;
+    size_t       i_tok = 0;
+
+    auto step = [&](llama_token id_last, int n_use, int n_acc) {
+        llama_tokens draft;
+        std::vector<float> probs;
+        common_speculative_get_draft_params(spec.get(), 0) = {
+            /* .drafting = */ true,
+            /* .n_max    = */ 3,
+            /* .pos0     = */ pos,
+            /* .id_last  = */ id_last,
+            /* .prompt   = */ &context,
+            /* .result   = */ &draft,
+            /* .result_q = */ nullptr,
+            /* .temp     = */ 1.0f,
+            /* .seed     = */ LLAMA_DEFAULT_SEED,
+            /* .info     = */ nullptr,
+            /* .result_p = */ &probs,
+        };
+        common_speculative_draft(spec.get());
+        run.drafts.push_back((llama_token) draft.size());
+        run.drafts.insert(run.drafts.end(), draft.begin(), draft.end());
+        run.probs.insert(run.probs.end(), probs.begin(), probs.end());
+
+        if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, pos, -1)) {
+            throw std::runtime_error("failed to remove the draft region");
+        }
+
+        n_use = std::min<int>(n_use, (int) draft.size());
+        common_batch batch(ctx_tgt);
+        batch.add(id_last, pos++, 0, true);
+        context.push_back(id_last);
+        for (int k = 0; k < n_use; ++k) {
+            batch.add(draft[k], pos++, 0, true);
+            context.push_back(draft[k]);
+        }
+        if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("failed to decode a verify batch");
+        }
+        if (!common_speculative_process(spec.get(), batch)) {
+            throw std::runtime_error("the driver failed on a verify batch");
+        }
+        common_speculative_accept(spec.get(), 0, (uint16_t) std::min(n_acc, n_use));
+        return argmax(batch.size() - 1);
+    };
+
+    static const int steps[][2] = {
+        { 3, 0 }, { 3, 1 }, { 3, 3 }, { 2, 2 }, { 3, 0 }, { 1, 1 }, { 3, 2 }, { 0, 0 }, { 3, 3 }, { 3, 1 },
+    };
+    static const int turns[] = { 300, 250, 420, 120, 30, 260 };
+
+    g_mtp_replan.on = true;
+    for (const int n_new : turns) {
+        g_mtp_replan.steps = false;
+        for (int done = 0; done < n_new; ) {
+            const int  n_call = std::min(n_batch, n_new - done);
+            const bool last   = done + n_call == n_new;
+
+            common_memory mem_tgt;
+            mem_tgt.init(ctx_tgt);
+            mem_tgt.seq_rm(0, pos, -1);
+            const llama_pos p0 = pos;
+            common_speculative_after_catchup(spec.get(), [&, p0]() {
+                common_memory mem_dft;
+                mem_dft.init(ctx_dft);
+                mem_dft.seq_rm(0, p0, -1);
+            });
+
+            common_batch batch(ctx_tgt);
+            for (int k = 0; k < n_call; ++k) {
+                GGML_ASSERT(i_tok < tokens.size());
+                batch.add(tokens[i_tok], pos++, 0, last && k + 1 == n_call);
+                context.push_back(tokens[i_tok++]);
+            }
+            if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                throw std::runtime_error("failed to decode a prompt call");
+            }
+            if (!common_speculative_process(spec.get(), batch)) {
+                throw std::runtime_error("the driver failed on a prompt call");
+            }
+            done += n_call;
+        }
+        common_speculative_flush(spec.get());
+
+        g_mtp_replan.steps = true;
+        common_speculative_begin(spec.get(), 0, context);
+        llama_token id = argmax(-1);
+        for (const auto & s : steps) {
+            id = step(id, s[0], s[1]);
+        }
+        common_speculative_flush(spec.get());
+        // the reply's last token, as the server keeps it, before the next turn's tokens
+        context.push_back(id);
+        {
+            common_batch batch(ctx_tgt);
+            batch.add(id, pos++, 0, false);
+            if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0 || !common_speculative_process(spec.get(), batch)) {
+                throw std::runtime_error("failed to decode a reply's last token");
+            }
+        }
+    }
+    common_speculative_flush(spec.get());
+    g_mtp_replan.on = false;
+
+    run.state_end.resize(llama_state_seq_get_size(ctx_dft, 0));
+    llama_state_seq_get_data(ctx_dft, run.state_end.data(), run.state_end.size(), 0);
+    common_speculative_get_state(spec.get(), 0, run.spec_end);
+
+    for (const auto & e : llama_get_memory_breakdown(ctx_dft)) {
+        run.compute += e.second.compute;
+    }
+
+    spec.reset();
+    g_mtp_replan.run = nullptr;
+    return run;
+}
+
+static int test_mtp_replan(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    // the allocator's and the evaluations' trace lines are counted, and stay out of the table
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        mtp_replan_log(text);
+        if (strncmp(text, "ubatch-trace: ", 14) == 0 || strncmp(text, "decode-trace: ", 14) == 0 ||
+            strncmp(text, "galloc-", 7) == 0 || strncmp(text, "sched-replan: ", 14) == 0) {
+            return;
+        }
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    const mtp_replan_config configs[] = {
+        { "f16 short",        GGML_TYPE_F16,  "32,8,2", nullptr },
+        { "f16 short kpool",  GGML_TYPE_F16,  "32,8,2", "1"     },
+        { "f16",              GGML_TYPE_F16,  nullptr,  nullptr },
+        { "q8_0 short",       GGML_TYPE_Q8_0, "32,8,2", nullptr },
+    };
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    common_log_flush(common_log_main());
+    LOG("|%10s|%16s|%9s|%9s|%5s|%22s|%22s|%22s|%8s|%17s|%s\n", "Model arch.", "Config", "Drafts", "End", "Short",
+            "Re-plans base p/s/t", "Re-plans keep p/s/t", "Re-plans plan p/s/t", "Plans", "Compute KiB k/p", "Status");
+
+    // a context of 2,048 cells, which the run fills past 256-cell steps
+    test_setenv("LLAMA_ARCHS_N_CTX", "2048");
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !mtp_kv_only_arch(arch)) {
+            continue;
+        }
+        const bool moe = moe_mandatory(arch) || moe_implemented(arch);
+
+        gguf_context_ptr gguf_ctx = get_gguf_ctx_mtp(arch, moe);
+
+        llama_model_ptr model;
+        try {
+            model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, nullptr, /*load_mtp*/ true);
+        } catch (const std::exception & err) {
+            LOG("|%10s|%16s|\033[1;31mERROR\033[0m (model load: %s)\n", llama_arch_name(arch), "", err.what());
+            n_tests++;
+            n_failed++;
+            continue;
+        }
+
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const std::vector<llama_token> tokens = get_tokens(1400, n_vocab, seed);
+
+        for (const mtp_replan_config & cfg : configs) {
+            n_tests++;
+            LOG("|%10s|%16s|", llama_arch_name(arch), cfg.name);
+            std::string status;
+            try {
+                struct log_pause {
+                    log_pause()  { common_log_pause(common_log_main()); }
+                    ~log_pause() { common_log_resume(common_log_main()); }
+                };
+                mtp_replan_run base;
+                mtp_replan_run keep;
+                mtp_replan_run plan;
+                {
+                    log_pause pause;
+                    base = mtp_replan_sequence(model.get(), tokens, cfg, 0);
+                    keep = mtp_replan_sequence(model.get(), tokens, cfg, 1);
+                    plan = mtp_replan_sequence(model.get(), tokens, cfg, 2);
+                }
+
+                auto same_drafts = [](const mtp_replan_run & a, const mtp_replan_run & b) {
+                    return !a.drafts.empty() && a.drafts == b.drafts && a.probs.size() == b.probs.size() &&
+                        memcmp(a.probs.data(), b.probs.data(), a.probs.size()*sizeof(float)) == 0;
+                };
+                auto same_end = [](const mtp_replan_run & a, const mtp_replan_run & b) {
+                    return !a.state_end.empty() && a.state_end == b.state_end && a.spec_end == b.spec_end;
+                };
+                const bool same_all = same_drafts(base, keep) && same_drafts(base, plan);
+                const bool end_ok   = same_end(base, keep) && same_end(base, plan);
+                const bool traced   = base.evals > 0 && base.evals == keep.evals && keep.evals == plan.evals;
+                const bool control  = keep.replan_prompt + keep.replan_steps > 0;
+                const bool zero     = plan.replan_prompt + plan.replan_steps == 0 && plan.grow == 0;
+                const bool short_ok = cfg.shortlist == nullptr || (base.short_on && keep.short_on && plan.short_on);
+
+                char rb[48], rk[48], rp[48], cp[48], pl[16];
+                snprintf(rb, sizeof(rb), "%d/%d/%d", base.replan_prompt, base.replan_steps, base.replan_tgt);
+                snprintf(rk, sizeof(rk), "%d/%d/%d", keep.replan_prompt, keep.replan_steps, keep.replan_tgt);
+                snprintf(rp, sizeof(rp), "%d/%d/%d", plan.replan_prompt, plan.replan_steps, plan.replan_tgt);
+                snprintf(cp, sizeof(cp), "%zu/%zu", keep.compute/1024, plan.compute/1024);
+                snprintf(pl, sizeof(pl), "%d", plan.plans);
+                LOG("%9s|%9s|%5s|%22s|%22s|%22s|%8s|%17s|", same_all ? "identical" : "DIFFERENT", end_ok ? "identical" : "DIFFERENT",
+                        plan.short_on ? "on" : "off", rb, rk, rp, pl, cp);
+
+                if (same_all && end_ok && traced && control && zero && short_ok) {
+                    status = "\033[1;32mOK\033[0m";
+                } else {
+                    n_failed++;
+                    status = "\033[1;31mFAIL\033[0m";
+                    if (!traced) {
+                        status += " (no or unequal trace lines: run with LLAMA_UBATCH_TRACE=1)";
+                    } else if (!control) {
+                        status += " (the control: the per-size schedulers never needed a new plan)";
+                    } else if (!zero) {
+                        status += " (re-planned: " + plan.first + ", " + std::to_string(plan.grow) + " buffer growths)";
+                    } else if (!short_ok) {
+                        status += " (the shortlist did not start)";
+                    }
+                }
+                if (verbosity > 0 && !keep.first.empty()) {
+                    status += " keep's first: " + keep.first;
+                }
+            } catch (const std::exception & err) {
+                n_failed++;
+                status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
+            }
+            LOG("%s\n", status.c_str());
+        }
+    }
+    test_setenv("LLAMA_ARCHS_N_CTX", nullptr);
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 // --kv-seq-rm (C740): LLAMA_KV_SEQ_RM_BOUND=1 must leave every memory as it is without the switch. Two contexts of one
 // model, the switch off and on (each reads it when its caches are created), take the same random sequence of decodes and
 // memory edits: a speculative step's tail rollback after a decode, the server's checkpoint restore (models with a
@@ -4853,6 +5270,7 @@ int main(int argc, char ** argv) {
     bool kv_seq_rm_time = false;
     bool ngram_prefetch = false;
     bool mtp_graph_keep = false;
+    bool mtp_replan = false;
     bool verify_prepare = false;
     bool mtp_h_dev = false;
     bool mtp_incall_overlap = false;
@@ -4935,6 +5353,8 @@ int main(int argc, char ** argv) {
             mtp_kv_only = true;
         } else if (strcmp(argv[i], "--mtp-graph-keep") == 0) {
             mtp_graph_keep = true;
+        } else if (strcmp(argv[i], "--mtp-replan") == 0) {
+            mtp_replan = true;
         } else if (strcmp(argv[i], "--verify-prepare") == 0) {
             verify_prepare = true;
         } else if (strcmp(argv[i], "--mtp-catchup-overlap") == 0) {
@@ -4985,6 +5405,11 @@ int main(int argc, char ** argv) {
         }
         if (verify_prepare) {
             return test_verify_prepare(arch_filter, seed, stdev, verbosity);
+        }
+        if (mtp_replan) {
+            // the allocator's re-plans are counted from LLAMA_UBATCH_TRACE's lines, read once in a process
+            test_setenv("LLAMA_UBATCH_TRACE", "1");
+            return test_mtp_replan(arch_filter, seed, stdev, verbosity);
         }
         if (mtp_graph_keep) {
             // the draft's graph builds are counted from LLAMA_UBATCH_TRACE's lines, read once at the first micro-batch
