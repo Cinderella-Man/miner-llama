@@ -5842,6 +5842,12 @@ bool llama_context::sched_small_plan(sched_small_entry & ss, const llama_ubatch 
     if (!mctx_full) {
         return false;
     }
+    // a QSA memory's whole-cache context re-pools every pool, which the shared reserve needs (the first ubatch after a
+    // sequence edit) but a batch of up to 8 tokens never does: its lists at their stable bounds (with every pool, a
+    // scheduler planned 41 MiB on a 65,536-cell context of test-llama-archs's Flash-Next model)
+    if (auto * mctx_idx = dynamic_cast<llama_memory_hybrid_idx_context *>(mctx_full.get())) {
+        mctx_idx->kpool_plan_for(ubatch);
+    }
     if (!gf_res_plan) {
         gf_res_plan.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
     }
