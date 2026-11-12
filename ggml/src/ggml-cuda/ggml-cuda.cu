@@ -3467,13 +3467,6 @@ static void ggml_cuda_graphs_patch_count(const int reason, const uint64_t groups
     }
 }
 
-// GGML_CUDA_GRAPHS_PATCH: whether this evaluation's profiling leaves the captures as the loop makes them (none, or only
-// the events around the whole evaluation)
-static bool ggml_cuda_graphs_patch_profile_ok() {
-    const ggml_cuda_profile_state * prof = ggml_cuda_profile();
-    return prof == nullptr || prof->mode == GGML_CUDA_PROFILE_MODE_GRAPH;
-}
-
 #ifdef GGML_CUDA_GRAPHS_PATCH_API
 // GGML_CUDA_GRAPHS_PATCH: the chain's last node now, while the stream captures (null before its first node); false
 // when the capture is not a chain (more than one node to depend on)
@@ -7255,6 +7248,15 @@ static uint64_t ggml_cuda_keepalive_shapes(const ggml_cgraph * cgraph) {
     }
     return h;
 }
+
+#ifdef USE_CUDA_GRAPH
+// GGML_CUDA_GRAPHS_PATCH: whether this evaluation's profiling leaves the captures as the loop makes them (none, or only
+// the events around the whole evaluation)
+static bool ggml_cuda_graphs_patch_profile_ok() {
+    const ggml_cuda_profile_state * prof = ggml_cuda_profile();
+    return prof == nullptr || prof->mode == GGML_CUDA_PROFILE_MODE_GRAPH;
+}
+#endif // USE_CUDA_GRAPH
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
