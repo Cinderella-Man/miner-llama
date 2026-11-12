@@ -33,6 +33,12 @@
 //                                  card; the block's next start is ordered on the card after the next evaluation's work
 //                                2: as 1, and before every evaluation that runs kernel by kernel, new shapes or not
 //                                0 (or any other value): no stop, only the counts
+//                                At 1 and 2 a stop on a card whose block has not begun yet (its start held behind an
+//                                  evaluation the card is still running) does not wait for it (C817): the word the stop
+//                                  writes ends the block at its first poll, once the evaluation is done, and the host goes
+//                                  on at once. Otherwise the copy to the next card at a new size, right after a card's
+//                                  evaluation is queued, waited for that evaluation (R131: a long prompt's first chunk
+//                                  queued one card at a time)
 //                                Whenever it is set, llama-server prints the counts after each reply (keep-alive = ...)
 // When a context is freed, each card's runs are logged with the SM clock the block measured while it ran.
 
@@ -240,6 +246,7 @@ struct ggml_cuda_keepalive_counts {
     uint64_t out_new     = 0; // sets, gets, memsets and copies outside a graph at a size new to the card
     uint64_t out_stops   = 0; // of them, the ones before which a running block was ended
     uint64_t held        = 0; // blocks started after the card's evaluation, not at once
+    uint64_t cancelled   = 0; // blocks ended by the host before they began, without a wait (C817; in stopped too)
 };
 
 // Starts and stops the cards' blocks. Ops is what a card does (keepalive.cu on CUDA, a thread in the test):
@@ -250,6 +257,9 @@ struct ggml_cuda_keepalive_counts {
 //                                                   the block must not start before (GGML_CUDA_KEEPALIVE_EAGER)
 //   bool     done(int dev)                          the block has ended (does not wait)
 //   void     wait(int dev)                          until the block has ended
+//   bool     pending(int dev)                       the card's newest block has not begun: the work of the stream a
+//                                                   start was held for last is not done, and the block waits behind it
+//                                                   (does not wait; asked only at GGML_CUDA_KEEPALIVE_EAGER 1 and 2)
 //   const ggml_cuda_keepalive_report & report(int dev)
 // Every method takes the controller's lock, so a free on one thread and a graph on another are safe.
 template <typename Ops, int MAX_DEVICES>
@@ -259,6 +269,9 @@ struct ggml_cuda_keepalive_ctl {
     ggml_cuda_keepalive_config cfg;
     Ops &                      ops;
     std::mutex                 mutex;
+    // C817: a stop at a held start that has not begun leaves the block to end by itself (false: C811's controller,
+    // which waits for it, and so for the evaluation it is held behind; the test compares the two)
+    bool                       cancel_held = true;
 
     struct dev_state {
         bool              seen    = false; // a graph has been computed on the card
@@ -372,6 +385,7 @@ struct ggml_cuda_keepalive_ctl {
             c.out_new     += d.counts.out_new;
             c.out_stops   += d.counts.out_stops;
             c.held        += d.counts.held;
+            c.cancelled   += d.counts.cancelled;
         }
         return c;
     }
@@ -403,7 +417,7 @@ struct ggml_cuda_keepalive_ctl {
             }
         }
         for (int dev = 0; dev < MAX_DEVICES; ++dev) {
-            if (devs[dev].running) {
+            if (devs[dev].running && !cancel_locked(dev)) {
                 finish_locked(dev);
             }
         }
@@ -429,7 +443,26 @@ struct ggml_cuda_keepalive_ctl {
             return;
         }
         ops.write(dev, ggml_cuda_keepalive_word(0, devs[dev].beat));
-        finish_locked(dev);
+        if (!cancel_locked(dev)) {
+            finish_locked(dev);
+        }
+    }
+
+    // GGML_CUDA_KEEPALIVE_EAGER at 1 or 2 (C817), after a stop's word is written: a block that has not begun is left
+    // to end by itself. It waits behind an evaluation the card is still running; when that is done, it reads a word
+    // without its generation (this stop's 0, or a later run's) and ends at its first poll, without running. Waiting
+    // for it would wait for that evaluation. The word is written first, so a block found not begun is sure to read it.
+    // Its report is not read (a later block on the card writes its own after it); it counts as ended by the host.
+    bool cancel_locked(int dev) {
+        if (!cancel_held || cfg.eager < 1 || !ops.pending(dev)) {
+            return false;
+        }
+        dev_state & d = devs[dev];
+        d.stats.stopped++;
+        d.counts.stopped++;
+        d.counts.cancelled++;
+        d.running = false;
+        return true;
     }
 
     // wait for the card's block to end and take its report

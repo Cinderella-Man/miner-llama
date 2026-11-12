@@ -152,6 +152,21 @@ struct ggml_cuda_keepalive_ops {
         CUDA_CHECK(cudaStreamSynchronize(streams[dev]));
     }
 
+    // GGML_CUDA_KEEPALIVE_EAGER (C817): the card's newest block has not begun. A held start records after_ev and makes
+    // the keep-alive stream wait for it right before its launch, so while the event's last record is not done, the
+    // newest block (held, or launched later behind a held one) has not begun
+    bool pending(int dev) {
+        if (after_ev[dev] == nullptr) {
+            return false;
+        }
+        const cudaError_t err = cudaEventQuery(after_ev[dev]);
+        if (err == cudaErrorNotReady) {
+            return true;
+        }
+        CUDA_CHECK(err);
+        return false;
+    }
+
     const ggml_cuda_keepalive_report & report(int dev) {
         return host[dev].report;
     }
@@ -233,11 +248,12 @@ size_t ggml_backend_cuda_keepalive_counts(char * buf, size_t size) {
     const int n = snprintf(buf, size,
         "%llu runs, %llu ended by the timeout (by card %s), %llu by the host, %llu without a report, %llu running; "
         "EAGER=%d: %llu evaluations kernel by kernel, %llu acted on (%llu stops), %llu new sizes outside a graph "
-        "(%llu stops), %llu starts held",
+        "(%llu stops), %llu starts held, %llu blocks ended before they began",
         (unsigned long long) c.starts, (unsigned long long) c.timeouts, by_card.empty() ? "-" : by_card.c_str(),
         (unsigned long long) c.stopped, (unsigned long long) c.lost, (unsigned long long) c.running, level,
         (unsigned long long) c.eager, (unsigned long long) c.eager_new, (unsigned long long) c.eager_stops,
-        (unsigned long long) c.out_new, (unsigned long long) c.out_stops, (unsigned long long) c.held);
+        (unsigned long long) c.out_new, (unsigned long long) c.out_stops, (unsigned long long) c.held,
+        (unsigned long long) c.cancelled);
     return n < 0 ? 0 : std::min((size_t) n, size - 1);
 }
 
