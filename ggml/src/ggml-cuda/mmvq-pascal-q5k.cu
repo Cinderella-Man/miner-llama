@@ -48,8 +48,8 @@
 //     P106, two tokens on this kernel took 2,575.94 and 2,574.12 us, one token on the one-token kernel 3,023.54 (R75).
 //   - 5 to 8 tokens (GGML_CUDA_MMVQ_PASCAL_RO8, C729): the same code at NT = 5 to 8 and R = 1 only, so every token's
 //     sums are still the one-token kernel's. At K = 2560 and 8 tokens the activations take 25.8 KB, beside 4 warps'
-//     weight staging (5 at 5 and 6 tokens); K = 6144 fits only 5 tokens, at 1 warp, the rest left to the k-column
-//     kernel.
+//     weight staging (5 at 5 and 6 tokens); K = 6144 fits only 5 tokens, at 1 warp, which is left to the k-column kernel
+//     with the rest unless _Q5K_MT_NW=1 asks for one warp (C809).
 
 #define Q5KMT_NW_MAX   6                    // warps per block at R = 1, at most (3 at R = 2)
 #define Q5KMT_MAX_COLS 4                    // tokens with GGML_CUDA_MMVQ_PASCAL_Q5K_MT
@@ -443,12 +443,16 @@ static int q5kmt_wstage(const int r, const int lpr_log2) {
     return (WARP_SIZE >> lpr_log2) * q5kmt_gstride(r, lpr_log2);
 }
 
+static int q5kmt_nw_env() {
+    static const int nw_env = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_MT_NW", Q5KMT_NW_MAX);
+    return nw_env;
+}
+
 // The warps per block for nt tokens and nsb super-blocks per row: GGML_CUDA_MMVQ_PASCAL_Q5K_MT_NW (default and at most
 // 6 at R = 1, 3 at R = 2), fewer where the shared memory would pass 48 KB; 0 if not even one warp fits.
 static int q5kmt_nw(const int nt, const int nsb) {
-    static const int nw_env = q5kmt_env("GGML_CUDA_MMVQ_PASCAL_Q5K_MT_NW", Q5KMT_NW_MAX);
     const int r   = q5kmt_r(nt);
-    int       nw  = std::min(std::max(nw_env, 1), Q5KMT_NW_MAX / r);
+    int       nw  = std::min(std::max(q5kmt_nw_env(), 1), Q5KMT_NW_MAX / r);
     const int act = q5kmt_act_bytes(nt, nsb);
     const int ws  = q5kmt_wstage(r, q5kmt_lpr_log2(nsb));
     while (nw > 0 && act + nw * ws > Q5KMT_SMEM_MAX) {
@@ -483,7 +487,11 @@ bool ggml_cuda_mmvq_pascal_q5k_mt_takes(const int64_t K, const int64_t nrows, co
             row_bytes < (K / QK_K) * Q5KMT_SB || row_bytes % 16 != 0 || (uintptr_t) x % 16 != 0) {
         return false;
     }
-    return q5kmt_nw((int) ncols, (int) (K / QK_K)) > 0;
+    const int nw = q5kmt_nw((int) ncols, (int) (K / QK_K));
+    // 5 to 8 tokens: a block of one warp only where _Q5K_MT_NW=1 asks for it (C809, Q1415: on a P106 2560 x 6144 at 5
+    // tokens took 520.89 and 519.46 us at one warp a block, 309.21 and 308.22 where this kernel left it, R120b), until
+    // C794's K tiles take them
+    return ncols > Q5KMT_MAX_COLS && q5kmt_nw_env() != 1 ? nw >= 2 : nw > 0;
 }
 
 bool ggml_cuda_mmvq_pascal_q5k_mt(const void * vx, const void * vy, float * dst, const int64_t K, const int64_t nrows,

@@ -61,8 +61,8 @@
 //   - 5 to 8 tokens (GGML_CUDA_MMVQ_PASCAL_RO8, C729): the same kernel at NT = 5 to 8 and R = 1 only, so a token's sums
 //     are still the one-token kernel's. Its activations take about NT / 4 times the 4-token staging: at K = 2560 and 8
 //     tokens 20.6 KB of int8 words and 2.6 KB (IQ4_XS) or 5.2 KB (Q4_K) of terms, beside 5 warps' weight staging; K = 6144
-//     fits only 5 tokens (IQ4_XS 6), at 1 to 3 warps, and wider rows fewer (dmt_nw), the rest left to the k-column kernel.
-//     IQ4_XS and Q4_K only: Q6_K's products of 5 to 8 tokens stay with the k-column kernel (dmt_nt_mode; C795, Q1390).
+//     fits only 5 tokens (IQ4_XS 6), at 1 to 3 warps, wider rows fewer (dmt_nw); one warp a block (C809) and the rest are
+//     left to the k-column kernel. IQ4_XS and Q4_K only: Q6_K's 5 to 8 tokens stay there too (dmt_nt_mode; C795, Q1390).
 
 #define DMT_NW_MAX   6                    // warps per block at R = 1, at most (3 at R = 2)
 #define DMT_MAX_COLS 4                    // tokens with GGML_CUDA_MMVQ_PASCAL_DMT and _Q6K_MT
@@ -1284,8 +1284,11 @@ bool ggml_cuda_mmvq_pascal_dmt_takes(const ggml_type type, const int64_t K, cons
         return false;
     }
     const int nw = dmt_nw(type, (int) ncols, nsb, dmt_pick_r(type, (int) ncols, nsb));
-    // Q6_K: a block of one warp only where _DMT_NW=1 asks for it (one warp a block lost to the k-column kernel, R79)
-    return type == GGML_TYPE_Q6_K && dmt_nw_env() != 1 ? nw >= 2 : nw > 0;
+    // A block of one warp only where _DMT_NW=1 asks for it, for Q6_K (one warp a block lost to the k-column kernel, R79)
+    // and for the products of 5 to 8 tokens (C809, Q1415: on a P106 IQ4_XS 2560 x 6144 at 6 tokens took 595.98 and
+    // 595.90 us at one warp a block, 277.57 and 279.01 where this kernel left it, R120b), until C794's K tiles take them
+    const bool one_warp_declined = type == GGML_TYPE_Q6_K || ncols > DMT_MAX_COLS;
+    return one_warp_declined && dmt_nw_env() != 1 ? nw >= 2 : nw > 0;
 }
 
 bool ggml_cuda_mmvq_pascal_dmt(const ggml_type type, const void * vx, const void * vy, float * dst, const int64_t K,
