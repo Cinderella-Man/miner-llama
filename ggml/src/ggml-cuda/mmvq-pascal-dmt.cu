@@ -1122,18 +1122,21 @@ static __global__ void mul_mat_vec_q_pascal_dmt_kt(const dmt_args p, const int n
     }
 }
 
-// GGML_CUDA_MMVQ_PASCAL_DMT_KT: 0 (default) off; 1 the K tiles where the whole activations leave the kernel above fewer
-// warps a block than the tiles do (at Flash-Next's widths: K = 6144 at 4 tokens, and Q4_K's at 3); 2 wherever the tiles
-// fit, for the checks. Only with GGML_CUDA_MMVQ_PASCAL_DMT on and at R = 1.
+// GGML_CUDA_MMVQ_PASCAL_DMT_KT: 0 (default) off; 1 the K tiles where they are faster on a P106: Q4_K's products of 4
+// tokens whose whole activations leave the kernel above at most DMT_KT_FULL_MAX warps a block (at Flash-Next's widths
+// K = 6144: 3 warps, the tiles 6); 2 wherever the tiles fit, for the checks. Only with GGML_CUDA_MMVQ_PASCAL_DMT on and
+// at R = 1.
 static int dmt_kt_mode() {
     static const int mode = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_KT", 0);
     return mode;
 }
 
-// GGML_CUDA_MMVQ_PASCAL_DMT_KT_M: row blocks per warp and round, 1 (default) or 2 (half the tile staging per row, in
-// rounds twice as long)
+// GGML_CUDA_MMVQ_PASCAL_DMT_KT_M: row blocks per warp and round, 2 (default since C808: half the tile staging per row, in
+// rounds twice as long) or 1. On a P106 2 is the faster in every tile case (R120b, us: IQ4_XS 2560 x 6144 at 4 tokens
+// 132.96 / 133.04 at 1 against 128.48 / 128.06 at 2; Q4_K at 3 tokens 110.40 / 110.94 against 106.91 / 106.79, at 4
+// 136.07 / 135.90 against 129.45 / 129.39).
 static int dmt_kt_m() {
-    static const int m = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_KT_M", 1) == 2 ? 2 : 1;
+    static const int m = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_KT_M", 2) == 1 ? 1 : 2;
     return m;
 }
 
@@ -1142,16 +1145,28 @@ static int dmt_kt_tile_bytes(const ggml_type type, const int nt, const int lpr_l
     return dmt_act_bytes(type, nt, 1 << lpr_log2);
 }
 
+// The most warps a block of the kernel above holds where GGML_CUDA_MMVQ_PASCAL_DMT_KT=1 sends Q4_K's 4-token products to
+// the tiles (C808). On a P106 (R120b, us per product at 2560 x 6144, C722's kernel against the tiles at M = 2) the tiles
+// gain only from 3 warps up to 6: Q4_K at 4 tokens 142.29 / 141.75 against 129.45 / 129.39; from 4 warps (IQ4_XS at 4
+// tokens, 112.60 / 113.33 against 128.48 / 128.06) and from 5 (Q4_K at 3 tokens, 98.07 / 99.10 against 106.91 / 106.79)
+// they lose.
+#define DMT_KT_FULL_MAX 3
+
 // The warps per block of the K tiles for nt tokens and nsb super-blocks per row (R = 1) where they take the product, else
 // 0: GGML_CUDA_MMVQ_PASCAL_DMT_KT_NW (default and at most 6), fewer where the block's shared memory would pass 48 KB;
 // none for other types than IQ4_XS and Q4_K or other token counts than 2 to 4, where the threads can't load a tile
-// ahead in DMT_KT_EU units each, or (with _KT=1) where the kernel above holds as many warps (nw_full)
+// ahead in DMT_KT_EU units each, or (with _KT=1) for other products than Q4_K's of 4 tokens, nor where the kernel above
+// holds more than DMT_KT_FULL_MAX warps (nw_full) or as many as the tiles
 static int dmt_kt_nw(const ggml_type type, const int nt, const int nsb, const int nw_full) {
     static const int nw_env = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_KT_NW", DMT_KT_NW_MAX);
     const int mode = dmt_kt_mode();
     // the tiles have IQ4_XS's and Q4_K's steps and staging, at 2 to 4 tokens, only; any other product this file takes
     // keeps its own kernel
     if ((mode != 1 && mode != 2) || (type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q4_K) || nt < 2 || nt > 4) {
+        return 0;
+    }
+    // _KT=1: only where they gain on a P106 (C808)
+    if (mode == 1 && (type != GGML_TYPE_Q4_K || nt != 4 || nw_full > DMT_KT_FULL_MAX)) {
         return 0;
     }
     const int lpr_log2 = dmt_lpr_log2(nsb);
