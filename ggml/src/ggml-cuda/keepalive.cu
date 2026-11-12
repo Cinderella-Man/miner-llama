@@ -1,7 +1,9 @@
 #include "keepalive.cuh"
 #include "common.cuh"
 
+#include <algorithm>
 #include <atomic>
+#include <string>
 
 // GGML_CUDA_KEEPALIVE (keepalive-policy.h has the settings): one block of one thread per card, launched on a stream
 // of the card's lowest priority, that reads the card's word in mapped host memory every GGML_CUDA_KEEPALIVE_POLL_US
@@ -70,6 +72,7 @@ struct ggml_cuda_keepalive_ops {
     bool         failed = false;
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES] = {};
     int          clock_khz[GGML_CUDA_MAX_DEVICES] = {};
+    cudaEvent_t  after_ev[GGML_CUDA_MAX_DEVICES] = {}; // GGML_CUDA_KEEPALIVE_EAGER: a held start's wait
 
     // the slots, made on the first start (no block runs yet, so the allocation waits for nothing)
     bool ready() {
@@ -94,7 +97,7 @@ struct ggml_cuda_keepalive_ops {
         }
     }
 
-    bool launch(int dev, uint32_t gen, uint32_t beat, uint32_t idle_ms, uint32_t poll_us) {
+    bool launch(int dev, uint32_t gen, uint32_t beat, uint32_t idle_ms, uint32_t poll_us, void * after) {
         if (!ready()) {
             return false;
         }
@@ -116,6 +119,14 @@ struct ggml_cuda_keepalive_ops {
         host[dev].report.gen = 0;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         const long long poll_cycles = (long long) poll_us * clock_khz[dev] / 1000;
+        if (after != nullptr) {
+            // GGML_CUDA_KEEPALIVE_EAGER: the block starts once the card's work so far on that stream is done
+            if (after_ev[dev] == nullptr) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&after_ev[dev], cudaEventDisableTiming));
+            }
+            CUDA_CHECK(cudaEventRecord(after_ev[dev], (cudaStream_t) after));
+            CUDA_CHECK(cudaStreamWaitEvent(streams[dev], after_ev[dev], 0));
+        }
         ggml_cuda_keepalive_kernel<<<1, 1, 0, streams[dev]>>>(word, rep, gen, beat, poll_cycles, (unsigned long long) idle_ms * 1000000ull);
         const cudaError_t err = cudaGetLastError();
         if (prev != dev) {
@@ -157,9 +168,77 @@ static ggml_cuda_keepalive_ctl_t & ggml_cuda_keepalive() {
             GGML_LOG_INFO("%s: GGML_CUDA_KEEPALIVE=%s: a block per card holds its clock, %u ms after the card's last graph, "
                           "polling every %u us\n", __func__, ggml_cuda_keepalive_mode_name(cfg.mode), cfg.idle_ms, cfg.poll_us);
         }
-        return new ggml_cuda_keepalive_ctl_t(cfg, *new ggml_cuda_keepalive_ops());
+        ggml_cuda_keepalive_ctl_t * c = new ggml_cuda_keepalive_ctl_t(cfg, *new ggml_cuda_keepalive_ops());
+        c->cfg.eager = ggml_cuda_keepalive_parse_eager(getenv("GGML_CUDA_KEEPALIVE_EAGER"));
+        if (cfg.mode != GGML_CUDA_KEEPALIVE_OFF && c->cfg.eager >= 0) {
+            GGML_LOG_INFO("%s: GGML_CUDA_KEEPALIVE_EAGER=%d: %s\n", __func__, c->cfg.eager,
+                          c->cfg.eager >= 2 ? "a card's block is ended before every evaluation that runs kernel by kernel, and "
+                                              "before work outside a graph at a size new to the card" :
+                          c->cfg.eager == 1 ? "a card's block is ended before an evaluation that runs kernel by kernel at shapes "
+                                              "new to the card, and before work outside a graph at a size new to the card" :
+                                              "counts only");
+        }
+        return c;
     }();
     return *ctl;
+}
+
+// GGML_CUDA_KEEPALIVE_EAGER's level while the keep-alive is on, else -1; the controller is not touched while it is unset
+int ggml_cuda_keepalive_eager_level() {
+    static const int env = ggml_cuda_keepalive_parse_eager(getenv("GGML_CUDA_KEEPALIVE_EAGER"));
+    if (env < 0) {
+        return -1;
+    }
+    ggml_cuda_keepalive_ctl_t & ka = ggml_cuda_keepalive();
+    return ka.on() ? ka.cfg.eager : -1;
+}
+
+void ggml_cuda_keepalive_eager_begin(int device, uint64_t shape) {
+    if (ggml_cuda_keepalive_eager_level() >= 0) {
+        ggml_cuda_keepalive().eager_begin(device, shape);
+    }
+}
+
+void ggml_cuda_keepalive_outside(int device, int kind, size_t size) {
+    if (ggml_cuda_keepalive_eager_level() >= 1) {
+        ggml_cuda_keepalive().outside(device, ggml_cuda_keepalive_outside_key(kind, size));
+    }
+}
+
+void ggml_cuda_keepalive_graph_end_after(int device, void * stream) {
+    ggml_cuda_keepalive_ctl_t & ka = ggml_cuda_keepalive();
+    if (ka.on()) {
+        ka.graph_end(device, stream);
+    }
+}
+
+size_t ggml_backend_cuda_keepalive_counts(char * buf, size_t size) {
+    if (buf == nullptr || size == 0) {
+        return 0;
+    }
+    buf[0] = '\0';
+    const int level = ggml_cuda_keepalive_eager_level();
+    if (level < 0) {
+        return 0;
+    }
+    ggml_cuda_keepalive_ctl_t & ka = ggml_cuda_keepalive();
+    const ggml_cuda_keepalive_counts c = ka.counts();
+    std::string by_card;
+    for (int dev = 0; dev < GGML_CUDA_MAX_DEVICES; ++dev) {
+        const ggml_cuda_keepalive_counts d = ka.counts(dev);
+        if (d.starts > 0) {
+            by_card += (by_card.empty() ? "" : " ") + std::to_string(dev) + ":" + std::to_string(d.timeouts);
+        }
+    }
+    const int n = snprintf(buf, size,
+        "%llu runs, %llu ended by the timeout (by card %s), %llu by the host, %llu without a report, %llu running; "
+        "EAGER=%d: %llu evaluations kernel by kernel, %llu acted on (%llu stops), %llu new sizes outside a graph "
+        "(%llu stops), %llu starts held",
+        (unsigned long long) c.starts, (unsigned long long) c.timeouts, by_card.empty() ? "-" : by_card.c_str(),
+        (unsigned long long) c.stopped, (unsigned long long) c.lost, (unsigned long long) c.running, level,
+        (unsigned long long) c.eager, (unsigned long long) c.eager_new, (unsigned long long) c.eager_stops,
+        (unsigned long long) c.out_new, (unsigned long long) c.out_stops, (unsigned long long) c.held);
+    return n < 0 ? 0 : std::min((size_t) n, size - 1);
 }
 
 void ggml_cuda_keepalive_graph_begin(int device, bool capture) {

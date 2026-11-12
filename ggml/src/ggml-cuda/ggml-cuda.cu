@@ -1085,10 +1085,20 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     return GGML_STATUS_SUCCESS;
 }
 
+// GGML_CUDA_KEEPALIVE_EAGER (C811): before work the backend runs on a card outside a graph (a set, get, memset or copy:
+// the driver's own copy and memset kernels, or this backend's, may launch for the first time there); device: the
+// backend's device, kind: ggml_cuda_keepalive_outside_kind
+static void ggml_cuda_keepalive_outside_dev(int device, int kind, size_t size) {
+    if (ggml_cuda_keepalive_eager_level() >= 1) {
+        ggml_cuda_keepalive_outside(ggml_cuda_get_physical_device(device), kind, size);
+    }
+}
+
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_keepalive_outside_dev(ctx->device, GGML_CUDA_KEEPALIVE_OUT_MEMSET, size);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -1097,6 +1107,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_keepalive_outside_dev(ctx->device, GGML_CUDA_KEEPALIVE_OUT_SET, size);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -1105,6 +1116,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_keepalive_outside_dev(ctx->device, GGML_CUDA_KEEPALIVE_OUT_GET, size);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -1114,6 +1126,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_keepalive_outside_dev(ctx->device, GGML_CUDA_KEEPALIVE_OUT_SET, size * n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1124,6 +1137,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_keepalive_outside_dev(ctx->device, GGML_CUDA_KEEPALIVE_OUT_GET, size * n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1133,6 +1147,13 @@ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer, 
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ggml_cuda_keepalive_eager_level() >= 1) {
+        size_t total = 0;
+        for (size_t i = 0; i < n_tensors; i++) {
+            total += sizes[i];
+        }
+        ggml_cuda_keepalive_outside_dev(ctx->device, GGML_CUDA_KEEPALIVE_OUT_SET, total);
+    }
 
     for (size_t i = 0; i < n_tensors; i++) {
         if (sizes[i] == 0) {
@@ -1153,6 +1174,13 @@ static void ggml_backend_cuda_buffer_get_tensor_n(ggml_backend_buffer_t buffer, 
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ggml_cuda_keepalive_eager_level() >= 1) {
+        size_t total = 0;
+        for (size_t i = 0; i < n_tensors; i++) {
+            total += sizes[i];
+        }
+        ggml_cuda_keepalive_outside_dev(ctx->device, GGML_CUDA_KEEPALIVE_OUT_GET, total);
+    }
 
     if (!ggml_cuda_pinned_memory_disabled() &&
             ggml_cuda_get_tensor_n(ctx->device, tensors, data, offsets, sizes, n_tensors)) {
@@ -1183,11 +1211,14 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
         if (src_physical == dst_physical) {
+            ggml_cuda_keepalive_outside_dev(dst_ctx->device, GGML_CUDA_KEEPALIVE_OUT_COPY, ggml_nbytes(src));
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
+            ggml_cuda_keepalive_outside_dev(src_ctx->device, GGML_CUDA_KEEPALIVE_OUT_SEND, ggml_nbytes(src));
+            ggml_cuda_keepalive_outside_dev(dst_ctx->device, GGML_CUDA_KEEPALIVE_OUT_RECV, ggml_nbytes(src));
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
 #endif
         }
@@ -1233,11 +1264,14 @@ static bool ggml_backend_cuda_buffer_cpy_tensor_n(ggml_backend_buffer_t buffer, 
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx_i->device);
         if (src_physical == dst_physical) {
+            ggml_cuda_keepalive_outside_dev(dst_ctx_i->device, GGML_CUDA_KEEPALIVE_OUT_COPY, ggml_nbytes(srcs[i]));
             CUDA_CHECK(cudaMemcpyAsync(dsts[i]->data, srcs[i]->data, ggml_nbytes(srcs[i]), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             GGML_ABORT("peer copy not supported");
 #else
+            ggml_cuda_keepalive_outside_dev(src_ctx->device, GGML_CUDA_KEEPALIVE_OUT_SEND, ggml_nbytes(srcs[i]));
+            ggml_cuda_keepalive_outside_dev(dst_ctx_i->device, GGML_CUDA_KEEPALIVE_OUT_RECV, ggml_nbytes(srcs[i]));
             CUDA_CHECK(cudaMemcpyPeerAsync(dsts[i]->data, dst_physical, srcs[i]->data, src_physical, ggml_nbytes(srcs[i]), cudaStreamPerThread));
 #endif
         }
@@ -1251,6 +1285,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_keepalive_outside_dev(ctx->device, GGML_CUDA_KEEPALIVE_OUT_MEMSET, buffer->size);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -3197,6 +3232,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_keepalive_outside_dev(cuda_ctx->device, GGML_CUDA_KEEPALIVE_OUT_SET, size);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -3206,6 +3242,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_keepalive_outside_dev(cuda_ctx->device, GGML_CUDA_KEEPALIVE_OUT_GET, size);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -3216,6 +3253,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_keepalive_outside_dev(cuda_ctx->device, GGML_CUDA_KEEPALIVE_OUT_SET, size * n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -3227,6 +3265,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_keepalive_outside_dev(cuda_ctx->device, GGML_CUDA_KEEPALIVE_OUT_GET, size * n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -3264,6 +3303,13 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         const int src_physical = ggml_cuda_get_physical_device(cuda_ctx_src->device);
         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
         if (src_physical == dst_physical) {
+            ggml_cuda_keepalive_outside_dev(cuda_ctx_dst->device, GGML_CUDA_KEEPALIVE_OUT_COPY, ggml_nbytes(dst));
+        } else {
+            // GGML_CUDA_KEEPALIVE_EAGER: both cards (the mailbox launches a kernel on each)
+            ggml_cuda_keepalive_outside_dev(cuda_ctx_src->device, GGML_CUDA_KEEPALIVE_OUT_SEND, ggml_nbytes(dst));
+            ggml_cuda_keepalive_outside_dev(cuda_ctx_dst->device, GGML_CUDA_KEEPALIVE_OUT_RECV, ggml_nbytes(dst));
+        }
+        if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else if (ggml_cuda_hop_mailbox_on(cuda_ctx_dst, cuda_ctx_src->device, src_physical, dst_physical) &&
                    ggml_cuda_hop_mailbox_copy(cuda_ctx_src, cuda_ctx_dst, (char *) dst->data, (const char *) src->data, ggml_nbytes(dst))) {
@@ -3295,6 +3341,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
     } else {
         // src and dst are on the same backend
+        ggml_cuda_keepalive_outside_dev(cuda_ctx_src->device, GGML_CUDA_KEEPALIVE_OUT_COPY, ggml_nbytes(dst));
         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
     }
     return true;
@@ -6717,6 +6764,50 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// GGML_CUDA_KEEPALIVE_EAGER (C811): the shapes of an evaluation that runs kernel by kernel, as one number. The kernels
+// it launches follow from its nodes' ops, types, shapes, strides and parameters (a kernel picked by a pointer's
+// alignment alone is not covered: level 2 acts on every such evaluation)
+static uint64_t ggml_cuda_keepalive_shapes(const ggml_cgraph * cgraph) {
+    uint64_t h = 0x9e3779b97f4a7c15ull ^ (uint64_t) cgraph->n_nodes;
+    auto mix = [&h](uint64_t v) {
+        h ^= v;
+        h *= 0xbf58476d1ce4e5b9ull;
+        h ^= h >> 31;
+    };
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        mix((uint64_t) node->op | ((uint64_t) node->type << 16));
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            mix((uint64_t) node->ne[d]);
+        }
+        for (int d = 1; d < GGML_MAX_DIMS; d++) {
+            mix((uint64_t) node->nb[d]);
+        }
+        uint64_t p[GGML_MAX_OP_PARAMS / sizeof(uint64_t)];
+        memcpy(p, node->op_params, sizeof(p));
+        for (uint64_t v : p) {
+            mix(v);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const ggml_tensor * s = node->src[j];
+            if (s == nullptr) {
+                continue;
+            }
+            mix((uint64_t) (j + 1) | ((uint64_t) s->type << 16));
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                mix((uint64_t) s->ne[d]);
+            }
+            for (int d = 1; d < GGML_MAX_DIMS; d++) {
+                mix((uint64_t) s->nb[d]);
+            }
+        }
+    }
+    return h;
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -6797,6 +6888,36 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    // GGML_CUDA_KEEPALIVE_EAGER (C811): an evaluation that runs kernel by kernel may launch a kernel for the first time
+    // on the card, and under lazy module loading that launch waits for the card's running block (FN85: up to
+    // GGML_CUDA_KEEPALIVE_MS). The block is ended first, as before a capture, and its next start follows this work
+    if (!use_cuda_graph) {
+        const int ka_level = ggml_cuda_keepalive_eager_level();
+        if (ka_level >= 0) {
+            uint64_t shapes = 0;
+            if (ka_level >= 1) {
+                // a graph reused as it was (the same uid, unique to each graph built) has the shapes it had: a small
+                // cache per thread, by backend and graph; a slot two graphs share only costs a recount
+                struct ka_slot {
+                    uint64_t uid    = 0;
+                    uint64_t shapes = 0;
+                };
+                static thread_local ka_slot ka_cache[256];
+                const uintptr_t k = (uintptr_t) cuda_ctx * 0x9e3779b97f4a7c15ull ^
+                                    (uintptr_t) (cgraph->n_nodes > 0 ? cgraph->nodes[0] : nullptr);
+                ka_slot & slot = ka_cache[(k ^ (k >> 17) ^ (k >> 33)) & 255];
+                if (cgraph->uid != 0 && cgraph->uid == slot.uid) {
+                    shapes = slot.shapes;
+                } else {
+                    shapes      = ggml_cuda_keepalive_shapes(cgraph);
+                    slot.uid    = cgraph->uid;
+                    slot.shapes = shapes;
+                }
+            }
+            ggml_cuda_keepalive_eager_begin(ggml_cuda_get_physical_device(cuda_ctx->device), shapes);
+        }
+    }
+
     // the light modes' start event goes before any capture begins, so it is never a node of a graph
     ggml_cuda_profile_graph * prof_light_graph = prof_light ? ggml_cuda_profile_light_begin(prof, cuda_ctx, graph_key, prof_phase) : nullptr;
     const char * prof_how = !use_cuda_graph ? "eager" : cuda_graph_update_required ? "capture" : "replay";
@@ -6829,8 +6950,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         ggml_cuda_profile_host_exit(prof_host, cuda_ctx);
     }
 
-    // GGML_CUDA_KEEPALIVE: a beat for the card's block, started if it is not running
-    ggml_cuda_keepalive_graph_end(ggml_cuda_get_physical_device(cuda_ctx->device));
+    // GGML_CUDA_KEEPALIVE: a beat for the card's block, started if it is not running (after this work, when
+    // GGML_CUDA_KEEPALIVE_EAGER holds the start)
+    ggml_cuda_keepalive_graph_end_after(ggml_cuda_get_physical_device(cuda_ctx->device), (void *) cuda_ctx->stream());
 
     return GGML_STATUS_SUCCESS;
 }
@@ -8321,6 +8443,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_keepalive_kick") == 0) {
         return (void *)ggml_backend_cuda_keepalive_kick;
+    }
+    if (strcmp(name, "ggml_backend_cuda_keepalive_counts") == 0) {
+        return (void *)ggml_backend_cuda_keepalive_counts;
     }
     return nullptr;
 }
