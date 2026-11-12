@@ -4286,7 +4286,7 @@ struct mtp_replan_run {
     int    replan_prompt = 0; // the draft's evaluations that needed a new plan, in prompt calls
     int    replan_steps  = 0; // and in speculative steps
     int    replan_tgt    = 0; // the target's
-    int    grow          = 0; // the draft's compute buffer growths at evaluations
+    int    grow          = 0; // the draft's compute buffer growths at evaluations, the context's own reserves left out
     int    plans         = 0; // the per-size schedulers planned over the whole memory (sched_small_plan)
     int    evals         = 0; // the draft's evaluations
     bool   short_on      = false;
@@ -4297,6 +4297,7 @@ struct mtp_replan_run {
 static struct {
     bool          on       = false;
     bool          steps    = false;
+    bool          reserve  = false; // in a reserve of the shared scheduler (a sampler set, a memory update)
     int           pending  = 0;
     int           pend_grw = 0;
     std::string   pend_why;
@@ -4316,7 +4317,10 @@ static void mtp_replan_log(const char * text) {
             }
         }
     } else if (strncmp(text, "galloc-grow: ", 13) == 0) {
-        g.pend_grw++;
+        // a reserve of the shared scheduler sizes its buffer for the worst case: not a re-plan
+        g.pend_grw += g.reserve ? 0 : 1;
+    } else if (strstr(text, "sched_reserve: reserving") != nullptr || strstr(text, "graph_reserve: reserving") != nullptr) {
+        g.reserve = true;
     } else if (strstr(text, "sched_small_plan: ") != nullptr) {
         g.run->plans++;
         g.pend_grw = 0; // the plan's own buffer
@@ -4331,10 +4335,12 @@ static void mtp_replan_log(const char * text) {
         g.run->grow += g.pend_grw;
         g.pending = 0;
         g.pend_grw = 0;
+        g.reserve = false;
     } else if (strncmp(text, "ubatch-trace: ", 14) == 0) {
         g.run->replan_tgt += g.pending > 0;
         g.pending = 0;
         g.pend_grw = 0;
+        g.reserve = false;
     }
 }
 
@@ -4378,6 +4384,7 @@ static mtp_replan_run mtp_replan_sequence(
     g_mtp_replan.run      = &run;
     g_mtp_replan.on       = false;
     g_mtp_replan.steps    = false;
+    g_mtp_replan.reserve  = false;
     g_mtp_replan.pending  = 0;
     g_mtp_replan.pend_grw = 0;
 
@@ -4573,8 +4580,8 @@ static int test_mtp_replan(const std::string & arch_filter, const size_t seed, c
     size_t n_tests  = 0;
     size_t n_failed = 0;
     common_log_flush(common_log_main());
-    LOG("|%10s|%16s|%9s|%9s|%5s|%22s|%22s|%22s|%8s|%17s|%s\n", "Model arch.", "Config", "Drafts", "End", "Short",
-            "Re-plans base p/s/t", "Re-plans keep p/s/t", "Re-plans plan p/s/t", "Plans", "Compute KiB k/p", "Status");
+    LOG("|%10s|%16s|%9s|%9s|%5s|%22s|%22s|%22s|%14s|%8s|%17s|%s\n", "Model arch.", "Config", "Drafts", "End", "Short",
+            "Re-plans base p/s/t", "Re-plans keep p/s/t", "Re-plans plan p/s/t", "Growths b/k/p", "Plans", "Compute KiB k/p", "Status");
 
     // a context of 2,048 cells, which the run fills past 256-cell steps
     test_setenv("LLAMA_ARCHS_N_CTX", "2048");
@@ -4632,14 +4639,15 @@ static int test_mtp_replan(const std::string & arch_filter, const size_t seed, c
                 const bool zero     = plan.replan_prompt + plan.replan_steps == 0 && plan.grow == 0;
                 const bool short_ok = cfg.shortlist == nullptr || (base.short_on && keep.short_on && plan.short_on);
 
-                char rb[48], rk[48], rp[48], cp[48], pl[16];
+                char rb[48], rk[48], rp[48], cp[48], pl[16], gr[48];
+                snprintf(gr, sizeof(gr), "%d/%d/%d", base.grow, keep.grow, plan.grow);
                 snprintf(rb, sizeof(rb), "%d/%d/%d", base.replan_prompt, base.replan_steps, base.replan_tgt);
                 snprintf(rk, sizeof(rk), "%d/%d/%d", keep.replan_prompt, keep.replan_steps, keep.replan_tgt);
                 snprintf(rp, sizeof(rp), "%d/%d/%d", plan.replan_prompt, plan.replan_steps, plan.replan_tgt);
                 snprintf(cp, sizeof(cp), "%zu/%zu", keep.compute/1024, plan.compute/1024);
                 snprintf(pl, sizeof(pl), "%d", plan.plans);
-                LOG("%9s|%9s|%5s|%22s|%22s|%22s|%8s|%17s|", same_all ? "identical" : "DIFFERENT", end_ok ? "identical" : "DIFFERENT",
-                        plan.short_on ? "on" : "off", rb, rk, rp, pl, cp);
+                LOG("%9s|%9s|%5s|%22s|%22s|%22s|%14s|%8s|%17s|", same_all ? "identical" : "DIFFERENT", end_ok ? "identical" : "DIFFERENT",
+                        plan.short_on ? "on" : "off", rb, rk, rp, gr, pl, cp);
 
                 if (same_all && end_ok && traced && control && zero && short_ok) {
                     status = "\033[1;32mOK\033[0m";
