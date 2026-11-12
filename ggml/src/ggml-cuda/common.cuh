@@ -22,6 +22,7 @@
 #endif
 #include "ggml-common.h"
 #include "profile-light.h"
+#include "graph-patch.h"
 
 #include <array>
 #include <algorithm>
@@ -1264,6 +1265,10 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+
+    // GGML_CUDA_GRAPHS_PATCH (C779): the bytes in use now, SIZE_MAX when the pool cannot tell (a patch then needs a full
+    // capture)
+    virtual size_t used() const { return SIZE_MAX; }
 };
 
 template<typename T>
@@ -1334,6 +1339,34 @@ struct ggml_cuda_graph {
                 CUDA_CHECK(cudaGraphExecDestroy(instance));
             }
         }
+        patch_drop_templates(0);
+    }
+    // GGML_CUDA_GRAPHS_PATCH (C779, graph-patch.h): what the last full capture recorded, so that an evaluation whose
+    // properties changed in a few nodes sets those nodes' CUDA nodes in the executables instead of a new capture.
+    // patch_templates[c] is the graph chunk c's executable was instantiated from (its nodes name the executable's
+    // nodes), patch_chains[c] its nodes in launch order; all empty unless the switch is set
+    std::vector<cudaGraph_t>                  patch_templates;
+    std::vector<std::vector<cudaGraphNode_t>> patch_chains;
+    std::vector<ggml_cuda_graph_patch_group>  patch_groups;
+    std::vector<int32_t>                      patch_node_group; // per ggml node: the group holding it, -1 if skipped
+    std::vector<uint8_t>                      patch_gather;     // per ggml node: skipped as a gathered state row
+    std::vector<uint8_t>                      node_changed;     // per ggml node: its properties changed (last evaluation)
+    bool node_structure_changed = false; // the last evaluation changed the node count or a node's op, type or sources
+    bool patch_ready = false;            // the executables match the recorded groups and the recorded properties
+    // the templates and chains of chunks from `from` on are dropped, with patch_ready
+    void patch_drop_templates(const size_t from) {
+        for (size_t c = from; c < patch_templates.size(); c++) {
+            if (patch_templates[c] != nullptr) {
+                CUDA_CHECK(cudaGraphDestroy(patch_templates[c]));
+            }
+        }
+        if (from < patch_templates.size()) {
+            patch_templates.resize(from);
+        }
+        if (from < patch_chains.size()) {
+            patch_chains.resize(from);
+        }
+        patch_ready = false;
     }
     // the ggml graph is captured as a series of CUDA graphs, so the GPU can run one chunk while the next is enqueued
     std::vector<cudaGraphExec_t> instances;
