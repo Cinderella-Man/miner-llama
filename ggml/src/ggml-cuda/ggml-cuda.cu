@@ -3435,8 +3435,9 @@ static int ggml_cuda_graphs_patch_max() {
     return m;
 }
 
-// GGML_CUDA_GRAPHS_PATCH: the process's counts, logged every 64 decisions: evaluations patched (and the groups, ggml
-// nodes and CUDA nodes they re-dispatched) and full captures by reason (the first is a patch-mode capture's recording)
+// GGML_CUDA_GRAPHS_PATCH: the process's counts, logged every 64 decisions as a warning (llama-server prints it at its
+// default verbosity): evaluations patched (and the groups, ggml nodes and CUDA nodes they re-dispatched) and full
+// captures by reason (a graph's first is "not_ready"). The graph profile labels a patched evaluation "patch"
 struct ggml_cuda_graphs_patch_stats {
     std::mutex mutex;
     uint64_t   by_reason[GGML_CUDA_GRAPH_PATCH_REASON_COUNT] = {};
@@ -3460,7 +3461,7 @@ static void ggml_cuda_graphs_patch_count(const int reason, const uint64_t groups
         for (int r = GGML_CUDA_GRAPH_PATCH_NOT_READY; r < GGML_CUDA_GRAPH_PATCH_REASON_COUNT; r++) {
             why += " " + std::string(ggml_cuda_graph_patch_reason_name(r)) + " " + std::to_string(s.by_reason[r]);
         }
-        GGML_LOG_INFO("GGML_CUDA_GRAPHS_PATCH: %" PRIu64 " of %" PRIu64 " captures patched (%" PRIu64 " groups, %" PRIu64
+        GGML_LOG_WARN("GGML_CUDA_GRAPHS_PATCH: %" PRIu64 " of %" PRIu64 " captures patched (%" PRIu64 " groups, %" PRIu64
                       " ggml nodes, %" PRIu64 " CUDA nodes set); captured in full:%s\n",
                       s.by_reason[GGML_CUDA_GRAPH_PATCH_NONE], s.n_decisions, s.n_groups, s.n_nodes, s.n_cuda_nodes, why.c_str());
     }
@@ -7272,6 +7273,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     bool patch_mode                 = false; // GGML_CUDA_GRAPHS_PATCH: this capture records its groups (C779)
+    bool patched                    = false; // GGML_CUDA_GRAPHS_PATCH: the executables were patched and replay
     const void * graph_key = nullptr;
 
     // GGML_CUDA_PROFILE_MODE other than group: sample mode's phase of this evaluation
@@ -7343,6 +7345,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const int reason = ggml_cuda_graph_patch(cuda_ctx, cgraph, graph, n_groups, n_nodes, n_cuda);
             if (reason == GGML_CUDA_GRAPH_PATCH_NONE) {
                 cuda_graph_update_required = false; // the executables replay
+                patched                    = true;
                 patch_mode = false;
             }
             ggml_cuda_graphs_patch_count(reason, n_groups, n_nodes, n_cuda);
@@ -7386,7 +7389,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     // the light modes' start event goes before any capture begins, so it is never a node of a graph
     ggml_cuda_profile_graph * prof_light_graph = prof_light ? ggml_cuda_profile_light_begin(prof, cuda_ctx, graph_key, prof_phase) : nullptr;
-    const char * prof_how = !use_cuda_graph ? "eager" : cuda_graph_update_required ? "capture" : "replay";
+    const char * prof_how = !use_cuda_graph ? "eager" : cuda_graph_update_required ? "capture" : patched ? "patch" : "replay";
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
