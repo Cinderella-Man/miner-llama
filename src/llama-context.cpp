@@ -1246,6 +1246,15 @@ bool llama_context::sampler_reserve_covered() const {
     return std::includes(sampling.reserved_chains.begin(), sampling.reserved_chains.end(), cur.begin(), cur.end());
 }
 
+// LLAMA_PP_MULTI_SPLIT=1 (C812): pipeline parallelism only for a context whose graph runs as more than one split
+static bool llama_pp_multi_split_only() {
+    static const bool on = [] {
+        const char * s = getenv("LLAMA_PP_MULTI_SPLIT");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return on;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -1289,6 +1298,30 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
     resolve_fused_ops(mctx.get(), n_seqs);
+
+    // LLAMA_PP_MULTI_SPLIT=1 (C812): pipeline parallelism keeps n_copies (4) copies of every graph input in the
+    // scheduler's buffers, in host memory and on each split's device, so that the next micro-batch can start on the
+    // first devices while the last ones still compute. A graph that runs as one split has no devices to overlap and
+    // the copies only take memory: the MTP draft with its token table on its layer's card (LLAMA_DRAFT_EMBD_DEV=layer
+    // and no -otd rule, which used to turn pipeline parallelism off) is one split on that card, and its four copies of
+    // a 512-token micro-batch's inputs took 86.41 MiB of pinned host memory instead of 21.60 on a P106 rig. Split the
+    // pp and the tg graph first, without allocating, and plan the context without pipeline parallelism if each is one
+    // split. Once off it stays off for the context: its weights do not move
+    if (cparams.pipeline_parallel && llama_pp_multi_split_only()) {
+        graph_reserve(n_tokens, n_seqs, std::min(n_tokens, cparams.n_outputs_max), mctx.get(), /*split_only =*/ true);
+        const int n_split_pp = ggml_backend_sched_get_n_splits(sched.get());
+        int n_split_tg = n_split_pp;
+        if (!cparams.training) {
+            graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), /*split_only =*/ true);
+            n_split_tg = ggml_backend_sched_get_n_splits(sched.get());
+        }
+        if (n_split_pp <= 1 && n_split_tg <= 1) {
+            LLAMA_LOG_INFO("%s: LLAMA_PP_MULTI_SPLIT: the graph runs as one split (pp %d, tg %d): planned without "
+                    "pipeline parallelism, one copy of each input\n", __func__, n_split_pp, n_split_tg);
+            cparams.pipeline_parallel = false;
+            sched_new(max_nodes, false);
+        }
+    }
 
     // reserve worst-case graph
     int n_splits_pp        = -1;
