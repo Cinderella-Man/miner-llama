@@ -24,6 +24,12 @@
 // leaves the products of 2 to 8 columns that the other kernels run faster on a P106 to them, by type, row width and
 // column count; GGML_CUDA_MMVQ_PASCAL_KCOL_TABLE=0 turns it off. GGML_CUDA_MMVQ_PASCAL=0 turns these kernels off with the
 // other Pascal kernels, =2 runs them on any NVIDIA GPU (testing).
+// GGML_CUDA_MMVQ_PASCAL_KCOL_EXACT=1 (C805; 0 by default): the products of 2 to 8 columns of Q3_K, IQ4_NL, Q2_0 and Q8_0 in
+// rows of chunks not a multiple of 4 (the types whose one-token sums are these kernels') are never left to the other
+// kernels, whose sums differ: not by the table, and not where the columns' activations pass the shared-memory budget,
+// where they run within 48 KB (in one launch where all columns fit, else in launches of fewer columns); =2 tries
+// launches within the budget first. _KCOL_EXACT_FAULT=1 (checks): a split product's later launches read the first one's
+// activations.
 
 // Runs dst = src0 * src1 if these kernels take it; returns false (nothing launched) otherwise.
 bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
