@@ -343,7 +343,11 @@ static std::vector<mnode> random_graph(std::mt19937 & rng, const int n) {
     std::vector<mnode> g(n);
     std::uniform_int_distribution<int> op(0, N_OPS - 1);
     for (int i = 0; i < n; i++) {
-        g[i] = { op(rng), 10 + (int) (rng() % 20), (int) (rng() % 1000) };
+        int o = op(rng);
+        if (o == OP_H && rng() % 4 != 0) {
+            o = OP_A; // a group that holds pool memory into the next is rare
+        }
+        g[i] = { o, 10 + (int) (rng() % 20), (int) (rng() % 1000) };
     }
     // a few long patterns, so that the six-node fusion and its condition on its last node occur
     for (int p = 0; p + 6 < n; p += 30 + (int) (rng() % 21)) {
@@ -363,7 +367,7 @@ struct run_counts {
 
 // one run of prompt micro-batches: rotating input readers, growing cache readers (those that are E end a long pattern,
 // so the six-node fusion turns on and off), sometimes a structure change, another node count or an eager evaluation
-static run_counts random_run(std::mt19937 & rng, const int window, const int n_evals) {
+static run_counts random_run(std::mt19937 & rng, const int window, const int max_pct, const int n_evals) {
     run_counts rc;
     std::vector<mnode> g = random_graph(rng, 40 + (int) (rng() % 120));
     std::vector<int> inputs, cache;
@@ -403,7 +407,7 @@ static run_counts random_run(std::mt19937 & rng, const int window, const int n_e
             continue;
         }
         int n_groups = 0;
-        int r = have ? model_patch(next, prev, rec, ex, window, 60, n_groups) : GGML_CUDA_GRAPH_PATCH_NOT_READY;
+        int r = have ? model_patch(next, prev, rec, ex, window, max_pct, n_groups) : GGML_CUDA_GRAPH_PATCH_NOT_READY;
         rc.by_reason[r]++;
         if (r == GGML_CUDA_GRAPH_PATCH_NONE) {
             rc.patched++;
@@ -449,7 +453,7 @@ static void test_model() {
     long reasons[GGML_CUDA_GRAPH_PATCH_REASON_COUNT] = {};
     for (int seed = 1; seed <= 2000; seed++) {
         std::mt19937 r_on(seed);
-        const run_counts on = random_run(r_on, LONGEST - 1, 300);
+        const run_counts on = random_run(r_on, LONGEST - 1, seed % 2 ? 100 : 60, 300);
         CHECK(on.inexact == 0);
         patched += on.patched;
         full    += on.full;
@@ -460,7 +464,7 @@ static void test_model() {
         }
         // the control: a window shorter than the longest pattern misses a fusion that a changed last node turns on
         std::mt19937 r_ctl(seed);
-        const run_counts ctl = random_run(r_ctl, 2, 300);
+        const run_counts ctl = random_run(r_ctl, 2, 100, 300);
         ctl_inexact += ctl.inexact;
         ctl_runs    += ctl.inexact > 0;
     }

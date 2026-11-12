@@ -3404,7 +3404,8 @@ static bool ggml_cuda_graph_force_capture(ggml_backend_cuda_context * cuda_ctx, 
 // again, whose properties changed in a few nodes, has those nodes' groups re-dispatched into a scratch capture and their
 // CUDA nodes' parameters set in the executables, which then replay. GGML_CUDA_GRAPHS_PATCH_WINDOW (32): a group is
 // re-dispatched when a changed node lies within this many nodes after its first one (a fusion decision reads ahead);
-// GGML_CUDA_GRAPHS_PATCH_MAX (60): the most nodes, in percent of the graph's, re-dispatched instead of a full capture.
+// GGML_CUDA_GRAPHS_PATCH_MAX (100): the most nodes, in percent of the graph's, re-dispatched instead of a full capture
+// (which in patch mode instantiates its executables anew, so a lower limit can cost more than it saves).
 // Off by default; without the force switch it does nothing
 static bool ggml_cuda_graphs_patch() {
     static const bool enabled = [] {
@@ -3416,7 +3417,7 @@ static bool ggml_cuda_graphs_patch() {
         if (on) {
             GGML_LOG_INFO("%s: GGML_CUDA_GRAPHS_PATCH: a forced graph whose properties changed in a few nodes is patched "
                           "and replayed (window %d nodes, at most %d%% of the nodes re-dispatched)\n", __func__,
-                          ggml_cuda_env_int("GGML_CUDA_GRAPHS_PATCH_WINDOW", 32), ggml_cuda_env_int("GGML_CUDA_GRAPHS_PATCH_MAX", 60));
+                          ggml_cuda_env_int("GGML_CUDA_GRAPHS_PATCH_WINDOW", 32), ggml_cuda_env_int("GGML_CUDA_GRAPHS_PATCH_MAX", 100));
         } else if (ggml_cuda_env_flag("GGML_CUDA_GRAPHS_PATCH")) {
             GGML_LOG_WARN("%s: GGML_CUDA_GRAPHS_PATCH needs GGML_CUDA_GRAPHS_FORCE=1 and a CUDA 12 build: ignored\n", __func__);
         }
@@ -3431,7 +3432,7 @@ static int ggml_cuda_graphs_patch_window() {
 }
 
 static int ggml_cuda_graphs_patch_max() {
-    static const int m = std::min(100, std::max(0, ggml_cuda_env_int("GGML_CUDA_GRAPHS_PATCH_MAX", 60)));
+    static const int m = std::min(100, std::max(0, ggml_cuda_env_int("GGML_CUDA_GRAPHS_PATCH_MAX", 100)));
     return m;
 }
 
