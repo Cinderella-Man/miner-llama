@@ -280,6 +280,10 @@ common_spec_adapt_params common_spec_adapt_params_from_env() {
     if (const char * v = getenv("LLAMA_SPEC_ADAPT_LOG"); v != nullptr) {
         p.log = v;
     }
+    p.online = (int32_t) spec_adapt_env_number("LLAMA_SPEC_ADAPT_ONLINE", 0.0, 0.0, 2.0);
+    if (const char * v = getenv("LLAMA_SPEC_ADAPT_ONLINE"); v != nullptr && *v != '\0' && (double) p.online != std::atof(v)) {
+        throw std::invalid_argument(string_format("LLAMA_SPEC_ADAPT_ONLINE: '%s' is not 0, 1 or 2", v));
+    }
 
     return p;
 }
@@ -306,7 +310,20 @@ std::vector<int32_t> common_spec_adapt_lengths(const common_spec_adapt_params & 
     return out;
 }
 
-common_spec_adapt_choice common_spec_adapt_choose(const common_spec_adapt_params & params,
+// the rule's walk over the drafted probabilities p (common_spec_adapt_choose). Where it stops at an allowed length
+// beyond p.size() (the draft is too short to test it), it also gives that length (C815: len_next), its threshold and
+// the part of its gain p already settles: the path products and their sum over p's positions past ch.n_keep, computed
+// as the test computes them, so a longer draft's test at len_next adds terms of at most pp to exactly that sum
+struct spec_adapt_walk {
+    common_spec_adapt_choice ch;
+    int32_t n_fail   = 0;   // the allowed length whose test failed (0: none)
+    int32_t len_next = 0;   // the first allowed length beyond p.size() (0: none)
+    double  gain     = 0.0; // len_next's gain over p's positions past ch.n_keep
+    double  pp       = 1.0; // the path probability at p.size() (1 when p.size() == ch.n_keep)
+    double  thr      = 0.0; // len_next's test passes when its gain exceeds this
+};
+
+static spec_adapt_walk spec_adapt_walk_p(const common_spec_adapt_params & params,
         const std::vector<int32_t> & lengths, const std::vector<float> & p, double s_run) {
     const double t1 = common_spec_adapt_cost(params, 1);
 
@@ -318,7 +335,8 @@ common_spec_adapt_choice common_spec_adapt_choose(const common_spec_adapt_params
         }
     };
 
-    common_spec_adapt_choice ch;
+    spec_adapt_walk w;
+    auto & ch = w.ch;
     ch.n_keep  = 0;
     ch.e_tau   = 1.0;
     ch.cost_ms = params.draft_ms + t1;
@@ -330,6 +348,18 @@ common_spec_adapt_choice common_spec_adapt_choose(const common_spec_adapt_params
             continue;
         }
         if (len > (int32_t) p.size()) {
+            // C815: the test at len waits for more of the draft; what p settles of it
+            double gain = 0.0;
+            double pp   = path;
+            for (int32_t i = ch.n_keep; i < (int32_t) p.size(); ++i) {
+                pp   *= std::max(0.0, std::min(1.0, (double) p[i]));
+                gain += pp;
+            }
+            const double dt = common_spec_adapt_cost(params, len + 1) - common_spec_adapt_cost(params, ch.n_keep + 1);
+            w.len_next = len;
+            w.gain     = gain;
+            w.pp       = pp;
+            w.thr      = params.scale * ch.s * dt / t1;
             break;
         }
 
@@ -343,6 +373,7 @@ common_spec_adapt_choice common_spec_adapt_choose(const common_spec_adapt_params
         const double dt = common_spec_adapt_cost(params, len + 1) - common_spec_adapt_cost(params, ch.n_keep + 1);
 
         if (!(gain > params.scale * ch.s * dt / t1)) {
+            w.n_fail = len;
             break;
         }
 
@@ -353,7 +384,47 @@ common_spec_adapt_choice common_spec_adapt_choose(const common_spec_adapt_params
         path        = pp;
     }
 
-    return ch;
+    return w;
+}
+
+common_spec_adapt_choice common_spec_adapt_choose(const common_spec_adapt_params & params,
+        const std::vector<int32_t> & lengths, const std::vector<float> & p, double s_run) {
+    return spec_adapt_walk_p(params, lengths, p, s_run).ch;
+}
+
+// C815. A longer draft q that starts with p walks the same tests up to p.size(): each test reads only the
+// probabilities up to its length, and S changes only when a test passes. So a test that failed on p fails on q, and
+// past the last allowed length q has nothing more to test. For len_next, q's gain is the sum below with the terms of
+// q's positions p.size() .. len_next - 1 added, each a path probability no larger than pp (a product with factors
+// clamped to [0, 1]); rounded additions are monotone, so adding pp for each instead bounds q's gain from above.
+bool common_spec_adapt_continue(const common_spec_adapt_online & a, const std::vector<float> & p) {
+    if (a.params == nullptr || a.lengths == nullptr || a.params->online <= 0) {
+        return true;
+    }
+    const auto w = spec_adapt_walk_p(*a.params, *a.lengths, p, a.s_run);
+    if (w.n_fail > 0 || w.len_next == 0) {
+        return false;
+    }
+    if (a.params->online >= 2) {
+        double g = w.gain;
+        for (int32_t i = (int32_t) p.size(); i < w.len_next; ++i) {
+            g += w.pp;
+        }
+        if (!(g > w.thr)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// C815. The token at position p.size() adds pp times its clamped probability, at least 0, to the sum the walk settled,
+// so the gain at len_next = p.size() + 1 is at least w.gain
+bool common_spec_adapt_keeps_next(const common_spec_adapt_online & a, const std::vector<float> & p) {
+    if (a.params == nullptr || a.lengths == nullptr) {
+        return false;
+    }
+    const auto w = spec_adapt_walk_p(*a.params, *a.lengths, p, a.s_run);
+    return w.n_fail == 0 && w.len_next == (int32_t) p.size() + 1 && w.gain > w.thr;
 }
 
 void common_spec_adapt_state::init(const common_spec_adapt_params & params) {
@@ -2047,6 +2118,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     uint64_t             cap_n_saved = 0;
     uint64_t             cap_n_rounds = 0;
 
+    // C815 (LLAMA_SPEC_ADAPT_ONLINE, through common_speculative_draft_params::adapt): the drafts the rule stopped, the
+    // drafting passes it left out, the sampler draws made for them, and the C738 last passes it confirmed
+    uint64_t online_n_drafts  = 0;
+    uint64_t online_n_stopped = 0;
+    uint64_t online_n_saved   = 0;
+    uint64_t online_n_draws   = 0;
+    uint64_t online_n_last    = 0;
+
     // target h rows on the device (llama_set_embeddings_nextn_dev): the catch-up in process() reads row k - 1 of the last
     // target decode in place, and row n_batch_tgt + seq_id for the first token of seq_id, uploaded from pending_h
     // pending_h stays on the host: process() and accept() fetch it before the next target decode overwrites the rows
@@ -2274,6 +2353,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         SPC_INF("draft length cap: %" PRIu64 " drafting passes left out in %" PRIu64 " drafts\n", cap_n_saved, cap_n_rounds);
     }
 
+    // C815: the closing line; at WARN, so that a server at its default verbosity logs it
+    void online_report() const {
+        SPC_WRN("C815: %" PRIu64 " drafts under the rule taken while drafting, %" PRIu64 " stopped early, %" PRIu64
+                " drafting passes left out, %" PRIu64 " sampler draws made for them, %" PRIu64 " last passes kept\n",
+                online_n_drafts, online_n_stopped, online_n_saved, online_n_draws, online_n_last);
+    }
+
+    // C815: what n passes left out would have drawn on a sequence's sampler: each sampled its pass's candidates through
+    // the chain once, on the host when the stopping pass did, and the chain's last sampler (dist) draws one number per
+    // call whatever the candidates' count
+    static void online_draw(common_sampler * smpl, int32_t n) {
+        llama_sampler * chain = common_sampler_get(smpl);
+        for (int32_t k = 0; k < n; ++k) {
+            llama_token_data       td  = { 0, 0.0f, 1.0f };
+            llama_token_data_array arr = { &td, 1, -1, false };
+            llama_sampler_apply(chain, &arr);
+        }
+    }
+
     // LLAMA_DRAFT_EMBD_CACHE=<rows>[,<max tokens>]: batches of up to max tokens (default 16: the draft passes and the
     // catch-up over a verify step's tokens) read their token rows from a cache on the draft layer's card, so that a
     // pass with the table on another card (-otd token_embd=CUDA4) does not cross to it; prompts read the table
@@ -2392,6 +2490,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         if (cap_on) {
             cap_report();
+        }
+        if (online_n_drafts > 0) {
+            online_report();
         }
 
         auto * ctx_dft = this->params.ctx_dft;
@@ -2695,6 +2796,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // C744: the drafting passes the slots' caps leave out at most (a p_min cut may stop a sequence before)
         int64_t n_cap = 0;
 
+        // C815: the sequences under the rule taken while drafting (dp.adapt), the draft length each reaches as built
+        // (n_stop: every pass adds a token when p_min <= 0), the longest the rule can keep of it (the last allowed
+        // length within n_stop and the slot's cap: drafting past it changes nothing), and those the rule stopped
+        std::vector<bool>    online(n_seq, false);
+        std::vector<bool>    online_stop(n_seq, false);
+        std::vector<int32_t> n_built(n_seq, 0);
+        std::vector<int32_t> n_last(n_seq, 0);
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
 
@@ -2724,6 +2833,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (cap_on && !dp.result_q && dp.n_max > 0 && dp.n_max >= params.n_min && dp.n_max < params.n_max) {
                 n_stop[seq_id] = dp.n_max;
                 n_cap += params.n_max - dp.n_max;
+            }
+
+            n_built[seq_id] = n_stop[seq_id];
+            if (dp.adapt != nullptr && dp.adapt->lengths != nullptr && dp.result_p != nullptr && params.p_min <= 0.0f) {
+                online[seq_id] = true;
+                online_n_drafts++;
+                const int32_t lim = dp.n_max > 0 ? std::min(n_stop[seq_id], dp.n_max) : n_stop[seq_id];
+                for (const int32_t len : *dp.adapt->lengths) {
+                    if (len <= lim) {
+                        n_last[seq_id] = std::max(n_last[seq_id], len);
+                    }
+                }
             }
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
@@ -2815,11 +2936,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_step_trace_mark("mtp.dp.ret");
 
             // C738: this pass is the last and adds one token to every drafting sequence (no p_min cut can stop one, and
-            // n_min keeps the draft): its caller may prepare the verify pass while it runs
-            if (i + 1 == params.n_max && params.p_min <= 0.0f && params.n_min <= params.n_max) {
+            // n_min keeps the draft): its caller may prepare the verify pass while it runs. C815: under the rule taken
+            // while drafting, a sequence's last pass is the one that reaches n_last, and only when the rule keeps its
+            // token whatever its probability is the draft the verify pass will see known now
+            if (params.p_min <= 0.0f && params.n_min <= params.n_max) {
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                     auto & dp = dparams[seq_id];
-                    if (drafting[seq_id] && dp.last_pass && (int) dp.result->size() == i) {
+                    if (!drafting[seq_id] || !dp.last_pass || (int) dp.result->size() != i) {
+                        continue;
+                    }
+                    if (!online[seq_id]) {
+                        if (i + 1 == params.n_max) {
+                            dp.last_pass();
+                        }
+                    } else if (i + 1 == n_last[seq_id] && common_spec_adapt_keeps_next(*dp.adapt, *dp.result_p)) {
+                        online_n_last++;
                         dp.last_pass();
                     }
                 }
@@ -2892,6 +3023,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                // C815: the rule taken while drafting: no later token can change what it keeps. The passes left out
+                // would each have drawn once on this sampler, where this pass drew (on the host): draw that for them, so
+                // that a probabilistic draft's next steps see the random state of the switch as built
+                if (online[seq_id] && ((int) result.size() >= n_last[seq_id] ||
+                                       !common_spec_adapt_continue(*dp.adapt, *dp.result_p))) {
+                    drafting[seq_id]    = false;
+                    online_stop[seq_id] = true;
+                    n_drafting--;
+
+                    // LLAMA_SPEC_ADAPT_ONLINE_FAULT=1 (a check's control): no draws, so a probabilistic draft's later
+                    // steps sample from another random state
+                    static const bool fault = [] {
+                        const char * s = getenv("LLAMA_SPEC_ADAPT_ONLINE_FAULT");
+                        return s != nullptr && atoi(s) != 0;
+                    }();
+                    const int32_t n_left = n_built[seq_id] - (int32_t) result.size();
+                    online_n_stopped++;
+                    online_n_saved += (uint64_t) std::max(0, n_left);
+                    if (n_left > 0 && !fault &&
+                            llama_get_sampled_token_ith(ctx_dft, i_last[seq_id]) == LLAMA_TOKEN_NULL) {
+                        online_draw(smpl, n_left);
+                        online_n_draws += (uint64_t) n_left;
+                    }
+                    llama_step_trace_count("adapt.stop", (int64_t) result.size());
+                    continue;
+                }
+
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448031546
                     chain_h[seq_id].insert(chain_h[seq_id].end(), h_row, h_row + n_embd);
@@ -2947,7 +3105,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            if (dp.result->size() < (size_t) params.n_min) {
+            // C815: a draft the rule stopped is judged at the length it has as built
+            const size_t n_judged = online_stop[seq_id] ? (size_t) n_built[seq_id] : dp.result->size();
+            if (n_judged < (size_t) params.n_min) {
                 dp.result->clear();
             }
         }

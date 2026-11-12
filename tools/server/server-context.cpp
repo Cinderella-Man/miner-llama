@@ -381,12 +381,20 @@ static int32_t spec_dump_ngram(const llama_tokens & ctx, llama_token last, int32
 // verified changes.
 //   LLAMA_SPEC_ADAPT_LOG=<file>  one JSON line per drafted step, after a header line per server start; it works with
 //                                the switch off too (the rule's choice is then recorded, not applied)
+//   LLAMA_SPEC_ADAPT_ONLINE=1|2  (C815, with LLAMA_SPEC_ADAPT=1 and --spec-draft-p-min 0) the rule taken while
+//                                drafting: draft-mtp stops where no later token can change what the rule keeps (1: an
+//                                allowed length's test failed, or the last allowed length is reached; 2: also when the
+//                                next allowed length cannot pay whatever the next tokens' probabilities), so a step runs
+//                                fewer drafting passes. The rule below then cuts a shorter draft to the same tokens; the
+//                                running speed-up, the replies and a probabilistic drafter's random state are the
+//                                switch's as built. The log's n_draft and p are what was drafted
 // Off by default: with neither variable set nothing below runs and the drafters compute no probabilities.
 struct server_spec_adapt {
     common_spec_adapt_params params;
     std::vector<int32_t>     lengths;     // the drafted-token counts allowed
     int32_t                  n_max   = 0;
     bool                     active  = false; // switched on, or logging
+    bool                     online_on = false; // C815: the rule taken while drafting
     FILE *                   f       = nullptr;
     int64_t                  run     = 0; // the server start in microseconds: tells apart runs appended to one file
     uint64_t                 n_steps = 0;
@@ -398,8 +406,12 @@ struct server_spec_adapt {
 
     static bool on() { return get().active; }
 
-    // at the server's start, once the drafters are known; throws on a malformed variable or an unwritable log
-    static void init(int32_t n_max) {
+    // C815: the switch on and taken while drafting
+    static bool online() { return get().online_on; }
+
+    // at the server's start, once the drafters are known; throws on a malformed variable or an unwritable log. p_min:
+    // the drafters' --spec-draft-p-min (the rule is taken while drafting only where every pass adds a token)
+    static void init(int32_t n_max, float p_min) {
         auto & a = get();
         if (a.f) {
             fclose(a.f);
@@ -409,6 +421,11 @@ struct server_spec_adapt {
         a.n_max   = n_max;
         a.lengths = common_spec_adapt_lengths(a.params, n_max);
         a.active  = a.params.enabled || !a.params.log.empty();
+        a.online_on = a.params.enabled && a.params.online > 0 && p_min <= 0.0f;
+        if (a.params.online > 0 && !a.online_on) {
+            LOG_WRN("LLAMA_SPEC_ADAPT_ONLINE=%d has no effect: it needs LLAMA_SPEC_ADAPT=1 and --spec-draft-p-min 0 "
+                    "(LLAMA_SPEC_ADAPT %s, p_min %.2f)\n", a.params.online, a.params.enabled ? "on" : "off", p_min);
+        }
         if (!a.active) {
             return;
         }
@@ -445,6 +462,9 @@ struct server_spec_adapt {
                 {"ema",      a.params.ema},
                 {"scale",    a.params.scale},
             };
+            if (a.online_on) {
+                hdr["online"] = a.params.online;
+            }
             const std::string s = hdr.dump();
             fputs(s.c_str(), a.f);
             fputc('\n', a.f);
@@ -459,6 +479,9 @@ struct server_spec_adapt {
                 "scale %.3f%s%s\n", a.params.enabled ? "on" : "off (log only)", w.c_str(), n_max, t.front(),
                 (int) t.size(), t.back(), a.params.draft_ms, s_mode, a.params.scale,
                 a.f ? ", log " : "", a.f ? a.params.log.c_str() : "");
+        if (a.online_on) {
+            LOG_INF("LLAMA_SPEC_ADAPT_ONLINE=%d: the rule is taken while drafting (C815)\n", a.params.online);
+        }
     }
 };
 
@@ -647,6 +670,7 @@ struct server_slot {
     // the drafted tokens kept
     std::vector<float> spec_draft_p;
     common_spec_adapt_state spec_adapt_state;
+    common_spec_adapt_online spec_adapt_online; // C815: the rule the drafter takes while drafting, with this step's S
     struct {
         bool    pending = false;
         int32_t n_draft = 0; // drafted
@@ -2684,7 +2708,7 @@ private:
         // LLAMA_SPEC_ADAPT: read once here, so that a malformed value stops the server at its start
         if (spec) {
             try {
-                server_spec_adapt::init(common_speculative_n_max(spec.get()));
+                server_spec_adapt::init(common_speculative_n_max(spec.get()), params_base.speculative.draft.p_min);
             } catch (const std::exception & e) {
                 SRV_ERR("LLAMA_SPEC_ADAPT: %s\n", e.what());
                 return false;
@@ -6181,6 +6205,15 @@ private:
                             /* .result_p = */ spec_adapt ? &slot.spec_draft_p : nullptr,
                         };
 
+                        // C815: the rule taken while drafting, with the S that spec_adapt_choose will use for this draft
+                        if (server_spec_adapt::online()) {
+                            const auto & a = server_spec_adapt::get();
+                            slot.spec_adapt_online.params  = &a.params;
+                            slot.spec_adapt_online.lengths = &a.lengths;
+                            slot.spec_adapt_online.s_run   = slot.spec_adapt_state.s(a.params);
+                            common_speculative_get_draft_params(spec.get(), slot.id).adapt = &slot.spec_adapt_online;
+                        }
+
                         // C738: the verify pass prepared while the last drafting pass runs
                         if (verify_prepare > 0) {
                             server_slot * ps = &slot;
@@ -6231,6 +6264,12 @@ private:
             // LLAMA_SPEC_ADAPT: verify only the prefix of the draft that pays (or record it, with the switch off)
             if (server_spec_adapt::on()) {
                 spec_adapt_choose(slot);
+
+                // C815: the drafter called last_pass only for a token the rule keeps whatever its probability
+                if (vprep_slot == slot.id && (int32_t) draft.size() != vprep_n_draft) {
+                    GGML_ABORT("C815: the rule kept %zu of slot %d's drafted tokens, its verify pass was prepared for %d\n",
+                            draft.size(), slot.id, vprep_n_draft);
+                }
             }
 
             slot.stats.n_draft_tokens += draft.size();
@@ -7204,8 +7243,9 @@ private:
                   slot.pipe_win.empty() && batch.size() == 0 && batch.slot_batched == &slot;
         // the draft is verified whole (no cap below it, no adaptive cut, no forced tokens), and nothing reads or changes
         // ctx_tgt's memory or settings before the decode (no checkpoint of it, no checkpoints inside the call, no shared
-        // memory with the draft, no per-batch output head decisions)
-        ok = ok && !server_spec_adapt::on() && !server_spec_verify::get().any_draft() &&
+        // memory with the draft, no per-batch output head decisions). C815: with the rule taken while drafting the
+        // drafter calls this only for a pass whose token the rule keeps, so the adaptive cut leaves this draft whole
+        ok = ok && (!server_spec_adapt::on() || server_spec_adapt::online()) && !server_spec_verify::get().any_draft() &&
              (dp.n_max <= 0 || dp.n_max >= n_draft) &&
              ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
              !(ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > (int32_t) llama_n_rs_seq(ctx_tgt)) &&

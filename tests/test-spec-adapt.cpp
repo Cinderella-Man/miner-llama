@@ -36,6 +36,7 @@ static void set_env(const char * name, const char * value) {
 static const char * k_env[] = {
     "LLAMA_SPEC_ADAPT", "LLAMA_SPEC_ADAPT_COST", "LLAMA_SPEC_ADAPT_WIDTHS", "LLAMA_SPEC_ADAPT_DRAFT_MS",
     "LLAMA_SPEC_ADAPT_S", "LLAMA_SPEC_ADAPT_S0", "LLAMA_SPEC_ADAPT_EMA", "LLAMA_SPEC_ADAPT_SCALE", "LLAMA_SPEC_ADAPT_LOG",
+    "LLAMA_SPEC_ADAPT_ONLINE",
 };
 
 static void clear_env() {
@@ -263,6 +264,178 @@ static void test_random() {
     printf("random: %d cases, %d with every width checked against the literal rule\n", n_cases, n_literal);
 }
 
+// C815: the rule taken while drafting (common_spec_adapt_continue, common_spec_adapt_keeps_next) against
+// common_spec_adapt_choose on the whole draft. A drafter that drafts one token a pass and stops where continue says so
+// keeps the same tokens with the same S, E and C (bit for bit); at online 1 it stops at the first allowed length whose
+// test fails, else at the last allowed length (FN82's "online" arm); at online 2 no later; a prefix where continue is
+// false gives the same choice on random extensions of it (all ones, all zeros, random); and keeps_next is exactly "a
+// next token of probability 0 completes a length the rule keeps", after which any probability keeps it
+static void test_online() {
+    std::mt19937 rng(815);
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+
+    auto same = [](const common_spec_adapt_choice & a, const common_spec_adapt_choice & b) {
+        return a.n_keep == b.n_keep && a.s == b.s && a.e_tau == b.e_tau && a.cost_ms == b.cost_ms;
+    };
+    auto prob = [&](double level) -> float {
+        const double r = u(rng);
+        if (r < 0.03) {
+            return 1.0f;
+        }
+        if (r < 0.05) {
+            return 0.0f;
+        }
+        if (r < 0.06) {
+            return 7.0f;  // clamped to 1 by the rule
+        }
+        if (r < 0.07) {
+            return -1.0f; // clamped to 0
+        }
+        return (float) std::min(1.0, std::max(0.0, level + 0.4 * (u(rng) - 0.5)));
+    };
+
+    int64_t n_drafts = 0;
+    int64_t n_ext    = 0;
+    int64_t n_next   = 0;
+    int64_t n_kept   = 0;
+    int64_t passes[3] = { 0, 0, 0 }; // as built, online 1, online 2
+    for (int it = 0; it < 20000; ++it) {
+        common_spec_adapt_params p;
+        if (it % 5 == 0) {
+            // FN82's est. v4 table, with its jump at the fifth column
+            p.cost_ms = { 87.597, 94.940, 105.432, 117.985, 139.227, 152.703, 166.181, 180.476 };
+        } else {
+            const double t1 = 50.0 + 150.0 * u(rng);
+            const double a  = 60.0 * u(rng);
+            const double b  = 8.0 * u(rng) * u(rng);
+            p.cost_ms.assign(1, t1);
+            const int n_tab = 2 + (int) (u(rng) * 12);
+            for (int k = 1; k < n_tab; ++k) {
+                p.cost_ms.push_back(p.cost_ms.back() + a + b * k);
+            }
+        }
+        p.draft_ms = 50.0 * u(rng);
+
+        const int mode = it % 3;
+        p.s_mode  = mode == 0 ? common_spec_adapt_params::S_STEP : mode == 1 ? common_spec_adapt_params::S_FIXED :
+                                                                                common_spec_adapt_params::S_RUN;
+        p.s_fixed = 0.3 + 3.0 * u(rng);
+        p.scale   = 0.25 + 1.75 * u(rng);
+        const double s_run = 0.3 + 3.0 * u(rng);
+
+        const int32_t n_max = 1 + (int32_t) (u(rng) * 12);
+        const double  w     = u(rng);
+        if (w < 0.3) {
+            p.widths.clear();
+            for (int32_t k = 1; k <= n_max + 1; ++k) {
+                p.widths.push_back(k);
+            }
+        } else if (w < 0.5) {
+            p.widths = { 1, 2, 4, 7, 12 };
+        } else if (w < 0.7) {
+            p.widths = { 1 };
+            for (int32_t k = 2; k <= 14; ++k) {
+                if (u(rng) < 0.3) {
+                    p.widths.push_back(k);
+                }
+            }
+        } // else the default 1, 3, 5, 9, 17
+        const auto lengths = common_spec_adapt_lengths(p, n_max);
+
+        std::vector<float> draft;
+        const double level = u(rng);
+        for (int32_t i = 0; i < n_max; ++i) {
+            draft.push_back(prob(level));
+        }
+
+        const auto full = common_spec_adapt_choose(p, lengths, draft, s_run);
+
+        // FN82's online arm: the first allowed length past what the rule keeps (its test failed), else the last
+        // allowed length; at least one pass
+        int32_t expect1 = lengths.back();
+        for (const int32_t len : lengths) {
+            if (len > full.n_keep) {
+                expect1 = len;
+                break;
+            }
+        }
+        expect1 = std::max<int32_t>(1, expect1);
+
+        int32_t stop1 = n_max;
+        for (int online = 1; online <= 2; ++online) {
+            p.online = online;
+            const common_spec_adapt_online a = { &p, &lengths, s_run };
+
+            std::vector<float> q;
+            int32_t stop = n_max;
+            for (int32_t j = 0; j < n_max; ++j) {
+                q.push_back(draft[j]);
+                if (!common_spec_adapt_continue(a, q)) {
+                    stop = j + 1;
+                    break;
+                }
+            }
+            const std::vector<float> pre(draft.begin(), draft.begin() + stop);
+            const auto ch = common_spec_adapt_choose(p, lengths, pre, s_run);
+            CHECK(same(ch, full));
+            if (online == 1) {
+                CHECK(stop == expect1);
+                if (stop != expect1) {
+                    fprintf(stderr, "  case %d: n_max %d keep %d: online 1 stopped at %d, expected %d\n", it, n_max,
+                            full.n_keep, stop, expect1);
+                }
+                stop1 = stop;
+            } else {
+                CHECK(stop <= stop1);
+            }
+            passes[online] += stop;
+
+            // a settled prefix: whatever follows it, the rule keeps the same
+            for (int e = 0; e < 4; ++e) {
+                std::vector<float> ext = pre;
+                const int32_t n_to = stop + (int32_t) (u(rng) * (n_max - stop + 1));
+                for (int32_t j = stop; j < n_to; ++j) {
+                    ext.push_back(e == 0 ? 1.0f : e == 1 ? 0.0f : prob(u(rng)));
+                }
+                CHECK(same(common_spec_adapt_choose(p, lengths, ext, s_run), ch));
+                n_ext++;
+            }
+        }
+        p.online = 0;
+        {
+            // switched off: continue always says yes
+            const common_spec_adapt_online a = { &p, &lengths, s_run };
+            CHECK(common_spec_adapt_continue(a, draft));
+        }
+
+        // keeps_next at every prefix
+        const common_spec_adapt_online a = { &p, &lengths, s_run };
+        for (int32_t j = 0; j < n_max; ++j) {
+            std::vector<float> q(draft.begin(), draft.begin() + j);
+            const bool k = common_spec_adapt_keeps_next(a, q);
+            std::vector<float> q0 = q;
+            q0.push_back(0.0f);
+            CHECK(k == (common_spec_adapt_choose(p, lengths, q0, s_run).n_keep == j + 1));
+            if (k) {
+                for (const float x : { 1.0f, draft[j], (float) u(rng), 7.0f, -1.0f }) {
+                    std::vector<float> q1 = q;
+                    q1.push_back(x);
+                    CHECK(common_spec_adapt_choose(p, lengths, q1, s_run).n_keep == j + 1);
+                }
+                n_kept++;
+            }
+            n_next++;
+        }
+
+        passes[0] += n_max;
+        n_drafts++;
+    }
+    printf("online: %lld drafts; drafting passes a draft %.4f as built, %.4f at online 1, %.4f at online 2; %lld "
+           "extensions of a settled prefix; %lld of %lld next tokens kept whatever their probability\n",
+           (long long) n_drafts, (double) passes[0] / n_drafts, (double) passes[1] / n_drafts,
+           (double) passes[2] / n_drafts, (long long) n_ext, (long long) n_kept, (long long) n_next);
+}
+
 static void test_state() {
     common_spec_adapt_params p; // 20 ms draft, T(1) 136
     common_spec_adapt_state st;
@@ -360,6 +533,19 @@ static void test_env() {
     CHECK(throws("LLAMA_SPEC_ADAPT_S", "fast"));
     CHECK(throws("LLAMA_SPEC_ADAPT_EMA", "0"));
     CHECK(throws("LLAMA_SPEC_ADAPT_SCALE", "1,2"));
+    CHECK(throws("LLAMA_SPEC_ADAPT_ONLINE", "3"));
+    CHECK(throws("LLAMA_SPEC_ADAPT_ONLINE", "1.5"));
+    CHECK(throws("LLAMA_SPEC_ADAPT_ONLINE", "on"));
+
+    // C815: LLAMA_SPEC_ADAPT_ONLINE
+    clear_env();
+    CHECK(common_spec_adapt_params_from_env().online == 0);
+    set_env("LLAMA_SPEC_ADAPT_ONLINE", "1");
+    CHECK(common_spec_adapt_params_from_env().online == 1);
+    set_env("LLAMA_SPEC_ADAPT_ONLINE", "2");
+    CHECK(common_spec_adapt_params_from_env().online == 2);
+    set_env("LLAMA_SPEC_ADAPT_ONLINE", "0");
+    CHECK(common_spec_adapt_params_from_env().online == 0);
     clear_env();
 }
 
@@ -368,6 +554,7 @@ int main() {
     test_lengths();
     test_hand();
     test_random();
+    test_online();
     test_state();
     test_env();
 
