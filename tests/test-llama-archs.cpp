@@ -3072,7 +3072,7 @@ struct mtp_hrow_run {
     std::vector<llama_token> drafts;
     std::vector<float>       probs;
     int                      n_pending = 0;
-    std::string              halves;    // the target's h_nextn halves after each call: prompt calls, then '|' a step
+    std::string              halves;    // the target's h_nextn halves after each call: prompt calls, then ';' a step
 };
 
 static mtp_hrow_run mtp_hrow_sequence(
@@ -3232,7 +3232,7 @@ static mtp_hrow_run mtp_hrow_sequence(
             throw std::runtime_error("the driver failed on a verify batch");
         }
         common_speculative_accept(spec.get(), 0, (uint16_t) std::min<int>(n_acc, (int) draft.size()));
-        note_halves("|");
+        note_halves(";");
         return argmax(batch.size() - 1);
     };
 
@@ -3309,11 +3309,11 @@ static int test_mtp_hrow_lazy(const std::string & arch_filter, const size_t seed
     };
     const arm_t arms[] = {
         // the reference: every catch-up at once; on the CPU (no events) the rows of one half stay on the host (C703)
-        { "off",      false, nullptr, 0, " 0|0|0 0,0,0|0|0 0|0" },
-        { "on",       true,  nullptr, 2, " 2|2|2 2,2,2|2|2 2|2" }, // C703: two halves from the start
-        { "lazy",     true,  "1",     2, " 1|1|1 2,2,2|2|2 2|2" }, // the second half at the long prompt's first call
-        { "noroom",   true,  "2",     0, " 1|1|1 1,1,1|1|1 1|1" }, // no second half: every catch-up at once
-        { "off+lazy", false, "1",     0, " 0|0|0 0,0,0|0|0 0|0" }, // the switch alone changes nothing
+        { "off",      false, nullptr, 0, " 0;0;0 0,0,0;0;0 0;0" },
+        { "on",       true,  nullptr, 2, " 2;2;2 2,2,2;2;2 2;2" }, // C703: two halves from the start
+        { "lazy",     true,  "1",     2, " 1;1;1 2,2,2;2;2 2;2" }, // the second half at the long prompt's first call
+        { "noroom",   true,  "2",     0, " 1;1;1 1,1,1;1;1 1;1" }, // no second half: every catch-up at once
+        { "off+lazy", false, "1",     0, " 0;0;0 0,0,0;0;0 0;0" }, // the switch alone changes nothing
     };
 
     size_t n_tests  = 0;
