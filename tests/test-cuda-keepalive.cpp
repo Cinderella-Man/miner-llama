@@ -721,9 +721,11 @@ static void test_held_stop() {
             CHECK(c.cancelled == 0);
         }
         // either way the block began after its evaluation and ended at its first poll, by the host, without running
+        // (the first block may have run or not: the stop before the evaluation can come before its first poll)
         wait_streams(&ev, 1);
         CHECK(ops.cards[0].ended && ops.cards[0].report.gen == gen1 && ops.cards[0].report.polls == 1);
-        CHECK(ops.cards[0].report.reason == GGML_CUDA_KEEPALIVE_STOPPED && ops.cards[0].ran == 1);
+        CHECK(ops.cards[0].report.reason == GGML_CUDA_KEEPALIVE_STOPPED);
+        CHECK(ops.cards[0].ran != 2);
         // the next evaluation's start is held again (the copy's size was new) and runs once that evaluation is done
         ev.queue_ms(20);
         ka.graph_end(0, &ev);
