@@ -835,6 +835,13 @@ static bool ggml_gallocr_trace(void) {
 // a tensor larger than its place in the plan: kind, index, its name (and its reader's, for a source), shape and sizes
 static void ggml_gallocr_trace_tensor(ggml_gallocr_t galloc, const char * kind, int i, const struct ggml_tensor * reader,
         const struct ggml_tensor * t, const struct tensor_alloc * talloc) {
+    if (talloc->buffer_id < 0) {
+        // the plan gave this place no memory (a view, or a tensor with memory of its own, when the plan was made)
+        GGML_LOG_WARN("galloc-trigger: %s %d '%s'%s%s%s (%s) ne = [%lld, %lld, %lld, %lld] needs %zu bytes, planned none\n",
+                kind, i, t->name, reader ? " of '" : "", reader ? reader->name : "", reader ? "'" : "", ggml_op_desc(t),
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], ggml_nbytes(t));
+        return;
+    }
     GGML_LOG_WARN("galloc-trigger: %s %d '%s'%s%s%s (%s) ne = [%lld, %lld, %lld, %lld] needs %zu bytes in %s, planned %zu\n",
             kind, i, t->name, reader ? " of '" : "", reader ? reader->name : "", reader ? "'" : "", ggml_op_desc(t),
             (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
