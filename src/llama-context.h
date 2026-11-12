@@ -178,6 +178,8 @@ struct llama_context {
     int64_t get_h_nextn_row0() const { return h_nextn_dev ? h_nextn_last*h_nextn_half_rows() : 0; }
     int64_t h_nextn_half_rows() const { return h_nextn_dev ? h_nextn_dev->ne[1]/h_nextn_halves : 0; }
     int32_t h_nextn_half_of(int64_t row) const { return h_nextn_halves > 1 && row >= h_nextn_half_rows() ? 1 : 0; }
+    // the halves the buffer holds now, 0 without a buffer (C813: one until the first hold with LLAMA_MTP_HROW_LAZY)
+    int32_t get_h_nextn_halves() const { return h_nextn_dev ? h_nextn_halves : 0; }
 
     // state rows read from the h_nextn device buffer of src, see llama_set_embd_state_src()
     bool set_state_src(llama_context * src);
@@ -403,6 +405,9 @@ private:
 
     // (re)allocate the device buffer for cparams.embeddings_nextn_dev, false if it does not fit
     bool h_nextn_dev_alloc();
+
+    // C813: make the second half of a one-half buffer, the rows of the first copied over; false if it does not fit
+    bool h_nextn_grow();
 
     ggml_backend_t backend_from_dev(ggml_backend_dev_t dev) const;
 
@@ -858,6 +863,13 @@ private:
     ggml_backend_event_ptr  ev_h_nextn_read[2];
     bool ev_h_nextn_written_recorded[2] = { false, false };
     bool ev_h_nextn_read_recorded[2]    = { false, false };
+    // LLAMA_MTP_HROW_LAZY (C813): with two halves asked for, the buffer keeps one half until the first hold, which makes the
+    // second (1), the held rows copied over, so the second half's memory is used only once a call's rows are held while
+    // the next call runs; 2 never makes it (a check of the no-room path). Without room the hold is refused for good and
+    // the reader reads the rows before the next decode, as with one half
+    int32_t                 h_nextn_lazy        = 0;
+    int32_t                 h_nextn_halves_want = 1;     // the halves set_h_nextn_halves() asked for
+    bool                    h_nextn_no_room     = false;
     // LLAMA_MTP_H_DEV (C693): 1 (default) the buffer above where the output device has events (upstream #31927), 0 the
     // rows extracted to host memory (the path before #31927), 2 as 1 and also on the CPU without events (checks)
     int32_t                 h_nextn_dev_mode  = 1;

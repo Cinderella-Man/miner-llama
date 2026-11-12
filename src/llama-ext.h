@@ -339,6 +339,11 @@ LLAMA_API bool    llama_set_embeddings_nextn_dev_halves(struct llama_context * c
 LLAMA_API bool    llama_hold_embeddings_nextn          (struct llama_context * ctx);
 // the first row of the half the last decode wrote (0 with one half)
 LLAMA_API int64_t llama_get_embeddings_nextn_row0      (const struct llama_context * ctx);
+// C813: the halves the h_nextn device buffer holds now, 0 without the buffer. With LLAMA_MTP_HROW_LAZY=1 (read when the
+// context is made) n = 2 above keeps one half until the first llama_hold_embeddings_nextn(), which makes the second (the
+// rows of the first copied over) and returns false if the device has no room for it: then the buffer keeps one half and
+// every later hold returns false. LLAMA_MTP_HROW_LAZY=2 never makes the second half (a check of that path).
+LLAMA_API int32_t llama_get_embeddings_nextn_dev_halves(const struct llama_context * ctx);
 
 // Copy rows of the h_nextn device buffer to or from host memory, ordered after the last decode and its readers
 LLAMA_API bool llama_get_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, float * out);

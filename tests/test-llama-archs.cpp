@@ -186,6 +186,8 @@ static void usage(char ** argv) {
     LOG("  --ngram-prefetch         Check that LLAMA_NGRAM_PREFETCH changes only when the n-gram rows are read (CPU only)\n");
     LOG("  --mtp-kv-only            Check that LLAMA_MTP_KV_ONLY leaves the MTP draft's caches and drafts as they are (CPU only)\n");
     LOG("  --mtp-catchup-overlap    Check that LLAMA_MTP_CATCHUP_OVERLAP leaves the MTP draft's caches and drafts as they are (CPU only)\n");
+    LOG("  --mtp-hrow-lazy          Check that LLAMA_MTP_HROW_LAZY makes the h_nextn buffer's second half only at the first held call\n");
+    LOG("                           and leaves the MTP draft's caches and drafts as they are, with and without room (CPU only)\n");
     LOG("  --kv-seq-rm              Check that LLAMA_KV_SEQ_RM_BOUND leaves every memory as it is over random sequence edits (CPU only)\n");
     LOG("  --kv-seq-rm-time         Time one seq_rm call without and with LLAMA_KV_SEQ_RM_BOUND at 65,536 cells (CPU only)\n");
     LOG("  --mtp-graph-keep         Check that LLAMA_MTP_GRAPH_KEEP leaves the MTP draft's caches and drafts as they are and builds fewer graphs (CPU only)\n");
@@ -3056,6 +3058,370 @@ static int test_mtp_catchup_overlap(const std::string & arch_filter, const size_
     return n_failed == 0 ? 0 : 1;
 }
 
+// LLAMA_MTP_HROW_LAZY (C813): the h_nextn buffer's second half only once a call's rows are held. Three turns in the
+// server's order, the first and the last a prompt shorter than the target's n_batch (one call, with its output), the
+// second one longer (calls of 32, 32 and 9, the first with the last turn's sampled token, a checkpoint's draft part after
+// the first call); draft steps after each prompt as in mtp_overlap_sequence. lazy is the value of LLAMA_MTP_HROW_LAZY
+struct mtp_hrow_run {
+    std::vector<uint8_t>     state_ckpt;   // as mtp_overlap_run
+    std::vector<uint8_t>     spec_ckpt;
+    std::vector<uint8_t>     state_prompt; // after the long prompt
+    std::vector<uint8_t>     spec_prompt;
+    std::vector<uint8_t>     state_end;
+    std::vector<uint8_t>     spec_end;
+    std::vector<llama_token> drafts;
+    std::vector<float>       probs;
+    int                      n_pending = 0;
+    std::string              halves;    // the target's h_nextn halves after each call: prompt calls, then ';' a step
+};
+
+static mtp_hrow_run mtp_hrow_sequence(
+        llama_model * model, const std::vector<llama_token> & tokens, const mtp_overlap_config & cfg, const bool overlap,
+        const char * lazy) {
+    test_setenv("LLAMA_MTP_KV_ONLY", cfg.kv_only ? "1" : nullptr);
+    test_setenv("LLAMA_MTP_CATCHUP_OVERLAP", overlap ? "1" : nullptr);
+    test_setenv("LLAMA_MTP_HROW_LAZY", lazy);
+
+    auto ctx_params_for = [&](const bool mtp) {
+        llama_context_params p = llama_context_default_params();
+        p.ctx_type        = mtp ? LLAMA_CONTEXT_TYPE_MTP : LLAMA_CONTEXT_TYPE_DEFAULT;
+        p.n_ctx           = 0;
+        p.n_batch         = 32;
+        p.n_ubatch        = mtp ? 18 : 8;
+        p.n_threads       = 4;
+        p.n_threads_batch = 4;
+        p.type_k          = cfg.type_kv;
+        p.type_v          = cfg.type_kv;
+        p.flash_attn_type = cfg.fa ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        p.n_outputs_max_per_seq = 4;
+        return p;
+    };
+
+    llama_context_ptr lctx_tgt(llama_init_from_model(model, ctx_params_for(false)));
+    llama_context_ptr lctx_dft(llama_init_from_model(model, ctx_params_for(true)));
+    test_setenv("LLAMA_MTP_KV_ONLY", nullptr);
+    test_setenv("LLAMA_MTP_HROW_LAZY", nullptr);
+    if (!lctx_tgt || !lctx_dft) {
+        test_setenv("LLAMA_MTP_CATCHUP_OVERLAP", nullptr);
+        throw std::runtime_error("failed to create the target or the MTP context");
+    }
+    llama_context * ctx_tgt = lctx_tgt.get();
+    llama_context * ctx_dft = lctx_dft.get();
+
+    common_params_speculative sp;
+    sp.types                  = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    sp.draft.ctx_tgt          = ctx_tgt;
+    sp.draft.ctx_dft          = ctx_dft;
+    sp.draft.n_max            = 3;
+    sp.draft.n_min            = 0;
+    sp.draft.p_min            = 0.0f;
+    sp.draft.backend_sampling = cfg.backend_sampling;
+    common_speculative_ptr spec(common_speculative_init(sp, 1));
+    test_setenv("LLAMA_MTP_CATCHUP_OVERLAP", nullptr);
+    if (!spec) {
+        throw std::runtime_error("failed to create the draft-mtp driver");
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    mtp_hrow_run run;
+
+    auto state_dft = [&]() {
+        std::vector<uint8_t> s(llama_state_seq_get_size(ctx_dft, 0));
+        llama_state_seq_get_data(ctx_dft, s.data(), s.size(), 0);
+        return s;
+    };
+
+    auto argmax = [&](int32_t i) {
+        const float * logits = llama_get_logits_ith(ctx_tgt, i);
+        GGML_ASSERT(logits != nullptr);
+        return (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
+    };
+
+    auto note_halves = [&](const char * sep) {
+        run.halves += sep;
+        run.halves += std::to_string(llama_get_embeddings_nextn_dev_halves(ctx_tgt));
+    };
+
+    llama_tokens context;
+    llama_pos    pos = 0;
+
+    // a prompt's calls as in mtp_overlap_sequence; first (if not LLAMA_TOKEN_NULL) is the call's first token, the last
+    // turn's sampled one
+    auto prompt = [&](int i0, llama_token first, const std::vector<int> & calls, int ckpt_after) {
+        int i = i0;
+        for (size_t c = 0; c < calls.size(); ++c) {
+            const bool last = c + 1 == calls.size();
+
+            common_memory mem_tgt;
+            mem_tgt.init(ctx_tgt);
+            mem_tgt.seq_rm(0, pos, -1);
+            const llama_pos p0 = pos;
+            common_speculative_after_catchup(spec.get(), [&, p0]() {
+                common_memory mem_dft;
+                mem_dft.init(ctx_dft);
+                mem_dft.seq_rm(0, p0, -1);
+            });
+
+            common_batch batch(ctx_tgt);
+            for (int k = 0; k < calls[c]; ++k) {
+                llama_token t;
+                if (c == 0 && k == 0 && first != LLAMA_TOKEN_NULL) {
+                    t = first;
+                } else {
+                    t = tokens[i++];
+                }
+                batch.add(t, pos++, 0, last && k + 1 == calls[c]);
+                context.push_back(t);
+            }
+            if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                throw std::runtime_error("failed to decode a prompt call");
+            }
+            if (!common_speculative_process(spec.get(), batch)) {
+                throw std::runtime_error("the driver failed on a prompt call");
+            }
+            run.n_pending += common_speculative_pending(spec.get()) ? 1 : 0;
+            note_halves(c == 0 ? " " : ",");
+
+            if ((int) c == ckpt_after) {
+                common_speculative_after_catchup(spec.get(), [&]() {
+                    run.state_ckpt = state_dft();
+                    common_speculative_get_state(spec.get(), 0, run.spec_ckpt);
+                });
+            }
+        }
+        return i;
+    };
+
+    auto step = [&](llama_token id_last, int n_acc) {
+        llama_tokens draft;
+        std::vector<float> probs;
+        common_speculative_get_draft_params(spec.get(), 0) = {
+            /* .drafting = */ true,
+            /* .n_max    = */ 3,
+            /* .pos0     = */ pos,
+            /* .id_last  = */ id_last,
+            /* .prompt   = */ &context,
+            /* .result   = */ &draft,
+            /* .result_q = */ nullptr,
+            /* .temp     = */ 1.0f,
+            /* .seed     = */ LLAMA_DEFAULT_SEED,
+            /* .info     = */ nullptr,
+            /* .result_p = */ &probs,
+        };
+        common_speculative_draft(spec.get());
+        run.drafts.push_back((llama_token) draft.size());
+        run.drafts.insert(run.drafts.end(), draft.begin(), draft.end());
+        run.probs.insert(run.probs.end(), probs.begin(), probs.end());
+
+        if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, pos, -1)) {
+            throw std::runtime_error("failed to remove the draft region");
+        }
+
+        common_batch batch(ctx_tgt);
+        batch.add(id_last, pos++, 0, true);
+        context.push_back(id_last);
+        for (const llama_token t : draft) {
+            batch.add(t, pos++, 0, true);
+            context.push_back(t);
+        }
+        if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("failed to decode a verify batch");
+        }
+        if (!common_speculative_process(spec.get(), batch)) {
+            throw std::runtime_error("the driver failed on a verify batch");
+        }
+        common_speculative_accept(spec.get(), 0, (uint16_t) std::min<int>(n_acc, (int) draft.size()));
+        note_halves(";");
+        return argmax(batch.size() - 1);
+    };
+
+    // the first turn: 20 tokens, one call
+    int i = prompt(0, LLAMA_TOKEN_NULL, { 20 }, -1);
+    common_speculative_begin(spec.get(), 0, context);
+    llama_token id = argmax(-1);
+    id = step(id, 0);
+    id = step(id, 2);
+
+    // the second turn: the sampled token and 72 prompt tokens, in calls of 32, 32 and 9
+    i = prompt(i, id, { 32, 32, 9 }, 0);
+    common_speculative_flush(spec.get());
+    run.state_prompt = state_dft();
+    common_speculative_get_state(spec.get(), 0, run.spec_prompt);
+    common_speculative_begin(spec.get(), 0, context);
+    id = argmax(-1);
+    id = step(id, 1);
+    id = step(id, 3);
+
+    // the third turn: the sampled token and 11 prompt tokens, one call
+    prompt(i, id, { 12 }, -1);
+    common_speculative_begin(spec.get(), 0, context);
+    step(argmax(-1), 2);
+
+    common_speculative_flush(spec.get());
+    run.state_end = state_dft();
+    common_speculative_get_state(spec.get(), 0, run.spec_end);
+
+    spec.reset();
+    return run;
+}
+
+// --mtp-hrow-lazy (C813): every arm against LLAMA_MTP_CATCHUP_OVERLAP off; the halves after each call as expected
+static int test_mtp_hrow_lazy(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    const mtp_overlap_config configs[] = {
+        { "f16 fa",         GGML_TYPE_F16,  true,  false, true  },
+        { "f16",            GGML_TYPE_F16,  false, false, true  },
+        { "q8_0 fa",        GGML_TYPE_Q8_0, true,  false, true  },
+        { "f16 fa kv-only", GGML_TYPE_F16,  true,  true,  true  },
+        { "f16 fa host",    GGML_TYPE_F16,  true,  false, false },
+    };
+
+    // the halves after each call: the first prompt, two steps, the second prompt's three calls, two steps, the third
+    // prompt, one step
+    struct arm_t {
+        const char * name;
+        bool         overlap;
+        const char * lazy;
+        int          n_pending;
+        const char * halves;
+    };
+    const arm_t arms[] = {
+        // the reference: every catch-up at once; on the CPU (no events) the rows of one half stay on the host (C703)
+        { "off",      false, nullptr, 0, " 0;0;0 0,0,0;0;0 0;0" },
+        { "on",       true,  nullptr, 2, " 2;2;2 2,2,2;2;2 2;2" }, // C703: two halves from the start
+        { "lazy",     true,  "1",     2, " 1;1;1 2,2,2;2;2 2;2" }, // the second half at the long prompt's first call
+        { "noroom",   true,  "2",     0, " 1;1;1 1,1,1;1;1 1;1" }, // no second half: every catch-up at once
+        { "off+lazy", false, "1",     0, " 0;0;0 0,0,0;0;0 0;0" }, // the switch alone changes nothing
+    };
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    common_log_flush(common_log_main());
+    LOG("|%10s|%15s|%9s|%10s|%10s|%10s|%10s|%10s|%8s|%22s|%s\n", "Model arch.", "Config", "Arm", "Checkpoint", "Prompt",
+            "Drafts", "End", "Ckpt spec", "Waited", "Halves", "Status");
+
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !mtp_kv_only_arch(arch)) {
+            continue;
+        }
+        const bool moe = moe_mandatory(arch) || moe_implemented(arch);
+
+        gguf_context_ptr gguf_ctx = get_gguf_ctx_mtp(arch, moe);
+
+        llama_model_ptr model;
+        try {
+            model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, nullptr, /*load_mtp*/ true);
+        } catch (const std::exception & err) {
+            LOG("|%10s|%15s|%9s|%10s|%10s|%10s|%10s|%10s|%8s|%22s|\033[1;31mERROR\033[0m (model load: %s)\n",
+                    llama_arch_name(arch), "", "", "", "", "", "", "", "", "", err.what());
+            n_tests++;
+            n_failed++;
+            continue;
+        }
+
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const std::vector<llama_token> tokens = get_tokens(160, n_vocab, seed);
+
+        for (const mtp_overlap_config & cfg : configs) {
+            struct log_pause {
+                log_pause()  { common_log_pause(common_log_main()); }
+                ~log_pause() { common_log_resume(common_log_main()); }
+            };
+
+            std::vector<mtp_hrow_run> runs;
+            std::string error;
+            try {
+                log_pause pause;
+                for (const arm_t & arm : arms) {
+                    runs.push_back(mtp_hrow_sequence(model.get(), tokens, cfg, arm.overlap, arm.lazy));
+                }
+            } catch (const std::exception & err) {
+                error = err.what();
+            }
+
+            for (size_t a = 0; a < sizeof(arms)/sizeof(arms[0]); ++a) {
+                const arm_t & arm = arms[a];
+                n_tests++;
+                LOG("|%10s|%15s|%9s|", llama_arch_name(arch), cfg.name, arm.name);
+                if (a >= runs.size()) {
+                    n_failed++;
+                    LOG("%10s|%10s|%10s|%10s|%10s|%8s|%22s|\033[1;31mERROR\033[0m (%s)\n", "", "", "", "", "", "", "",
+                            error.c_str());
+                    continue;
+                }
+                const mtp_hrow_run & ref = runs[0];
+                const mtp_hrow_run & r   = runs[a];
+
+                auto same = [](const std::vector<uint8_t> & x, const std::vector<uint8_t> & y) {
+                    return !x.empty() && x == y;
+                };
+                const bool same_ckpt   = same(ref.state_ckpt, r.state_ckpt);
+                const bool same_prompt = same(ref.state_prompt, r.state_prompt) && same(ref.spec_prompt, r.spec_prompt);
+                const bool same_drafts = !ref.drafts.empty() && ref.drafts == r.drafts && ref.probs.size() == r.probs.size() &&
+                    memcmp(ref.probs.data(), r.probs.data(), ref.probs.size()*sizeof(float)) == 0;
+                const bool same_end    = same(ref.state_end, r.state_end) && same(ref.spec_end, r.spec_end);
+                const bool same_cspec  = same(ref.spec_ckpt, r.spec_ckpt);
+                const bool waited_ok   = r.n_pending == arm.n_pending;
+                const std::string halves_want = arm.halves;
+                const bool halves_ok   = r.halves == halves_want;
+
+                char waited_str[32];
+                snprintf(waited_str, sizeof(waited_str), "%d", r.n_pending);
+                LOG("%10s|%10s|%10s|%10s|%10s|%8s|%22s|", same_ckpt ? "identical" : "DIFFERENT", same_prompt ? "identical" : "DIFFERENT",
+                        same_drafts ? "identical" : "DIFFERENT", same_end ? "identical" : "DIFFERENT",
+                        same_cspec ? "identical" : "DIFFERENT", waited_str, r.halves.c_str());
+
+                if (same_ckpt && same_prompt && same_drafts && same_end && same_cspec && waited_ok && halves_ok) {
+                    LOG("\033[1;32mOK\033[0m\n");
+                } else {
+                    n_failed++;
+                    std::string why;
+                    if (!waited_ok) {
+                        why += " (waited: want " + std::to_string(arm.n_pending) + ")";
+                    }
+                    if (!halves_ok) {
+                        why += " (halves: want" + halves_want + ")";
+                    }
+                    LOG("\033[1;31mFAIL\033[0m%s\n", why.c_str());
+                }
+            }
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 // C735: how a prompt's checkpoints are taken, in llama-server's order
 enum mtp_incall_mode {
     MTP_INCALL_CUT,    // separate calls end at each checkpoint, taken between calls (the reference)
@@ -5274,6 +5640,7 @@ int main(int argc, char ** argv) {
     bool kv_shift = false;
     bool mtp_kv_only = false;
     bool mtp_catchup_overlap = false;
+    bool mtp_hrow_lazy = false;
     bool kv_seq_rm = false;
     bool kv_seq_rm_time = false;
     bool ngram_prefetch = false;
@@ -5367,6 +5734,8 @@ int main(int argc, char ** argv) {
             verify_prepare = true;
         } else if (strcmp(argv[i], "--mtp-catchup-overlap") == 0) {
             mtp_catchup_overlap = true;
+        } else if (strcmp(argv[i], "--mtp-hrow-lazy") == 0) {
+            mtp_hrow_lazy = true;
         } else if (strcmp(argv[i], "--mtp-h-dev") == 0) {
             mtp_h_dev = true;
         } else if (strcmp(argv[i], "--mtp-incall-overlap") == 0) {
@@ -5404,6 +5773,9 @@ int main(int argc, char ** argv) {
         }
         if (mtp_catchup_overlap) {
             return test_mtp_catchup_overlap(arch_filter, seed, stdev, verbosity);
+        }
+        if (mtp_hrow_lazy) {
+            return test_mtp_hrow_lazy(arch_filter, seed, stdev, verbosity);
         }
         if (mtp_incall_overlap) {
             return test_mtp_incall_overlap(arch_filter, seed, stdev, verbosity);

@@ -514,6 +514,11 @@ llama_context::llama_context(
         h_nextn_dev_mode = atoi(LLAMA_MTP_H_DEV);
     }
 
+    // LLAMA_MTP_HROW_LAZY (C813): the h_nextn buffer's second half at the first hold, see h_nextn_lazy
+    if (const char * LLAMA_MTP_HROW_LAZY = getenv("LLAMA_MTP_HROW_LAZY")) {
+        h_nextn_lazy = std::max(0, atoi(LLAMA_MTP_HROW_LAZY));
+    }
+
     // C761: LLAMA_NGRAM_PREFETCH=1 prefetches the n-gram rows of a call's later micro-batches from a helper thread, at most
     // LLAMA_NGRAM_PREFETCH_MB (default 48) MiB ahead of set_input; with LLAMA_UBATCH_TRACE or LLAMA_NGRAM_PREFETCH_STATS=1
     // every call's rows are counted, the switch off too. Only qwen4exp's n-gram input of a mapped (lazy) table reads it;
@@ -2136,15 +2141,112 @@ bool llama_context::h_nextn_dev_alloc() {
         }
         // C703: the CPU computes a decode before it returns, so two halves there need no events (the CPU check);
         // C693: LLAMA_MTP_H_DEV=2 takes one half there too (the host rows' check)
+        // C813: and so does one half that may grow to two
         const bool cpu = ggml_backend_dev_type(h_nextn_dev_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        if ((!ev_h_nextn_written[h] || !ev_h_nextn_read[h]) && !((h_nextn_halves > 1 || h_nextn_dev_mode == 2) && cpu)) {
+        if ((!ev_h_nextn_written[h] || !ev_h_nextn_read[h]) &&
+                !((h_nextn_halves > 1 || h_nextn_halves_want > 1 || h_nextn_dev_mode == 2) && cpu)) {
             return fail("the device has no events");
         }
     }
 
     LLAMA_LOG_INFO("%s: %10s h_nextn buffer size = %8.2f MiB%s\n", __func__,
             ggml_backend_buffer_name(buf_h_nextn_dev.get()), ggml_backend_buffer_get_size(buf_h_nextn_dev.get())/1024.0/1024.0,
-            h_nextn_halves > 1 ? " (two halves)" : "");
+            h_nextn_halves > 1 ? " (two halves)" :
+            h_nextn_halves_want > 1 ? " (one half, the second at the first held call: LLAMA_MTP_HROW_LAZY)" : "");
+
+    return true;
+}
+
+bool llama_context::h_nextn_grow() {
+    const char * func = __func__;
+    auto no_room = [&](const char * why) {
+        LLAMA_LOG_WARN("%s: LLAMA_MTP_HROW_LAZY: %s: the h_nextn buffer keeps one half, a call's rows are read before the "
+                "next call\n", func, why);
+        h_nextn_no_room = true;
+        return false;
+    };
+
+    if (h_nextn_no_room) {
+        return false;
+    }
+    if (h_nextn_dev == nullptr || h_nextn_halves != 1 || h_nextn_halves_want != 2) {
+        return false;
+    }
+    // a prepared decode's graph writes the buffer it was built with: this call's rows are read at once instead
+    if (vprep.active) {
+        return false;
+    }
+    if (h_nextn_lazy == 2) {
+        return no_room("the second half is never made (LLAMA_MTP_HROW_LAZY=2)");
+    }
+
+    // the last decode's rows are written and every reader is done with the buffer
+    if (ev_h_nextn_written_recorded[0]) {
+        ggml_backend_event_synchronize(ev_h_nextn_written[0].get());
+    }
+    if (ev_h_nextn_read_recorded[0]) {
+        ggml_backend_event_synchronize(ev_h_nextn_read[0].get());
+        ev_h_nextn_read_recorded[0] = false;
+    }
+
+    const int64_t n_embd    = h_nextn_dev->ne[0];
+    const int64_t half_rows = h_nextn_dev->ne[1];
+
+    // the new tensor is made while the old one lives, so that its address differs from the one the graphs were built
+    // with (a reused graph keeps its views of the old buffer)
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_new(ggml_init(params));
+    ggml_tensor * t_new = ggml_new_tensor_2d(ctx_new.get(), GGML_TYPE_F32, n_embd, 2*half_rows);
+    ggml_set_name(t_new, "h_nextn_dev");
+
+    ggml_backend_buffer_ptr buf_new(ggml_backend_alloc_ctx_tensors_from_buft(ctx_new.get(), ggml_backend_dev_buffer_type(h_nextn_dev_dev)));
+    if (!buf_new) {
+        return no_room("no room for the second half");
+    }
+
+    if (!ev_h_nextn_written[1]) {
+        ev_h_nextn_written[1].reset(ggml_backend_event_new(h_nextn_dev_dev));
+        ev_h_nextn_read[1].reset(ggml_backend_event_new(h_nextn_dev_dev));
+    }
+    const bool cpu = ggml_backend_dev_type(h_nextn_dev_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    if ((!ev_h_nextn_written[1] || !ev_h_nextn_read[1]) && !cpu) {
+        return no_room("the device has no events for the second half");
+    }
+    ev_h_nextn_written_recorded[1] = false;
+    ev_h_nextn_read_recorded[1]    = false;
+
+    // the first half's rows (the held call's, and the caller's rows past n_batch) into the new first half
+    {
+        ggml_init_params vparams = {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_view(ggml_init(vparams));
+        ggml_tensor * half0 = ggml_view_2d(ctx_view.get(), t_new, n_embd, half_rows, t_new->nb[1], 0);
+        if (ggml_backend_view_init(half0) != GGML_STATUS_SUCCESS) {
+            return no_room("the first half's view failed");
+        }
+        ggml_backend_tensor_copy(h_nextn_dev, half0);
+    }
+
+    const double mib = ggml_backend_buffer_get_size(buf_new.get())/1024.0/1024.0;
+
+    // the old buffer goes (freeing a device buffer waits for the device)
+    buf_h_nextn_dev = std::move(buf_new);
+    ctx_h_nextn_dev = std::move(ctx_new);
+    h_nextn_dev     = t_new;
+    h_nextn_halves  = 2;
+
+    // this context's graphs are built again with the new buffer; a reader's compare the tensor (llm_graph_params)
+    gf_res_invalidate();
+
+    LLAMA_LOG_INFO("%s: %10s h_nextn buffer size = %8.2f MiB (two halves, made at the first held call: LLAMA_MTP_HROW_LAZY)\n",
+            func, ggml_backend_buffer_name(buf_h_nextn_dev.get()), mib);
 
     return true;
 }
@@ -2176,6 +2278,12 @@ bool llama_context::set_h_nextn_halves(int32_t n) {
     if (n < 1 || n > 2) {
         return false;
     }
+    h_nextn_halves_want = n;
+    // C813: two halves asked for keep the buffer's halves; the first hold makes the second (h_nextn_grow())
+    if (h_nextn_lazy > 0 && n == 2) {
+        h_nextn_no_room = false;
+        return true;
+    }
     if (h_nextn_halves != n) {
         h_nextn_halves = n;
         // the next graphs see the new buffer
@@ -2188,8 +2296,14 @@ bool llama_context::set_h_nextn_halves(int32_t n) {
 }
 
 bool llama_context::hold_h_nextn() {
-    if (h_nextn_dev == nullptr || h_nextn_halves < 2) {
+    if (h_nextn_dev == nullptr) {
         return false;
+    }
+    if (h_nextn_halves < 2) {
+        // C813: the second half on the first hold, if the device has room for it
+        if (h_nextn_lazy == 0 || !h_nextn_grow()) {
+            return false;
+        }
     }
     h_nextn_held = true;
     return true;
@@ -8277,6 +8391,10 @@ bool llama_hold_embeddings_nextn(llama_context * ctx) {
 
 int64_t llama_get_embeddings_nextn_row0(const llama_context * ctx) {
     return ctx->get_h_nextn_row0();
+}
+
+int32_t llama_get_embeddings_nextn_dev_halves(const llama_context * ctx) {
+    return ctx->get_h_nextn_halves();
 }
 
 bool llama_get_embeddings_nextn_rows(llama_context * ctx, int64_t row0, int64_t n_rows, float * out) {
