@@ -1272,7 +1272,8 @@ static bool backend_lacks_skipped_ids(ggml_backend_t backend, ggml_cgraph * gf) 
 //                 the live check runs as well and its verdict goes into the record
 //   --replay DIR  (or GGML_TEST_REPLAY=DIR) the tensors restored from the record instead of drawn, the tested backend
 //                 alone computes, and its results go through the live check's comparison against the stored ones: the
-//                 same thresholds, the same output lines, the same summary
+//                 same thresholds, the same output lines, the same summary; a case the filter selects that the record
+//                 does not hold is named with the verdict NOREC (C806)
 // A replayed case uses the record's draw of the inputs; the reference is the one the recording build's CPU code gives,
 // which is the rig's own when the record is made with the rig build (no AVX: the same CPU code on any x86-64 host).
 struct rr_options {
@@ -1286,7 +1287,8 @@ struct rr_options {
     size_t      cpu_check     = 0;     // --cpu-check N, GGML_TEST_REPLAY_CPU_CHECK: about one replayed case in N (inputs
                                        // under 32 MB) also runs the live check against this host's CPU first
     bool        allow_missing = false; // --replay-allow-missing, GGML_TEST_REPLAY_ALLOW_MISSING=1: cases the filter
-                                       // selects but the record lacks are left out without failing the run
+                                       // selects but the record lacks are left out without failing the run (either
+                                       // way each one is named, verdict NOREC)
 };
 
 static rr_options          g_rr;
@@ -1878,10 +1880,16 @@ struct test_case {
         if (replaying) {
             const std::string mp = rr_case_path(g_rr.replay, case_id, ".meta");
             if (!tbo_file_exists(mp)) {
+                // a case the filter selects that the record does not hold (C806): named with its own verdict, NOREC,
+                // in the output and in the replay log, so that a set replayed on a later build of its line tells the
+                // cases added since apart from failing ones; without --replay-allow-missing the summary still fails
+                // the run
                 g_rr_missing++;
-                if (!g_rr.allow_missing) {
-                    std::lock_guard<std::mutex> guard(g_test_output_mutex);
-                    printf("  %s: not recorded [%s]\n", case_name.c_str(), mp.c_str());
+                std::lock_guard<std::mutex> guard(g_test_output_mutex);
+                printf("  %s: NOREC (not recorded) [%s]\n", case_name.c_str(), mp.c_str());
+                if (g_rr_log_file) {
+                    fprintf(g_rr_log_file, "%s\t%s\tNOREC\t\n", case_id.c_str(), case_name.c_str());
+                    fflush(g_rr_log_file);
                 }
                 return test_status_t::SKIPPED;
             }
@@ -17396,9 +17404,10 @@ static void usage(char ** argv) {
     printf("  --cpu-check <n>             with --replay (also GGML_TEST_REPLAY_CPU_CHECK): about one case in <n> with inputs\n");
     printf("                              under 32 MB also runs the live check on this host's CPU, its reference compared\n");
     printf("  --replay-allow-missing      with --replay (also GGML_TEST_REPLAY_ALLOW_MISSING=1): cases without a record\n");
-    printf("                              are left out instead of failing the run\n");
-    printf("  --replay-log <file>         with --replay (also GGML_TEST_REPLAY_LOG): a line per case: index, case, verdict,\n");
-    printf("                              each compared node's error\n\n");
+    printf("                              are left out instead of failing the run (each one is named, verdict NOREC)\n");
+    printf("  --replay-log <file>         with --replay (also GGML_TEST_REPLAY_LOG): a line per case: index, case, verdict\n");
+    printf("                              (OK, FAIL, or NOREC for a case the record does not hold), each compared node's\n");
+    printf("                              error\n\n");
     printf("Examples:\n");
     printf("  %s -j 8\n", argv[0]);
     printf("  %s -o ADD,MUL_MAT\n", argv[0]);
