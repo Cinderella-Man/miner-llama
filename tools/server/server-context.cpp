@@ -448,7 +448,7 @@ struct server_spec_adapt {
             if (a.f == nullptr) {
                 throw std::runtime_error(string_format("cannot open '%s' for appending", a.params.log.c_str()));
             }
-            const json hdr = {
+            json hdr = {
                 {"hdr",      1},
                 {"run",      a.run},
                 {"enabled",  a.params.enabled},
