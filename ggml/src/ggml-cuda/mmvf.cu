@@ -821,15 +821,25 @@ void ggml_cuda_op_mul_mat_vec_f(
 // weight once. 1: on compute 6.1, 2: on any NVIDIA GPU (tests); for a 2-D matrix outside the graph's compute buffers
 // (weights), times 4 to 8 contiguous columns, that mul_mat_vec_f takes at one token.
 // GGML_CUDA_MMVF_F32_MT_FAULT=1 (checks only): those products add the first half of each row only.
+// GGML_CUDA_MMVF_F32_MT_ROWS (C807, Q1413; default 32): the switch takes a matrix of at most that many rows; 0: any
+// number (C754's rule, for timing). mul_mat_vec_f runs a block per row, and each block reads every token's activations
+// again, so a matrix of many rows reads them once per row where cuBLAS reads them once per tile: on a P106-090 the
+// router (2560 -> 512) took 4.07 ms a four-token verify pass on mul_mat_vec_f against 2.41 on cuBLAS, while the shared
+// expert's gate (2560 -> 1) took 0.29 against 0.61 (R120b). 32 rows of a 2560-wide row are at most two rounds of
+// blocks on the P106-090's 5 SMs at 4-8 tokens (four or five 256-thread blocks an SM).
 static int mmvf_env_int(const char * name, const int def) {
     const char * env = getenv(name);
     return env ? atoi(env) : def;
 }
 
 bool ggml_cuda_mul_mat_vec_f_f32_mt(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    static const int mode  = mmvf_env_int("GGML_CUDA_MMVF_F32_MT", 0);
-    static const int fault = mmvf_env_int("GGML_CUDA_MMVF_F32_MT_FAULT", 0);
+    static const int mode     = mmvf_env_int("GGML_CUDA_MMVF_F32_MT", 0);
+    static const int fault    = mmvf_env_int("GGML_CUDA_MMVF_F32_MT_FAULT", 0);
+    static const int max_rows = mmvf_env_int("GGML_CUDA_MMVF_F32_MT_ROWS", 32);
     if (mode == 0) {
+        return false;
+    }
+    if (max_rows > 0 && src0->ne[1] > max_rows) {
         return false;
     }
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
