@@ -267,6 +267,10 @@ public:
     // update in its F32 input, and each device casts them back; only with the tables on the devices
     bool     kpool_stage_on() const;
     uint32_t get_n_kpool_upd() const; // rows of this ubatch's update, padded to a stable bound
+    // LLAMA_SCHED_PER_SIZE_RESERVE (C803): a whole-cache context (init_full) sized for the plan of one ubatch's shape: the
+    // cache's every cell and pool, as the reserve, but the new-pool list and the tables' update at the stable bounds a
+    // ubatch of this size is padded to, which do not grow with the cache, in place of a re-pool of every pool
+    void     kpool_plan_for(const llama_ubatch & ubatch);
     // the copy on il's device (I32 [1, n_rows] and I32 [kpool, n_rows]) and its number, -1 if il has none
     int32_t  kpool_dev_table(int32_t il, ggml_tensor ** cells, ggml_tensor ** idxs) const;
     // upd (F32 [(2 + kpool)*n_upd]): the rows, then their pool_cells, then their pool_idxs, whole numbers as F32; the

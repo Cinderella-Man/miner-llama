@@ -622,9 +622,20 @@ private:
         ggml_backend_sched_ptr sched;
         llm_graph_result     * ready; // the graph allocated in this scheduler, nullptr when it has to be rebuilt
         bool                   in_flight; // with mtp_graph_keep: a graph of this scheduler submitted since the last wait
+        bool                   planned;       // LLAMA_SCHED_PER_SIZE_RESERVE: planned over the whole memory (sched_small_plan)
+        bool                   planned_extra; // and with the shortlist head's further ids in that plan
     };
     std::vector<sched_small_entry> sched_small;
     bool sched_per_size = false;
+
+    // env: LLAMA_SCHED_PER_SIZE_RESERVE=1 (C803), with per-size schedulers (LLAMA_MTP_GRAPH_KEEP=1 or
+    // LLAMA_SCHED_PER_SIZE=1): a per-size scheduler is planned once, when it is made, from its batch's graph over the
+    // whole memory (and the head shortlist's whole room), as the shared scheduler is at the context's start, so that no
+    // later graph of its shape outgrows the plan; without it the first graph's plan grows with the context, a re-plan
+    // and a larger compute buffer each time (FN84, R60, R85: the MTP draft's 2 to 5 reallocations a request)
+    bool sched_small_reserve = false;
+    llm_graph_result_ptr gf_res_plan; // the graph sched_small_plan builds, never computed
+    bool sched_small_plan(sched_small_entry & ss, const llama_ubatch & ubatch, llm_graph_type gtype);
 
     // env: LLAMA_MTP_GRAPH_KEEP=1 (C619), an MTP context only: schedulers per size, keyed also by the head's shortlist
     // and the hidden-row carry (gf_res_key), and a per-size scheduler waits only for its own graph in flight

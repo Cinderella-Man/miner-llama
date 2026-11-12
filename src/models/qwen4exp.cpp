@@ -750,7 +750,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
 
     // the draft's head over a shortlist of tokens (llama_head_shortlist_*): one draft row, a plain head
     if (cparams.head_short_on && cparams.head_short && n_outputs == 1 && !model.output_s && (!loras || loras->empty())) {
-        cur = llama_head_shortlist_logits(ctx0, *cparams.head_short, model.output, cur);
+        cur = llama_head_shortlist_logits(ctx0, *cparams.head_short, model.output, cur, cparams.head_short_n_plan);
     } else {
         cur = build_lora_mm(model.output, cur, model.output_s);
     }

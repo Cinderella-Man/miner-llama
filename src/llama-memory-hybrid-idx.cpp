@@ -1136,6 +1136,27 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool_upd() const {
     return kpool_cur().n_upd_g;
 }
 
+void llama_memory_hybrid_idx_context::kpool_plan_for(const llama_ubatch & ubatch) {
+    if (kpool_st == nullptr) {
+        return;
+    }
+    auto & st = *kpool_st;
+
+    const auto *   idx   = mem->get_mem_idx();
+    const uint32_t kpool = mem->get_kpool();
+
+    // the bounds kpool_build_state and kpool_dev_build pad a ubatch's lists to; a list past them (a long re-pool after
+    // a sequence edit) is padded further and plans again, as without the plan
+    const uint32_t n_pool_max = idx->get_size() / kpool * idx->get_n_seq_max();
+    const uint32_t bound_new  = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
+    st.n_new   = 0;
+    st.n_new_g = std::max(1u, std::min({bound_new, kpool_pad(st.n_pool_real) - 1, n_pool_max}));
+
+    const uint32_t bound_upd = std::min<uint32_t>(GGML_PAD(64 + ubatch.n_tokens/kpool + 2*ubatch.n_seqs_unq + 8, 64u), kpool_dev_n_dump());
+    st.n_upd   = 0;
+    st.n_upd_g = bound_upd;
+}
+
 int32_t llama_memory_hybrid_idx_context::kpool_dev_table(int32_t il, ggml_tensor ** cells, ggml_tensor ** idxs) const {
     const auto * dv = mem != nullptr ? mem->kpool_dev_get() : nullptr;
     GGML_ASSERT(dv != nullptr);

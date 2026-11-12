@@ -81,7 +81,8 @@ void llama_head_shortlist::sync() {
     n_dev = extra.size();
 }
 
-ggml_tensor * llama_head_shortlist_logits(ggml_context * ctx, const llama_head_shortlist & sl, ggml_tensor * output, ggml_tensor * h) {
+ggml_tensor * llama_head_shortlist_logits(ggml_context * ctx, const llama_head_shortlist & sl, ggml_tensor * output, ggml_tensor * h,
+        uint32_t n_extra_plan) {
     const int64_t n_embd  = output->ne[0];
     const int64_t n_vocab = output->ne[1];
 
@@ -95,7 +96,8 @@ ggml_tensor * llama_head_shortlist_logits(ggml_context * ctx, const llama_head_s
     ggml_tensor * low = ggml_mul_mat(ctx, ggml_view_2d(ctx, output, n_embd, sl.k_low, output->nb[1], 0), h); // [k_low, 1]
     ggml_tensor * out = ggml_concat(ctx, low, sl.neg_inf, 0);                                                  // [n_vocab, 1]
 
-    const int64_t n_extra = sl.n_extra();
+    GGML_ASSERT(n_extra_plan <= std::max<uint32_t>(sl.m_cap, 1));
+    const int64_t n_extra = n_extra_plan > 0 ? (int64_t) n_extra_plan : (int64_t) sl.n_extra();
     if (n_extra > 0) {
         // the further ids: every row of the head is one "expert" of a mul_mat_id, as in the screened head
         ggml_tensor * ids  = ggml_view_1d(ctx, sl.ids, n_extra, 0);                                             // I32 [n_extra]
