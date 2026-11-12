@@ -2222,6 +2222,168 @@ static void test_top_k_rows_switch(const test_params & params) {
     printf("backend top-k rows switch test PASSED\n");
 }
 
+// C802: with LLAMA_SAMPLING_TOP_K_ROWS=1 the target's graph keeps one node count, and fits the plan the context made
+// when it was created, in every micro-batch: without outputs (a prompt's middle), with one (a prompt's end, a decode
+// step) and with several (a verify pass). A graph with another node count, or with a node the plan left unallocated
+// where it is now allocated, makes ggml's allocator plan the compute buffers again; on several devices the scheduler
+// first waits for every one of them, and the new plan fits no larger micro-batch (FN84: every request, on nine cards).
+// Each graph's nodes are counted with the scheduler's eval callback (asked once for every node); the allocator's
+// re-plans with its trace lines ("galloc-trigger", LLAMA_UBATCH_TRACE=1). The trace is read once in a process: the test
+// sets it, and counts re-plans when it runs before any other test of its process (--test test_top_k_rows_fixed_graph,
+// or LLAMA_UBATCH_TRACE=1 in the environment); otherwise it says so and checks the node counts only. The switch off is
+// the control, held to the same: one node count, no re-plan. The sampled tokens and candidates are the same off and on
+struct fixed_graph_state {
+    int64_t n_nodes   = 0; // the nodes the eval callback was asked about
+    int     n_galloc  = 0; // the allocator's trace lines: the trace is on
+    int     n_trigger = 0; // its re-plans
+};
+
+static void fixed_graph_log(ggml_log_level level, const char * text, void * user_data) {
+    GGML_UNUSED(level);
+    auto * st = (fixed_graph_state *) user_data;
+    if (strstr(text, "galloc-") != nullptr) {
+        st->n_galloc++;
+        if (strstr(text, "galloc-trigger") != nullptr) {
+            st->n_trigger++;
+        }
+    }
+    fputs(text, stderr);
+}
+
+static bool fixed_graph_eval(ggml_tensor * t, bool ask, void * user_data) {
+    GGML_UNUSED(t);
+    if (ask) {
+        ((fixed_graph_state *) user_data)->n_nodes++;
+    }
+    return false;
+}
+
+static void test_top_k_rows_fixed_graph(const test_params & params) {
+    const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const char * sw = "LLAMA_SAMPLING_TOP_K_ROWS";
+    const char * tr = "LLAMA_UBATCH_TRACE";
+
+    const char * env = getenv(sw);
+    const bool        env_had   = env != nullptr;
+    const std::string env_saved = env ? env : "";
+    const char * env_tr = getenv(tr);
+    const bool        tr_had    = env_tr != nullptr;
+    const std::string tr_saved  = env_tr ? env_tr : "";
+    test_set_env(tr, "1");
+
+    // {tokens, outputs at the last of them}, one sequence: one micro-batch each but the last, which the context splits
+    // into four (8, 8, 8 and 6 tokens, the last with the output)
+    const std::vector<std::array<int, 2>> batches = {
+        {8, 0}, {8, 0}, {5, 1}, {1, 1}, {4, 4}, {3, 3}, {8, 0}, {2, 0}, {6, 2}, {1, 1}, {8, 4}, {8, 0}, {30, 1},
+    };
+    size_t n_outputs = 0;
+    for (const auto & b : batches) {
+        n_outputs += b[1];
+    }
+
+    struct result {
+        std::vector<int64_t>     n_nodes;    // per decode
+        int                      n_trigger = 0;
+        bool                     traced    = false;
+        std::vector<llama_token> sampled;
+        std::vector<llama_token> candidates; // every output's, one after another
+    };
+
+    auto run = [&](bool on) {
+        test_set_env(sw, on ? "1" : "0");
+
+        fixed_graph_state st;
+        llama_log_set(fixed_graph_log, &st);
+
+        // the server's chain at the presets' settings (C691's switch test, chain 0): a top-k first
+        llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_penalties(n_vocab, 64, 1.0f, 0.0f, 0.0f));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_n_sigma(-1.0f));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(20));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_typical(1.0f, 1));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_p(0.95f, 1));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_min_p(0.0f, 1));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_temp_ext(0.7f, 0.0f, 1.0f));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(1234));
+        std::vector<llama_sampler_seq_config> configs = {{ 0, chain.get() }};
+
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_ctx                 = 512;
+        cparams.n_batch               = 512;
+        cparams.n_ubatch              = 8;
+        cparams.n_seq_max             = 1;
+        cparams.n_outputs_max         = 4;
+        cparams.n_outputs_max_per_seq = 4;
+        cparams.samplers              = configs.data();
+        cparams.n_samplers            = configs.size();
+        cparams.cb_eval               = fixed_graph_eval;
+        cparams.cb_eval_user_data     = &st;
+
+        llama_context_ptr ctx(llama_init_from_model(params.model.get(), cparams));
+        GGML_ASSERT(ctx);
+
+        result res;
+        res.traced = st.n_galloc > 0; // the trace on: the reserve's buffers were traced
+        st.n_trigger = 0;
+
+        int32_t pos = 0;
+        for (const auto & [n_tokens, n_out] : batches) {
+            common_batch batch(ctx.get());
+            for (int t = 0; t < n_tokens; ++t) {
+                batch.add((pos * 7919 + 13) % n_vocab, pos, 0, t >= n_tokens - n_out);
+                pos++;
+            }
+            st.n_nodes = 0;
+            GGML_ASSERT(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+            res.n_nodes.push_back(st.n_nodes);
+
+            for (int i = n_tokens - n_out; i < n_tokens; ++i) {
+                res.sampled.push_back(llama_get_sampled_token_ith(ctx.get(), i));
+                const llama_token * cand = llama_get_sampled_candidates_ith(ctx.get(), i);
+                if (cand) {
+                    res.candidates.insert(res.candidates.end(), cand, cand + llama_get_sampled_candidates_count_ith(ctx.get(), i));
+                }
+            }
+            printf("switch %s: %2d tokens, %d outputs: %lld nodes, %d re-plans so far\n", on ? "on " : "off", n_tokens,
+                    n_out, (long long) st.n_nodes, st.n_trigger);
+        }
+        res.n_trigger = st.n_trigger;
+
+        ctx.reset();
+        llama_log_set(nullptr, nullptr);
+        return res;
+    };
+
+    const result off = run(false);
+    const result on  = run(true);
+
+    for (const auto * r : { &off, &on }) {
+        const char * name = r == &off ? "off" : "on";
+        const int64_t n = r->n_nodes[0];
+        bool one = true;
+        for (size_t i = 0; i + 1 < batches.size(); ++i) {
+            one = one && r->n_nodes[i] == n;
+        }
+        // the last decode is four micro-batches
+        one = one && r->n_nodes.back() == 4*n;
+        const std::string replans = r->traced ? std::to_string(r->n_trigger) : "not counted (the allocator's trace was off in this process)";
+        printf("switch %s: %s node count (%lld a graph), re-plans: %s\n", name, one ? "one" : "MORE THAN ONE", (long long) n,
+                replans.c_str());
+        GGML_ASSERT(one);
+        GGML_ASSERT(!r->traced || r->n_trigger == 0);
+    }
+
+    GGML_ASSERT(off.sampled.size() == n_outputs && on.sampled == off.sampled);
+    GGML_ASSERT(on.candidates == off.candidates);
+    printf("the same %zu sampled tokens and %zu candidates off and on\n", off.sampled.size(), off.candidates.size());
+
+    test_set_env(sw, env_had ? env_saved.c_str() : nullptr);
+    test_set_env(tr, tr_had ? tr_saved.c_str() : nullptr);
+
+    printf("backend top-k rows fixed graph test PASSED\n");
+}
+
 struct backend_test_case {
     std::string name;
     void (*fn)(const test_params &);
@@ -2255,6 +2417,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_multi_output_sampling_chain",         test_multi_output_sampling_chain,      true },
     { "test_multi_output_cpu_suffix",             test_multi_output_cpu_suffix,          true },
     { "test_top_k_rows_switch",                   test_top_k_rows_switch,                true },
+    { "test_top_k_rows_fixed_graph",              test_top_k_rows_fixed_graph,           true },
 };
 
 // TODO: add usage, examples

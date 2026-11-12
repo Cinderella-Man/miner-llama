@@ -5428,8 +5428,24 @@ void llm_graph_context::build_sampling() const {
     }
 
     // the padding row gives the chains without a row of the ubatch a valid input, even with no output at all
-    ggml_tensor * logits_t = !top_k_rows.empty() && res->t_logits->ne[1] > 0 ? res->t_logits :
-        ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    ggml_tensor * logits_t = nullptr;
+    if (top_k_rows.empty()) {
+        logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    } else {
+        // C802: one row of padding, a pad of none of the logits' rows, in every ubatch: added here, before the chains,
+        // without the compute flag (ggml_build_forward_order). Without outputs it is the chains' input, as before; with
+        // outputs the chains read the logits themselves and nothing reads the pad, so it is never computed. So every
+        // ubatch has the same nodes in the same order, and the one-row pad is an allocated node in every graph, the
+        // plan the context reserved with outputs among them: no ubatch makes the allocator plan the compute buffers
+        // again (FN84: with the pad's node only in ubatches without outputs, it did at each change between the two).
+        // A view of the logits in the pad's place would keep the node count, but the plan gives a view no memory, so
+        // the next ubatch without outputs would not fit it. The plan holds one row more than before, not the
+        // n_outputs + 1 rows the switch off pads
+        ggml_tensor * none = ggml_view_2d(ctx0, res->t_logits, res->t_logits->ne[0], 0, res->t_logits->nb[1], 0);
+        ggml_tensor * pad  = ggml_pad(ctx0, none, 0, 1, 0, 0);
+        ggml_build_forward_order(gf, pad);
+        logits_t = res->t_logits->ne[1] > 0 ? res->t_logits : pad;
+    }
 
     for (auto & [k, out] : top_k_rows) {
         out.first = ggml_top_k(ctx0, logits_t, k);
