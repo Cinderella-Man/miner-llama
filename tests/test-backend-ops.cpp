@@ -14263,11 +14263,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // ... and with their K tiles (GGML_CUDA_MMVQ_PASCAL_DMT_KT, C728): K = 6144 with a partial last round and row block
     // (333 and 4097 rows) and rows that are views of wider rows; the cases above run the tiles at the other widths with
-    // _KT=2
+    // _KT=2. Since C794 (GGML_CUDA_MMVQ_PASCAL_RO8_KT, the tiles at 5 to 8 tokens) up to 8 tokens.
     for (ggml_type type : { GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K }) {
         for (auto [m, k, k_v] : std::vector<std::tuple<int64_t, int64_t, int64_t>>{
                 { 333, 6144, 0 }, { 4097, 6144, 0 }, { 129, 6144, 6656 } }) {
-            for (int64_t n = 1; n <= 5; ++n) {
+            for (int64_t n = 1; n <= 8; ++n) {
                 test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 },
                                                          { 0, 1, 2, 3 }, k_v));
             }

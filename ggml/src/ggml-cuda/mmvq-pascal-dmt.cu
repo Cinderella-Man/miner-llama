@@ -62,7 +62,9 @@
 //     are still the one-token kernel's. Its activations take about NT / 4 times the 4-token staging: at K = 2560 and 8
 //     tokens 20.6 KB of int8 words and 2.6 KB (IQ4_XS) or 5.2 KB (Q4_K) of terms, beside 5 warps' weight staging; K = 6144
 //     fits only 5 tokens (IQ4_XS 6), at 1 to 3 warps, wider rows fewer (dmt_nw); one warp a block (C809) and the rest are
-//     left to the k-column kernel. IQ4_XS and Q4_K only: Q6_K's 5 to 8 tokens stay there too (dmt_nt_mode; C795, Q1390).
+//     left to the k-column kernel, unless the K tiles below take them (GGML_CUDA_MMVQ_PASCAL_RO8_KT, C794: 6 warps a
+//     block at K = 6144 and 5 to 8 tokens). IQ4_XS and Q4_K only: Q6_K's 5 to 8 tokens stay there too (dmt_nt_mode;
+//     C795, Q1390).
 
 #define DMT_NW_MAX   6                    // warps per block at R = 1, at most (3 at R = 2)
 #define DMT_MAX_COLS 4                    // tokens with GGML_CUDA_MMVQ_PASCAL_DMT and _Q6K_MT
@@ -875,9 +877,28 @@ static void dmt_launch_type(const int nt, const int r, const dmt_args & p, const
 //   - Shared memory at 4 tokens, K = 6144, 6 warps: 9376 B of tile, 9216 B raw and 26112 B of weight staging (IQ4_XS),
 //     10432 + 9216 + 27648 B (Q4_K): 2 blocks of 6 warps a SM, as at K = 2560.
 //   - The kernel takes only products the kernel above takes, at R = 1, so nothing outside this file changes.
+//   - 5 to 8 tokens (GGML_CUDA_MMVQ_PASCAL_RO8_KT, C794): the same kernel at NT = 5 to 8, for the products of
+//     GGML_CUDA_MMVQ_PASCAL_RO8 that whole staging leaves at few warps a block or to the k-column kernel (K = 6144: IQ4_XS
+//     3 warps at 5 tokens, 1 at 6, none from 7; Q4_K 2 at 5, none from 6). There the raw tile shares the warps' weight
+//     staging (one barrier more a tile: every warp is done with its segments of the last tile before the raw tile is
+//     stored over them), so a tile of 8 tokens and 6 warps' staging take 18592 B + 26112 B (IQ4_XS) or 20672 + 27648 B
+//     (Q4_K): 6 warps a block, 2 blocks a SM, at every token count. A thread loads up to dmt_kt_eu<NT>() units of the
+//     next tile ahead (6 at 7 and 8 tokens), so 5 to 8 tokens at K = 6144 (L = 8) need 6 warps. Each token's sums are
+//     the one-token kernel's as above. The products this kernel takes at 5 to 8 tokens are taken by the file
+//     (ggml_cuda_mmvq_pascal_dmt_takes) even where whole staging holds no warp or one.
 
 #define DMT_KT_NW_MAX 6 // warps per block, at most
-#define DMT_KT_EU     4 // 16-byte units of the raw tile a thread loads ahead, at most
+#define DMT_KT_EU     4 // 16-byte units of the raw tile a thread loads ahead, at most, at 2 to 4 tokens
+// The most tokens with the register prefetch of the weights: at 7 and 8 tokens the prefetch's registers pass the 168
+// that 2 blocks of 6 warps allow (Q4_K 8 to 40 bytes of stack at 7 and 8 tokens, IQ4_XS 8 at 8 tokens and M = 2), so
+// there the tiles run without it
+#define DMT_KT_PF_COLS 6
+
+// 16-byte units of the raw tile a thread loads ahead, at most: DMT_KT_EU at 2 to 4 tokens, at 5 to 8 enough for 6 warps
+// at L = 8 (NT x 144 units: 4, 5, 6, 6)
+template <int NT> constexpr __host__ __device__ int dmt_kt_eu() {
+    return NT <= DMT_MAX_COLS ? DMT_KT_EU : (3 * NT + 3) / 4;
+}
 
 template <ggml_type type, int NT, int M, bool PF>
 __launch_bounds__(DMT_KT_NW_MAX*WARP_SIZE, 2)
@@ -911,12 +932,13 @@ static __global__ void mul_mat_vec_q_pascal_dmt_kt(const dmt_args p, const int n
     const char * const sws[1] = { smw + sl * SB };
 
     // the raw tile t of every token into registers (with GGML_CUDA_MMVQ_PASCAL_DMT_KT_FAULT=1 the next tile, a fault for
-    // the checks), and from there into shared memory
-    uint4 ru[DMT_KT_EU];
+    // the checks), and from there into shared memory (at 5 to 8 tokens over the warps' staging: raw_off = stage_off)
+    constexpr int EU = dmt_kt_eu<NT>();
+    uint4 ru[EU];
     const auto load_raw = [&](const int t) {
         const int ts = fault ? (t + 1 == p.niter ? 0 : t + 1) : t;
 #pragma unroll
-        for (int k = 0; k < DMT_KT_EU; ++k) {
+        for (int k = 0; k < EU; ++k) {
             const int u = tid + k * nth;
             if (u < nru) {
                 int j = 0; // the token: u / tunits
@@ -930,7 +952,7 @@ static __global__ void mul_mat_vec_q_pascal_dmt_kt(const dmt_args p, const int n
     };
     const auto store_raw = [&]() {
 #pragma unroll
-        for (int k = 0; k < DMT_KT_EU; ++k) {
+        for (int k = 0; k < EU; ++k) {
             const int u = tid + k * nth;
             if (u < nru) {
                 ((uint4 *) raw)[u] = ru[k];
@@ -1008,7 +1030,11 @@ static __global__ void mul_mat_vec_q_pascal_dmt_kt(const dmt_args p, const int n
 
     while (true) {
         for (int t = 0; t < p.niter; ++t) {
-            // tile t: every warp is done with tile t - 1 when it stores its part of the raw tile
+            // tile t: every warp is done with tile t - 1 when it stores its part of the raw tile; at 5 to 8 tokens the
+            // raw tile lies over the warps' staging, so every warp first waits until all are done with their segments
+            if constexpr (NT > DMT_MAX_COLS) {
+                __syncthreads();
+            }
             store_raw();
             __syncthreads();
             convert();
@@ -1152,31 +1178,54 @@ static int dmt_kt_tile_bytes(const ggml_type type, const int nt, const int lpr_l
 // they lose.
 #define DMT_KT_FULL_MAX 3
 
+// GGML_CUDA_MMVQ_PASCAL_RO8_KT (C794): the K tiles for the products of 5 to 8 tokens that GGML_CUDA_MMVQ_PASCAL_RO8 sends
+// to this file: 0 (default) off; 1 where the kernel above holds at most DMT_KT_FULL_MAX warps a block (none, one, as C809
+// leaves to the k-column kernel, and up to 3: at K = 6144 every token count) and the tiles more, the rule of _DMT_KT=1;
+// 2 wherever they fit, for the checks. _DMT_KT_M, _DMT_KT_NW and _DMT_KT_FAULT act on them too; _DMT_KT does not.
+static int dmt_ro8_kt_mode() {
+    static const int mode = dmt_env("GGML_CUDA_MMVQ_PASCAL_RO8_KT", 0);
+    return mode;
+}
+
+// a thread's units of the raw tile ahead at nt tokens (dmt_kt_eu)
+static int dmt_kt_eu_nt(const int nt) {
+    switch (nt) {
+        case 5:  return dmt_kt_eu<5>();
+        case 6:  return dmt_kt_eu<6>();
+        case 7:  return dmt_kt_eu<7>();
+        case 8:  return dmt_kt_eu<8>();
+        default: return dmt_kt_eu<4>();
+    }
+}
+
 // The warps per block of the K tiles for nt tokens and nsb super-blocks per row (R = 1) where they take the product, else
 // 0: GGML_CUDA_MMVQ_PASCAL_DMT_KT_NW (default and at most 6), fewer where the block's shared memory would pass 48 KB;
-// none for other types than IQ4_XS and Q4_K or other token counts than 2 to 4, where the threads can't load a tile
-// ahead in DMT_KT_EU units each, or (with _KT=1) for other products than Q4_K's of 4 tokens, nor where the kernel above
-// holds more than DMT_KT_FULL_MAX warps (nw_full) or as many as the tiles
+// none for other types than IQ4_XS and Q4_K or other token counts than 2 to 8, where the threads can't load a tile
+// ahead in dmt_kt_eu units each, or (with _KT=1) for other products than Q4_K's of 4 tokens, nor where the kernel above
+// holds more than DMT_KT_FULL_MAX warps (nw_full) or as many as the tiles. 2 to 4 tokens follow
+// GGML_CUDA_MMVQ_PASCAL_DMT_KT, 5 to 8 GGML_CUDA_MMVQ_PASCAL_RO8_KT (whose raw tile lies over the warps' staging).
 static int dmt_kt_nw(const ggml_type type, const int nt, const int nsb, const int nw_full) {
     static const int nw_env = dmt_env("GGML_CUDA_MMVQ_PASCAL_DMT_KT_NW", DMT_KT_NW_MAX);
-    const int mode = dmt_kt_mode();
-    // the tiles have IQ4_XS's and Q4_K's steps and staging, at 2 to 4 tokens, only; any other product this file takes
+    const bool ro8 = nt > DMT_MAX_COLS;
+    const int mode = ro8 ? dmt_ro8_kt_mode() : dmt_kt_mode();
+    // the tiles have IQ4_XS's and Q4_K's steps and staging, at 2 to 8 tokens, only; any other product this file takes
     // keeps its own kernel
-    if ((mode != 1 && mode != 2) || (type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q4_K) || nt < 2 || nt > 4) {
+    if ((mode != 1 && mode != 2) || (type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q4_K) || nt < 2 || nt > DMT_RO8_COLS) {
         return 0;
     }
-    // _KT=1: only where they gain on a P106 (C808)
-    if (mode == 1 && (type != GGML_TYPE_Q4_K || nt != 4 || nw_full > DMT_KT_FULL_MAX)) {
+    // _KT=1: only where they gain on a P106 (C808); _RO8_KT=1: where the kernel above holds at most DMT_KT_FULL_MAX warps
+    if (mode == 1 && (ro8 ? nw_full > DMT_KT_FULL_MAX : type != GGML_TYPE_Q4_K || nt != 4 || nw_full > DMT_KT_FULL_MAX)) {
         return 0;
     }
     const int lpr_log2 = dmt_lpr_log2(nsb);
-    const int fixed    = dmt_kt_tile_bytes(type, nt, lpr_log2) + nt * (288 << lpr_log2);
+    const int tile     = dmt_kt_tile_bytes(type, nt, lpr_log2);
+    const int raw      = nt * (288 << lpr_log2);
     const int ws       = dmt_wstage(type, 1, lpr_log2);
     int nw = std::min(std::max(nw_env, 1), DMT_KT_NW_MAX);
-    while (nw > 0 && fixed + nw * ws > DMT_SMEM_MAX) {
+    while (nw > 0 && (ro8 ? tile + std::max(raw, nw * ws) : tile + raw + nw * ws) > DMT_SMEM_MAX) {
         nw--;
     }
-    if (nw == 0 || nt * (18 << lpr_log2) > DMT_KT_EU * nw * WARP_SIZE) {
+    if (nw == 0 || nt * (18 << lpr_log2) > dmt_kt_eu_nt(nt) * nw * WARP_SIZE) {
         return 0;
     }
     return mode == 2 || nw > nw_full ? nw : 0;
@@ -1218,6 +1267,15 @@ static void dmt_kt_launch_nt(const int nt, const bool pf, const dmt_args & p, co
         case 3*2 + 0: dmt_kt_launch<type, 3, M, false>(p, ngrp, raw_off, fault, nw, smem, stream); break;
         case 3*2 + 1: dmt_kt_launch<type, 3, M, true >(p, ngrp, raw_off, fault, nw, smem, stream); break;
         case 4*2 + 0: dmt_kt_launch<type, 4, M, false>(p, ngrp, raw_off, fault, nw, smem, stream); break;
+        case 5*2 + 0: dmt_kt_launch<type, 5, M, false>(p, ngrp, raw_off, fault, nw, smem, stream); break;
+        case 5*2 + 1: dmt_kt_launch<type, 5, M, true >(p, ngrp, raw_off, fault, nw, smem, stream); break;
+        case 6*2 + 0: dmt_kt_launch<type, 6, M, false>(p, ngrp, raw_off, fault, nw, smem, stream); break;
+        case 6*2 + 1: dmt_kt_launch<type, 6, M, true >(p, ngrp, raw_off, fault, nw, smem, stream); break;
+        // 7 and 8 tokens without the prefetch (DMT_KT_PF_COLS): those kernels aren't compiled
+        case 7*2 + 0:
+        case 7*2 + 1: dmt_kt_launch<type, 7, M, false>(p, ngrp, raw_off, fault, nw, smem, stream); break;
+        case 8*2 + 0:
+        case 8*2 + 1: dmt_kt_launch<type, 8, M, false>(p, ngrp, raw_off, fault, nw, smem, stream); break;
         default:      dmt_kt_launch<type, 4, M, true >(p, ngrp, raw_off, fault, nw, smem, stream); break;
     }
 }
@@ -1250,13 +1308,17 @@ static bool dmt_kt(const ggml_type type, const void * vx, const void * vy, float
     p.col_bytes_y    = (int) col_bytes_y;
     p.stride_col_dst = (int) stride_col_dst;
     p.ds_off         = (1 << p.lpr_log2) * (64 * nt + 4);
-    const int raw_off = dmt_kt_tile_bytes(type, nt, p.lpr_log2);
-    p.stage_off      = raw_off + nt * (288 << p.lpr_log2);
+    // 2 to 4 tokens: the tile, the raw tile, the warps' staging; 5 to 8: the raw tile over the warps' staging
+    const bool ro8    = nt > DMT_MAX_COLS;
+    const int tile    = dmt_kt_tile_bytes(type, nt, p.lpr_log2);
+    const int raw     = nt * (288 << p.lpr_log2);
+    const int raw_off = tile;
+    p.stage_off      = ro8 ? tile : tile + raw;
     p.wstage         = dmt_wstage(type, 1, p.lpr_log2);
     p.gstride        = dmt_gstride(dmt_sb(type), 1, p.lpr_log2);
-    const int smem   = p.stage_off + nw * p.wstage;
+    const int smem   = ro8 ? tile + std::max(raw, nw * p.wstage) : p.stage_off + nw * p.wstage;
     const int ngrp   = (p.nwrb + nw * m - 1) / (nw * m);
-    const bool pf    = dmt_pick_pf(type, nt, nsb, 1);
+    const bool pf    = dmt_pick_pf(type, nt, nsb, 1) && nt <= DMT_KT_PF_COLS;
 
     if (type == GGML_TYPE_IQ4_XS) {
         if (m == 2) {
@@ -1301,8 +1363,12 @@ bool ggml_cuda_mmvq_pascal_dmt_takes(const ggml_type type, const int64_t K, cons
     const int nw = dmt_nw(type, (int) ncols, nsb, dmt_pick_r(type, (int) ncols, nsb));
     // A block of one warp only where _DMT_NW=1 asks for it, for Q6_K (one warp a block lost to the k-column kernel, R79)
     // and for the products of 5 to 8 tokens (C809, Q1415: on a P106 IQ4_XS 2560 x 6144 at 6 tokens took 595.98 and
-    // 595.90 us at one warp a block, 277.57 and 279.01 where this kernel left it, R120b), until C794's K tiles take them
+    // 595.90 us at one warp a block, 277.57 and 279.01 where this kernel left it, R120b), unless the K tiles take them
+    // (GGML_CUDA_MMVQ_PASCAL_RO8_KT, C794: 5 to 8 tokens run at R = 1)
     const bool one_warp_declined = type == GGML_TYPE_Q6_K || ncols > DMT_MAX_COLS;
+    if (ncols > DMT_MAX_COLS && dmt_kt_nw(type, (int) ncols, nsb, nw) > 0) {
+        return true;
+    }
     return one_warp_declined && dmt_nw_env() != 1 ? nw >= 2 : nw > 0;
 }
 
@@ -1324,6 +1390,12 @@ bool ggml_cuda_mmvq_pascal_dmt(const ggml_type type, const void * vx, const void
     const int nw  = dmt_nw(type, nt, nsb, r);
     if (r == 1 && dmt_kt(type, vx, vy, dst, nt, nsb, nrows, row_bytes, col_bytes_y, stride_col_dst, nw, stream)) {
         return true;
+    }
+    // a product of 5 to 8 tokens taken for the K tiles (C794) that they could not launch (activations not 16-byte
+    // aligned) and that the kernel below would run at fewer warps than _takes allows: the other kernels' (the same
+    // condition as _takes without the tiles)
+    if (nt > DMT_MAX_COLS && (dmt_nw_env() != 1 ? nw < 2 : nw < 1)) {
+        return false;
     }
 
     dmt_args p;
