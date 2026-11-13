@@ -889,6 +889,10 @@ static void dmt_launch_type(const int nt, const int r, const dmt_args & p, const
 
 #define DMT_KT_NW_MAX 6 // warps per block, at most
 #define DMT_KT_EU     4 // 16-byte units of the raw tile a thread loads ahead, at most, at 2 to 4 tokens
+// The most tokens with the register prefetch of the weights: at 7 and 8 tokens the prefetch's registers pass the 168
+// that 2 blocks of 6 warps allow (Q4_K 8 to 40 bytes of stack at 7 and 8 tokens, IQ4_XS 8 at 8 tokens and M = 2), so
+// there the tiles run without it
+#define DMT_KT_PF_COLS 6
 
 // 16-byte units of the raw tile a thread loads ahead, at most: DMT_KT_EU at 2 to 4 tokens, at 5 to 8 enough for 6 warps
 // at L = 8 (NT x 144 units: 4, 5, 6, 6)
@@ -1267,10 +1271,11 @@ static void dmt_kt_launch_nt(const int nt, const bool pf, const dmt_args & p, co
         case 5*2 + 1: dmt_kt_launch<type, 5, M, true >(p, ngrp, raw_off, fault, nw, smem, stream); break;
         case 6*2 + 0: dmt_kt_launch<type, 6, M, false>(p, ngrp, raw_off, fault, nw, smem, stream); break;
         case 6*2 + 1: dmt_kt_launch<type, 6, M, true >(p, ngrp, raw_off, fault, nw, smem, stream); break;
-        case 7*2 + 0: dmt_kt_launch<type, 7, M, false>(p, ngrp, raw_off, fault, nw, smem, stream); break;
-        case 7*2 + 1: dmt_kt_launch<type, 7, M, true >(p, ngrp, raw_off, fault, nw, smem, stream); break;
-        case 8*2 + 0: dmt_kt_launch<type, 8, M, false>(p, ngrp, raw_off, fault, nw, smem, stream); break;
-        case 8*2 + 1: dmt_kt_launch<type, 8, M, true >(p, ngrp, raw_off, fault, nw, smem, stream); break;
+        // 7 and 8 tokens without the prefetch (DMT_KT_PF_COLS): those kernels aren't compiled
+        case 7*2 + 0:
+        case 7*2 + 1: dmt_kt_launch<type, 7, M, false>(p, ngrp, raw_off, fault, nw, smem, stream); break;
+        case 8*2 + 0:
+        case 8*2 + 1: dmt_kt_launch<type, 8, M, false>(p, ngrp, raw_off, fault, nw, smem, stream); break;
         default:      dmt_kt_launch<type, 4, M, true >(p, ngrp, raw_off, fault, nw, smem, stream); break;
     }
 }
@@ -1313,7 +1318,7 @@ static bool dmt_kt(const ggml_type type, const void * vx, const void * vy, float
     p.gstride        = dmt_gstride(dmt_sb(type), 1, p.lpr_log2);
     const int smem   = ro8 ? tile + std::max(raw, nw * p.wstage) : p.stage_off + nw * p.wstage;
     const int ngrp   = (p.nwrb + nw * m - 1) / (nw * m);
-    const bool pf    = dmt_pick_pf(type, nt, nsb, 1);
+    const bool pf    = dmt_pick_pf(type, nt, nsb, 1) && nt <= DMT_KT_PF_COLS;
 
     if (type == GGML_TYPE_IQ4_XS) {
         if (m == 2) {
