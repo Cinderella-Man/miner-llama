@@ -649,9 +649,10 @@ private:
     // the context of the moment, and from then on the shared scheduler re-plans as the context grows (R130: 18 times in
     // FN84's prompts, after that one change of cards). With it, a pass whose allocation re-planned the shared scheduler
     // plans it again from that batch's graph over the whole memory (sched_shared_plan) and builds and allocates its own
-    // graph again, before anything is computed
+    // graph again, before anything is computed. A re-plan is any plan the allocation made (ggml_backend_sched_get_n_plans):
+    // the scheduler's after a change of devices or a graph that outgrew the plan, the allocator's own on a single buffer
     bool sched_shared_whole = false;
-    int32_t sched_shared_replans = 0; // the shared scheduler's re-plans, for any reason (sched_graph_realloc)
+    int32_t sched_shared_replans = 0; // with =2: the passes whose allocation re-planned the shared scheduler
     int32_t sched_shared_plans   = 0; // and its plans over the whole memory (sched_shared_plan)
     bool sched_shared_plan(const llama_ubatch & ubatch, llm_graph_type gtype);
 

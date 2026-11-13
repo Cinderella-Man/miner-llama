@@ -3623,7 +3623,9 @@ llm_graph_result * llama_context::process_ubatch_graph(const llama_ubatch & ubat
         }
         tt.build = trace ? ggml_time_us() : 0;
 
-        const int32_t n_shared_replans = sched_shared_replans;
+        // the scheduler's plans before this allocation: a re-plan after a change of devices or a graph that outgrew the
+        // plan (ggml_backend_sched_alloc_splits), or the allocator's own re-plan of a single-buffer graph (a CPU)
+        const int n_plans = ggml_backend_sched_get_n_plans(sched_res());
         if (!ggml_backend_sched_alloc_graph(sched_res(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -3633,7 +3635,8 @@ llm_graph_result * llama_context::process_ubatch_graph(const llama_ubatch & ubat
         // LLAMA_SCHED_PER_SIZE_RESERVE=2 (C818): this allocation re-planned the shared scheduler from this graph, sized for
         // the memory as it is now: plan it from this batch's graph over the whole memory, then build and allocate the
         // batch's graph again. Nothing has been computed and the re-plan has already waited for the devices
-        if (!ss && sched_shared_whole && sched_shared_replans != n_shared_replans) {
+        if (!ss && sched_shared_whole && ggml_backend_sched_get_n_plans(sched_res()) != n_plans) {
+            sched_shared_replans++;
             ggml_backend_sched_reset(sched_res());
             if (!sched_shared_plan(ubatch, gtype)) {
                 LLAMA_LOG_WARN("%s: LLAMA_SCHED_PER_SIZE_RESERVE=2: the shared scheduler could not be planned over the whole memory\n", __func__);
@@ -3643,13 +3646,13 @@ llm_graph_result * llama_context::process_ubatch_graph(const llama_ubatch & ubat
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
             }
-            const int32_t n_again = sched_shared_replans;
+            const int n_again = ggml_backend_sched_get_n_plans(sched_res());
             if (!ggml_backend_sched_alloc_graph(sched_res(), gf)) {
                 LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
                 ret = GGML_STATUS_ALLOC_FAILED;
                 return nullptr;
             }
-            if (sched_shared_replans != n_again) {
+            if (ggml_backend_sched_get_n_plans(sched_res()) != n_again) {
                 LLAMA_LOG_WARN("%s: LLAMA_SCHED_PER_SIZE_RESERVE=2: the %u-token graph needed a new plan after the plan over the whole memory\n",
                         __func__, ubatch.n_tokens);
             }
@@ -6133,17 +6136,12 @@ bool llama_context::sched_shared_plan(const llama_ubatch & ubatch, llm_graph_typ
 }
 
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
-    auto * lctx = static_cast<llama_context *>(user_data);
-
-    // LLAMA_SCHED_PER_SIZE_RESERVE=2 (C818) acts on every re-plan of the shared scheduler, a change of devices included
-    if (sched == lctx->sched.get()) {
-        lctx->sched_shared_replans++;
-    }
-
     // reallocating after the backend assignments changed is expected, trace only the unexpected ones
     if (backend_ids_changed) {
         return;
     }
+
+    auto * lctx = static_cast<llama_context *>(user_data);
 
     if (graph_size_changed) {
         lctx->n_reallocs_diff++;
