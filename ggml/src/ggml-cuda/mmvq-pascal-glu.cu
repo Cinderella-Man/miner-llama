@@ -41,6 +41,11 @@
 //     by default loads the next segments into registers before it computes the current ones (C722's prefetch).
 //   - Rows per row block: the larger of the two types' rows per warp pass (32 / L); the other type's warp makes two or
 //     more passes (at 2,560 weights: 16 rows, Q2_0's warp in two passes of 8).
+//   - 5 to 8 tokens of a pair with an IQ4_XS, Q4_K or Q5_K product (C793, Q1388; GGML_CUDA_MMVQ_PASCAL_GLU_MT=3 or 4):
+//     mul_mat_vec_q_pascal_glu_ro8, the same steps with every type's warp code. GGML_CUDA_MMVQ_PASCAL_RO8 runs those
+//     products of 5 to 8 tokens on C722's and C690's kernels at R = 1, whose sums are the one-token kernel's (C729), so
+//     the order above holds there too; the pair is taken only where those kernels take the separate product. A kernel of
+//     its own, so that mul_mat_vec_q_pascal_glu at 5 to 8 tokens (Q2_0 and Q3_K pairs) keeps its code and registers.
 
 #define GLU_MAX_COLS 8
 #define GLU_NP_MAX   4                    // warp pairs per block, at most
@@ -683,7 +688,7 @@ static __global__ void mul_mat_vec_q_pascal_glu(const glu_args p) {
     } else if (m.kind == GK_Q3_K) {
         glu_warp<GK_Q3_K, NT, PF>(p, m, role, pair, sm);
     } else {
-        // IQ4_XS, Q4_K and Q5_K: 2 to 4 tokens (the separate kernels they repeat)
+        // IQ4_XS, Q4_K and Q5_K: 2 to 4 tokens (the separate kernels they repeat; 5 to 8: mul_mat_vec_q_pascal_glu_ro8)
         if constexpr (NT <= 4) {
             if (m.kind == GK_Q4_K) {
                 glu_warp<GK_Q4_K, NT, PF>(p, m, role, pair, sm);
@@ -696,6 +701,36 @@ static __global__ void mul_mat_vec_q_pascal_glu(const glu_args p) {
     }
 }
 
+// 5 to 8 tokens of a pair with an IQ4_XS, Q4_K or Q5_K product (C793): mul_mat_vec_q_pascal_glu's steps with every
+// type's warp code; grid, block and shared memory as there
+template <int NT, bool PF>
+__launch_bounds__(2*GLU_NP_MAX*WARP_SIZE, 1)
+static __global__ void mul_mat_vec_q_pascal_glu_ro8(const glu_args p) {
+    static_assert(NT > 4 && NT <= GLU_MAX_COLS, "the 2-4-token pairs run mul_mat_vec_q_pascal_glu");
+    extern __shared__ uint4 glu_sm[];
+    char * sm = (char *) glu_sm;
+
+    ggml_cuda_pdl_sync();
+
+    glu_stage_act<NT>(p, sm);
+    __syncthreads();
+
+    const int role = threadIdx.y & 1;
+    const int pair = threadIdx.y >> 1;
+    const glu_mat m = role ? p.m[1] : p.m[0];
+    if (m.kind == GK_Q2_0) {
+        glu_warp<GK_Q2_0, NT, PF>(p, m, role, pair, sm);
+    } else if (m.kind == GK_Q3_K) {
+        glu_warp<GK_Q3_K, NT, PF>(p, m, role, pair, sm);
+    } else if (m.kind == GK_Q4_K) {
+        glu_warp<GK_Q4_K, NT, PF>(p, m, role, pair, sm);
+    } else if (m.kind == GK_Q5_K) {
+        glu_warp<GK_Q5_K, NT, PF>(p, m, role, pair, sm);
+    } else {
+        glu_warp<GK_IQ4_XS, NT, PF>(p, m, role, pair, sm);
+    }
+}
+
 static int glu_env(const char * name, const int dflt) {
     const char * env = getenv(name);
     return env ? atoi(env) : dflt;
@@ -704,6 +739,16 @@ static int glu_env(const char * name, const int dflt) {
 static int glu_mode() {
     static const int mode = glu_env("GGML_CUDA_MMVQ_PASCAL_GLU_MT", 0);
     return mode;
+}
+
+// GGML_CUDA_MMVQ_PASCAL_GLU_MT=3 or 4 (C793): IQ4_XS, Q4_K and Q5_K products of 5 to 8 tokens taken too
+static bool glu_ro8() {
+    return glu_mode() == 3 || glu_mode() == 4;
+}
+
+// the register prefetch: off at 2 and 4
+static bool glu_pf() {
+    return glu_mode() != 2 && glu_mode() != 4;
 }
 
 static int glu_np_env() {
@@ -792,11 +837,13 @@ static bool glu_matrix_ok(const ggml_tensor * w, const int64_t ncols) {
         case GK_Q2_0:
         case GK_Q3_K:
             return glu_kcol_runs(w->type);
+        // 5 to 8 tokens at GGML_CUDA_MMVQ_PASCAL_GLU_MT=3 or 4 only (C793), where _RO8 runs the product read once
         case GK_Q4_K:
         case GK_IQ4_XS:
-            return ncols <= 4 && ggml_cuda_mmvq_pascal_dmt_takes(w->type, K, nrows, ncols, row_bytes, w->data);
+            return (ncols <= 4 || glu_ro8()) &&
+                   ggml_cuda_mmvq_pascal_dmt_takes(w->type, K, nrows, ncols, row_bytes, w->data);
         default: // GK_Q5_K
-            return ncols <= 4 && ggml_cuda_mmvq_pascal_q5k_mt_takes(K, nrows, ncols, row_bytes, w->data);
+            return (ncols <= 4 || glu_ro8()) && ggml_cuda_mmvq_pascal_q5k_mt_takes(K, nrows, ncols, row_bytes, w->data);
     }
 }
 
@@ -891,14 +938,24 @@ static int glu_smem(const glu_shape & s, const int np, const int nt) {
     return s.act + np * s.pstage + np * 4 * nt * (1 << s.rbr_log2) * (int) sizeof(float);
 }
 
-template <int NT, bool PF>
+// the kernel of NT tokens: W, a pair with an IQ4_XS, Q4_K or Q5_K product of 5 to 8 tokens (C793)
+template <int NT, bool PF, bool W>
+static void (*glu_kernel())(const glu_args) {
+    if constexpr (W) {
+        return mul_mat_vec_q_pascal_glu_ro8<NT, PF>;
+    } else {
+        return mul_mat_vec_q_pascal_glu<NT, PF>;
+    }
+}
+
+template <int NT, bool PF, bool W>
 static int glu_blocks_regs(const int threads) {
     // resident blocks per SM that the kernel's registers allow, per block size (np 1 to 4), queried once
     static int cache[GLU_NP_MAX + 1] = {};
     const int np = threads / (2 * WARP_SIZE);
     if (cache[np] == 0) {
         int n = 0;
-        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, mul_mat_vec_q_pascal_glu<NT, PF>, threads, 0) != cudaSuccess) {
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, glu_kernel<NT, PF, W>(), threads, 0) != cudaSuccess) {
             (void) cudaGetLastError();
             n = 1;
         }
@@ -907,20 +964,31 @@ static int glu_blocks_regs(const int threads) {
     return cache[np];
 }
 
-template <int NT, bool PF>
+template <int NT, bool PF, bool W>
 static void glu_launch(const glu_args & p, const int nsm, const int smem, cudaStream_t stream) {
     const int threads = 2 * p.np * WARP_SIZE;
-    const int bps  = std::max(1, std::min(glu_blocks_regs<NT, PF>(threads), 96 * 1024 / smem));
+    const int bps  = std::max(1, std::min(glu_blocks_regs<NT, PF, W>(threads), 96 * 1024 / smem));
     const int nblk = std::min((p.nrb + p.np - 1) / p.np, nsm * bps);
-    mul_mat_vec_q_pascal_glu<NT, PF><<<dim3(nblk, 1, 1), dim3(WARP_SIZE, 2 * p.np, 1), smem, stream>>>(p);
+    glu_kernel<NT, PF, W>()<<<dim3(nblk, 1, 1), dim3(WARP_SIZE, 2 * p.np, 1), smem, stream>>>(p);
 }
 
-template <int NT>
+template <int NT, bool W = false>
 static void glu_launch_pf(const glu_args & p, const int nsm, const int smem, const bool pf, cudaStream_t stream) {
     if (pf) {
-        glu_launch<NT, true>(p, nsm, smem, stream);
+        glu_launch<NT, true, W>(p, nsm, smem, stream);
     } else {
-        glu_launch<NT, false>(p, nsm, smem, stream);
+        glu_launch<NT, false, W>(p, nsm, smem, stream);
+    }
+}
+
+// 5 to 8 tokens: W as above
+template <int NT>
+static void glu_launch_nt(const glu_args & p, const int nsm, const int smem, const bool pf, const bool w,
+                          cudaStream_t stream) {
+    if (w) {
+        glu_launch_pf<NT, true>(p, nsm, smem, pf, stream);
+    } else {
+        glu_launch_pf<NT, false>(p, nsm, smem, pf, stream);
     }
 }
 
@@ -1039,15 +1107,17 @@ bool ggml_cuda_mmvq_pascal_glu_mt(ggml_backend_cuda_context & ctx, const ggml_te
     p.fault          = glu_fault();
 
     const int  nsm = ggml_cuda_info().devices[ctx.device].nsm;
-    const bool pf  = glu_mode() != 2;
+    const bool pf  = glu_pf();
+    // 5 to 8 tokens with an IQ4_XS, Q4_K or Q5_K product (glu_matrix_ok took it under _GLU_MT=3 or 4): their kernel
+    const bool w   = kg >= GK_Q4_K || ku >= GK_Q4_K;
     switch (nt) {
         case 2:  glu_launch_pf<2>(p, nsm, smem, pf, stream); break;
         case 3:  glu_launch_pf<3>(p, nsm, smem, pf, stream); break;
         case 4:  glu_launch_pf<4>(p, nsm, smem, pf, stream); break;
-        case 5:  glu_launch_pf<5>(p, nsm, smem, pf, stream); break;
-        case 6:  glu_launch_pf<6>(p, nsm, smem, pf, stream); break;
-        case 7:  glu_launch_pf<7>(p, nsm, smem, pf, stream); break;
-        default: glu_launch_pf<8>(p, nsm, smem, pf, stream); break;
+        case 5:  glu_launch_nt<5>(p, nsm, smem, pf, w, stream); break;
+        case 6:  glu_launch_nt<6>(p, nsm, smem, pf, w, stream); break;
+        case 7:  glu_launch_nt<7>(p, nsm, smem, pf, w, stream); break;
+        default: glu_launch_nt<8>(p, nsm, smem, pf, w, stream); break;
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
