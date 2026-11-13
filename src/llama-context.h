@@ -639,8 +639,27 @@ private:
     // later graph of its shape outgrows the plan; without it the first graph's plan grows with the context, a re-plan
     // and a larger compute buffer each time (FN84, R60, R85: the MTP draft's 2 to 5 reallocations a request)
     bool sched_small_reserve = false;
-    llm_graph_result_ptr gf_res_plan; // the graph sched_small_plan builds, never computed
+    llm_graph_result_ptr gf_res_plan; // the graph sched_small_plan and sched_shared_plan build, never computed
     bool sched_small_plan(sched_small_entry & ss, const llama_ubatch & ubatch, llm_graph_type gtype);
+
+    // env: LLAMA_SCHED_PER_SIZE_RESERVE=2 (C818): =1, and the shared scheduler planned over the whole memory again
+    // whenever it re-plans. Its start plan is made over the whole memory (sched_reserve), so a growing context fits it;
+    // but a graph whose nodes land on other cards than in that plan's graph (the MTP draft's catch-up reads the hidden
+    // rows on the draft's card, the reserve graph takes them from the host) is planned from the graph in hand, sized for
+    // the context of the moment, and from then on the shared scheduler re-plans as the context grows (R130: 18 times in
+    // FN84's prompts, after that one change of cards). With it, a pass whose allocation re-planned the shared scheduler
+    // plans it again from that batch's graph over the whole memory (sched_shared_plan) and builds and allocates its own
+    // graph again, before anything is computed
+    bool sched_shared_whole = false;
+    int32_t sched_shared_replans = 0; // the shared scheduler's re-plans, for any reason (sched_graph_realloc)
+    int32_t sched_shared_plans   = 0; // and its plans over the whole memory (sched_shared_plan)
+    bool sched_shared_plan(const llama_ubatch & ubatch, llm_graph_type gtype);
+
+    // env: LLAMA_SCHED_TEST_REPLAN=1 (C818, a test): once per context, the first pass of more than 8 tokens that builds
+    // a graph in the shared scheduler first plans it from that graph over the memory as it is, which is what a change of
+    // cards does on a machine with several devices (a CPU has one buffer type, so its cards never change). Nothing
+    // computed changes
+    bool sched_test_replan = false;
 
     // env: LLAMA_MTP_GRAPH_KEEP=1 (C619), an MTP context only: schedulers per size, keyed also by the head's shortlist
     // and the hidden-row carry (gf_res_key), and a per-size scheduler waits only for its own graph in flight

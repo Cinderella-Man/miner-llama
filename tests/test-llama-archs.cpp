@@ -191,7 +191,7 @@ static void usage(char ** argv) {
     LOG("  --kv-seq-rm              Check that LLAMA_KV_SEQ_RM_BOUND leaves every memory as it is over random sequence edits (CPU only)\n");
     LOG("  --kv-seq-rm-time         Time one seq_rm call without and with LLAMA_KV_SEQ_RM_BOUND at 65,536 cells (CPU only)\n");
     LOG("  --mtp-graph-keep         Check that LLAMA_MTP_GRAPH_KEEP leaves the MTP draft's caches and drafts as they are and builds fewer graphs (CPU only)\n");
-    LOG("  --mtp-replan             Check that LLAMA_SCHED_PER_SIZE_RESERVE plans the MTP draft's per-size schedulers once, so a growing context never re-plans them (CPU only)\n");
+    LOG("  --mtp-replan             Check that LLAMA_SCHED_PER_SIZE_RESERVE plans the MTP draft's per-size schedulers once (=1), and its shared scheduler over the whole memory again after a re-plan (=2), so a growing context never re-plans them (CPU only)\n");
     LOG("  --verify-prepare         Check that a decode prepared before its last token id (llama_decode_prepare, C738) gives the plain decode's results\n");
     LOG("  --mtp-h-dev              Check that LLAMA_MTP_H_DEV's host and device rows give the MTP draft the same caches and drafts (CPU only)\n");
     LOG("  --mtp-incall-overlap     Check that checkpoints inside a call (C217) give the MTP draft's parts and drafts of separate calls,\n");
@@ -4636,7 +4636,14 @@ static int test_mtp_graph_keep(const std::string & arch_filter, const size_t see
 // (LLAMA_SCHED_PER_SIZE_RESERVE=1, plan). The allocator's trace (LLAMA_UBATCH_TRACE=1) logs a line for every graph that
 // does not fit its scheduler's plan ("galloc-trigger"), before that evaluation's own trace line ("ubatch-trace: mtp" for
 // the draft, "dec" for the target). plan must re-plan the draft 0 times, keep more than 0 times (the control: the run
-// does outgrow plans made on the way), and all three must give the same drafts, probabilities and draft states
+// does outgrow plans made on the way), and all three must give the same drafts, probabilities and draft states.
+// C818 adds three arms for the shared scheduler's plan after a change of cards, which a CPU never makes: the draft's
+// first pass of more than 8 tokens plans the shared scheduler from that graph over the memory as it is
+// (LLAMA_SCHED_TEST_REPLAN=1), as the rig's first catch-up does when the hidden rows move from the host to the draft's
+// card (R130). plan+cards (LLAMA_SCHED_PER_SIZE_RESERVE=1) must then re-plan the shared scheduler as the context grows
+// (the control); whole+cards (=2) exactly once, at the first graph that outgrows that plan (on a rig: the change of
+// cards itself), followed in the same pass by one plan over the whole memory (sched_shared_plan), and never again;
+// whole (=2 alone) 0 times and with no such plan. All six arms must give the same drafts, probabilities and states
 struct mtp_replan_config {
     const char * name;
     ggml_type    type_kv;
@@ -4655,6 +4662,10 @@ struct mtp_replan_run {
     int    grow          = 0; // the draft's compute buffer growths at evaluations, the context's own reserves left out
     int    plans         = 0; // the per-size schedulers planned over the whole memory (sched_small_plan)
     int    evals         = 0; // the draft's evaluations
+    int    replan_shared = 0; // the draft's re-plans in passes of more than 8 tokens (the shared scheduler's)
+    int    shared_plans  = 0; // C818: the shared scheduler planned over the whole memory (sched_shared_plan)
+    int    test_plans    = 0; // C818: the shared scheduler planned from a graph in hand (LLAMA_SCHED_TEST_REPLAN)
+    int    replan_again  = 0; // C818: a graph that needed a new plan after its pass's plan over the whole memory
     bool   short_on      = false;
     size_t compute       = 0; // the draft context's compute buffers at the end, bytes
     std::string first;        // the first re-plan's reason
@@ -4664,6 +4675,7 @@ static struct {
     bool          on       = false;
     bool          steps    = false;
     bool          reserve  = false; // in a reserve of the shared scheduler (a sampler set, a memory update)
+    bool          whole    = false; // C818: a plan over the whole memory in this evaluation, before its graph's allocation
     int           pending  = 0;
     int           pend_grw = 0;
     std::string   pend_why;
@@ -4676,6 +4688,8 @@ static void mtp_replan_log(const char * text) {
         return;
     }
     if (strncmp(text, "galloc-trigger: ", 16) == 0) {
+        // after this evaluation's plan over the whole memory, its graph should fit
+        g.run->replan_again += g.whole ? 1 : 0;
         if (g.pending++ == 0) {
             g.pend_why = text + 16;
             while (!g.pend_why.empty() && g.pend_why.back() == '\n') {
@@ -4690,10 +4704,19 @@ static void mtp_replan_log(const char * text) {
     } else if (strstr(text, "sched_small_plan: ") != nullptr) {
         g.run->plans++;
         g.pend_grw = 0; // the plan's own buffer
+    } else if (strstr(text, "sched_shared_plan: ") != nullptr) {
+        g.run->shared_plans++;
+        g.pend_grw = 0; // the plan's own buffer, and the growth of the re-plan it follows
+        g.whole    = true;
+    } else if (strstr(text, "LLAMA_SCHED_TEST_REPLAN: the shared scheduler planned") != nullptr) {
+        g.run->test_plans++;
+        g.pend_grw = 0;
     } else if (strncmp(text, "ubatch-trace: mtp ", 18) == 0) {
         g.run->evals++;
         if (g.pending > 0) {
             (g.steps ? g.run->replan_steps : g.run->replan_prompt)++;
+            const char * nt = strstr(text, "n_tokens = ");
+            g.run->replan_shared += nt != nullptr && atoi(nt + 11) > 8 ? 1 : 0;
             if (g.run->first.empty()) {
                 g.run->first = g.pend_why;
             }
@@ -4702,22 +4725,26 @@ static void mtp_replan_log(const char * text) {
         g.pending = 0;
         g.pend_grw = 0;
         g.reserve = false;
+        g.whole = false;
     } else if (strncmp(text, "ubatch-trace: ", 14) == 0) {
         g.run->replan_tgt += g.pending > 0;
         g.pending = 0;
         g.pend_grw = 0;
         g.reserve = false;
+        g.whole = false;
     }
 }
 
 // turns of new tokens, each in the server's calls of up to n_batch tokens (the last one with an output), each followed
-// by 10 speculative steps as in mtp_keep_sequence (catch-ups of every width from 1 to 4)
+// by 10 speculative steps as in mtp_keep_sequence (catch-ups of every width from 1 to 4). Arms: 0 base, 1 keep, 2 plan,
+// 3 plan+cards, 4 whole+cards, 5 whole (C818's three: LLAMA_SCHED_TEST_REPLAN=1 for the draft context in 3 and 4,
+// LLAMA_SCHED_PER_SIZE_RESERVE=2 in 4 and 5)
 static mtp_replan_run mtp_replan_sequence(
         llama_model * model, const std::vector<llama_token> & tokens, const mtp_replan_config & cfg, const int arm) {
     static const char * names[] = { "LLAMA_MTP_GRAPH_KEEP", "LLAMA_SCHED_PER_SIZE_RESERVE", "LLAMA_DRAFT_SHORTLIST",
-        "LLAMA_QSA_KPOOL_DEV", "LLAMA_QSA_INDEXER_ROWS" };
+        "LLAMA_QSA_KPOOL_DEV", "LLAMA_QSA_INDEXER_ROWS", "LLAMA_SCHED_TEST_REPLAN" };
     test_setenv(names[0], arm >= 1 ? "1" : nullptr);
-    test_setenv(names[1], arm >= 2 ? "1" : nullptr);
+    test_setenv(names[1], arm >= 4 ? "2" : arm >= 2 ? "1" : nullptr);
     test_setenv(names[2], cfg.shortlist);
     test_setenv(names[3], cfg.kpool);
     test_setenv(names[4], cfg.kpool);
@@ -4755,7 +4782,10 @@ static mtp_replan_run mtp_replan_sequence(
     g_mtp_replan.pend_grw = 0;
 
     llama_context_ptr lctx_tgt(llama_init_from_model(model, ctx_params_for(false)));
+    // the draft context alone plans its shared scheduler from a graph in hand (read when the context is made)
+    test_setenv(names[5], arm == 3 || arm == 4 ? "1" : nullptr);
     llama_context_ptr lctx_dft(llama_init_from_model(model, ctx_params_for(true)));
+    test_setenv(names[5], nullptr);
     if (!lctx_tgt || !lctx_dft) {
         unset();
         g_mtp_replan.run = nullptr;
@@ -4946,8 +4976,10 @@ static int test_mtp_replan(const std::string & arch_filter, const size_t seed, c
     size_t n_tests  = 0;
     size_t n_failed = 0;
     common_log_flush(common_log_main());
-    LOG("|%10s|%16s|%9s|%9s|%5s|%22s|%22s|%22s|%14s|%8s|%17s|%s\n", "Model arch.", "Config", "Drafts", "End", "Short",
-            "Re-plans base p/s/t", "Re-plans keep p/s/t", "Re-plans plan p/s/t", "Growths b/k/p", "Plans", "Compute KiB k/p", "Status");
+    LOG("|%10s|%16s|%9s|%9s|%5s|%22s|%22s|%22s|%14s|%8s|%17s|%22s|%22s|%22s|%14s|%14s|%s\n", "Model arch.", "Config", "Drafts",
+            "End", "Short", "Re-plans base p/s/t", "Re-plans keep p/s/t", "Re-plans plan p/s/t", "Growths b/k/p", "Plans",
+            "Compute KiB k/p", "Re-plans p+c p/s/t", "Re-plans w+c p/s/t", "Re-plans whole p/s/t", "Whole p+c/w+c/w",
+            "Growths c/wc/w", "Status");
 
     // a context of 2,048 cells, which the run fills past 256-cell steps
     test_setenv("LLAMA_ARCHS_N_CTX", "2048");
@@ -4984,11 +5016,17 @@ static int test_mtp_replan(const std::string & arch_filter, const size_t seed, c
                 mtp_replan_run base;
                 mtp_replan_run keep;
                 mtp_replan_run plan;
+                mtp_replan_run pcard; // C818: plan+cards
+                mtp_replan_run wcard; // C818: whole+cards
+                mtp_replan_run whole; // C818: whole
                 {
                     log_pause pause;
-                    base = mtp_replan_sequence(model.get(), tokens, cfg, 0);
-                    keep = mtp_replan_sequence(model.get(), tokens, cfg, 1);
-                    plan = mtp_replan_sequence(model.get(), tokens, cfg, 2);
+                    base  = mtp_replan_sequence(model.get(), tokens, cfg, 0);
+                    keep  = mtp_replan_sequence(model.get(), tokens, cfg, 1);
+                    plan  = mtp_replan_sequence(model.get(), tokens, cfg, 2);
+                    pcard = mtp_replan_sequence(model.get(), tokens, cfg, 3);
+                    wcard = mtp_replan_sequence(model.get(), tokens, cfg, 4);
+                    whole = mtp_replan_sequence(model.get(), tokens, cfg, 5);
                 }
 
                 auto same_drafts = [](const mtp_replan_run & a, const mtp_replan_run & b) {
@@ -4998,24 +5036,44 @@ static int test_mtp_replan(const std::string & arch_filter, const size_t seed, c
                 auto same_end = [](const mtp_replan_run & a, const mtp_replan_run & b) {
                     return !a.state_end.empty() && a.state_end == b.state_end && a.spec_end == b.spec_end;
                 };
-                const bool same_all = same_drafts(base, keep) && same_drafts(base, plan);
-                const bool end_ok   = same_end(base, keep) && same_end(base, plan);
-                const bool traced   = base.evals > 0 && base.evals == keep.evals && keep.evals == plan.evals;
+                const mtp_replan_run * arms[] = { &keep, &plan, &pcard, &wcard, &whole };
+                bool same_all = true;
+                bool end_ok   = true;
+                bool traced   = base.evals > 0;
+                bool short_ok = true;
+                for (const mtp_replan_run * r : arms) {
+                    same_all = same_all && same_drafts(base, *r);
+                    end_ok   = end_ok   && same_end(base, *r);
+                    traced   = traced   && r->evals == base.evals;
+                    short_ok = short_ok && (cfg.shortlist == nullptr || r->short_on);
+                }
+                short_ok = short_ok && (cfg.shortlist == nullptr || base.short_on);
                 const bool control  = keep.replan_prompt + keep.replan_steps > 0;
                 const bool zero     = plan.replan_prompt + plan.replan_steps == 0 && plan.grow == 0;
-                const bool short_ok = cfg.shortlist == nullptr || (base.short_on && keep.short_on && plan.short_on);
+                // C818: the plan from a graph in hand is outgrown with =1 (the control); with =2 the one re-plan it leads to
+                // is followed by one plan over the whole memory and nothing more; =2 alone changes nothing on a CPU
+                const bool c818_ctl = pcard.test_plans == 1 && pcard.replan_shared > 0 && pcard.shared_plans == 0;
+                const bool c818_one = wcard.test_plans == 1 && wcard.replan_shared == 1 && wcard.shared_plans == 1 &&
+                    wcard.replan_prompt + wcard.replan_steps == 1 && wcard.replan_again == 0 && wcard.grow == 0;
+                const bool c818_off = whole.test_plans == 0 && whole.shared_plans == 0 &&
+                    whole.replan_prompt + whole.replan_steps == 0 && whole.grow == 0;
 
-                char rb[48], rk[48], rp[48], cp[48], pl[16], gr[48];
+                char rb[48], rk[48], rp[48], cp[48], pl[16], gr[48], rc[48], rw[48], rh[48], sh[48], gc[48];
                 snprintf(gr, sizeof(gr), "%d/%d/%d", base.grow, keep.grow, plan.grow);
                 snprintf(rb, sizeof(rb), "%d/%d/%d", base.replan_prompt, base.replan_steps, base.replan_tgt);
                 snprintf(rk, sizeof(rk), "%d/%d/%d", keep.replan_prompt, keep.replan_steps, keep.replan_tgt);
                 snprintf(rp, sizeof(rp), "%d/%d/%d", plan.replan_prompt, plan.replan_steps, plan.replan_tgt);
                 snprintf(cp, sizeof(cp), "%zu/%zu", keep.compute/1024, plan.compute/1024);
                 snprintf(pl, sizeof(pl), "%d", plan.plans);
-                LOG("%9s|%9s|%5s|%22s|%22s|%22s|%14s|%8s|%17s|", same_all ? "identical" : "DIFFERENT", end_ok ? "identical" : "DIFFERENT",
-                        plan.short_on ? "on" : "off", rb, rk, rp, gr, pl, cp);
+                snprintf(rc, sizeof(rc), "%d/%d/%d", pcard.replan_prompt, pcard.replan_steps, pcard.replan_tgt);
+                snprintf(rw, sizeof(rw), "%d/%d/%d", wcard.replan_prompt, wcard.replan_steps, wcard.replan_tgt);
+                snprintf(rh, sizeof(rh), "%d/%d/%d", whole.replan_prompt, whole.replan_steps, whole.replan_tgt);
+                snprintf(sh, sizeof(sh), "%d/%d/%d", pcard.shared_plans, wcard.shared_plans, whole.shared_plans);
+                snprintf(gc, sizeof(gc), "%d/%d/%d", pcard.grow, wcard.grow, whole.grow);
+                LOG("%9s|%9s|%5s|%22s|%22s|%22s|%14s|%8s|%17s|%22s|%22s|%22s|%14s|%14s|", same_all ? "identical" : "DIFFERENT",
+                        end_ok ? "identical" : "DIFFERENT", plan.short_on ? "on" : "off", rb, rk, rp, gr, pl, cp, rc, rw, rh, sh, gc);
 
-                if (same_all && end_ok && traced && control && zero && short_ok) {
+                if (same_all && end_ok && traced && control && zero && short_ok && c818_ctl && c818_one && c818_off) {
                     status = "\033[1;32mOK\033[0m";
                 } else {
                     n_failed++;
@@ -5026,6 +5084,17 @@ static int test_mtp_replan(const std::string & arch_filter, const size_t seed, c
                         status += " (the control: the per-size schedulers never needed a new plan)";
                     } else if (!zero) {
                         status += " (re-planned: " + plan.first + ", " + std::to_string(plan.grow) + " buffer growths)";
+                    } else if (!c818_ctl) {
+                        status += " (C818's control: plan+cards made " + std::to_string(pcard.test_plans) + " test plans, " +
+                            std::to_string(pcard.replan_shared) + " shared re-plans, " + std::to_string(pcard.shared_plans) + " whole plans)";
+                    } else if (!c818_one) {
+                        status += " (whole+cards: " + std::to_string(wcard.test_plans) + " test plans, " +
+                            std::to_string(wcard.replan_shared) + " shared re-plans, " + std::to_string(wcard.shared_plans) +
+                            " whole plans, " + std::to_string(wcard.replan_again) + " re-plans after one, " +
+                            std::to_string(wcard.grow) + " buffer growths; first: " + wcard.first + ")";
+                    } else if (!c818_off) {
+                        status += " (whole: " + std::to_string(whole.shared_plans) + " whole plans, " +
+                            std::to_string(whole.replan_prompt + whole.replan_steps) + " re-plans, " + std::to_string(whole.grow) + " buffer growths)";
                     } else if (!short_ok) {
                         status += " (the shortlist did not start)";
                     }
