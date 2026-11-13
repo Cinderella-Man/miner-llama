@@ -15,8 +15,9 @@
 // GGML_CUDA_MMVQ_PASCAL_KCOL: 0 off; 1 (default) 2 to 8 columns, and 1 column for Q3_K and IQ4_NL (which have no other
 // Pascal kernel) and for Q8_0 rows whose 64-weight chunks aren't a multiple of 4 (the one-token kernel loads those 32
 // bits at a time); 2 every product of 1 to 8 columns of these types. GGML_CUDA_MMVQ_PASCAL_KCOL_SKIP=q4_K,q6_K: types
-// left to the other kernels at 1 to 4 columns (C828: the Pascal kernels' range; at 5 to 8 these kernels keep them).
-// GGML_CUDA_MMVQ_PASCAL_KCOL_R=1|2 rows per lane group, _KCOL_ITT=n iterations per activation tile, _KCOL_SMEM=bytes of shared memory per block (at most 49152), _KCOL_NSM=n the SM count and _KCOL_SMSM=bytes the
+// left to the other kernels at 1 to 4 columns, the Pascal kernels' range (C828; at 5 to 8 these kernels keep them).
+// GGML_CUDA_MMVQ_PASCAL_KCOL_R=1|2 rows per lane group, _KCOL_ITT=n iterations per activation
+// tile, _KCOL_SMEM=bytes of shared memory per block (at most 49152), _KCOL_NSM=n the SM count and _KCOL_SMSM=bytes the
 // shared memory per SM the shape is chosen for (=5 and =98304: a P106's shapes on another card): launch shapes for
 // tuning. Any of R, ITT and SMEM selects the shape as before Q823 with those values (_KCOL_SMEM=49152:
 // the default before Q823); without them the shape follows kcol::pick_shape's defaults (Q823: a third of the SM's shared
