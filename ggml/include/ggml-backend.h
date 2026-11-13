@@ -364,6 +364,10 @@ extern "C" {
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
+    // The number of plans of the scheduler's graph allocator so far: each reserve, each re-plan after the backends
+    // changed or a graph outgrew the plan, and the allocator's own re-plan of a single-buffer graph
+    GGML_API int                  ggml_backend_sched_get_n_plans(ggml_backend_sched_t sched);
+
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 

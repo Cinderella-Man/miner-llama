@@ -790,15 +790,29 @@ llama_context::llama_context(
             }
         }
 
-        // LLAMA_SCHED_PER_SIZE_RESERVE=1 (C803): each per-size scheduler is planned once over the whole memory
+        // LLAMA_SCHED_PER_SIZE_RESERVE=1 (C803): each per-size scheduler is planned once over the whole memory; =2 (C818)
+        // also plans the shared scheduler over the whole memory again whenever it re-plans. Without per-size schedulers
+        // the shared scheduler takes every batch, and an MTP draft's would change cards twice a step (a drafting pass
+        // and a catch-up), each change then followed by a plan over the whole memory: so =2 needs them too
         const char * env_plan = getenv("LLAMA_SCHED_PER_SIZE_RESERVE");
         if (env_plan && atoi(env_plan) != 0) {
             if (!sched_per_size) {
-                LLAMA_LOG_WARN("%s: LLAMA_SCHED_PER_SIZE_RESERVE=1 needs per-size schedulers (LLAMA_MTP_GRAPH_KEEP=1 or LLAMA_SCHED_PER_SIZE=1), ignored\n", __func__);
+                LLAMA_LOG_WARN("%s: LLAMA_SCHED_PER_SIZE_RESERVE=%s needs per-size schedulers (LLAMA_MTP_GRAPH_KEEP=1 or LLAMA_SCHED_PER_SIZE=1), ignored\n",
+                        __func__, env_plan);
             } else {
                 sched_small_reserve = true;
-                LLAMA_LOG_INFO("%s: LLAMA_SCHED_PER_SIZE_RESERVE: each per-size scheduler is planned once, over the whole memory\n", __func__);
+                sched_shared_whole  = atoi(env_plan) == 2;
+                LLAMA_LOG_INFO("%s: LLAMA_SCHED_PER_SIZE_RESERVE: each per-size scheduler is planned once, over the whole memory%s\n", __func__,
+                        sched_shared_whole ? "; the shared scheduler is planned over the whole memory again whenever it re-plans (=2)" : "");
             }
+        }
+
+        // LLAMA_SCHED_TEST_REPLAN=1 (C818, a test): one plan of the shared scheduler from a graph in hand, as a change of
+        // cards makes it
+        const char * env_test_replan = getenv("LLAMA_SCHED_TEST_REPLAN");
+        sched_test_replan = env_test_replan && atoi(env_test_replan) != 0;
+        if (sched_test_replan) {
+            LLAMA_LOG_WARN("%s: LLAMA_SCHED_TEST_REPLAN: the first shared-scheduler pass of more than 8 tokens plans it from its own graph over the memory as it is (a test)\n", __func__);
         }
     }
 
@@ -3582,12 +3596,66 @@ llm_graph_result * llama_context::process_ubatch_graph(const llama_ubatch & ubat
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+
+        // the batch's graph built again, after a plan of the scheduler from another graph or from this one: a scheduler
+        // that splits a graph over several devices points its nodes at the input copies of that split, which the next
+        // split frees, so a graph is split once
+        auto rebuild = [&]() {
+            res->reset();
+            ggml_backend_sched_reset(sched_res());
+            ggml_backend_sched_set_eval_callback(sched_res(), cparams.cb_eval, cparams.cb_eval_user_data);
+            gf = model.build_graph(gparams);
+            return gf != nullptr;
+        };
+
+        // LLAMA_SCHED_TEST_REPLAN=1 (C818, a test): the shared scheduler planned from this graph over the memory as it is
+        if (!ss && sched_test_replan && ubatch.n_tokens > 8) {
+            sched_test_replan = false;
+            const int64_t t0 = ggml_time_us();
+            const bool    ok = ggml_backend_sched_reserve(sched_res(), gf);
+            LLAMA_LOG_INFO("%s: LLAMA_SCHED_TEST_REPLAN: the shared scheduler planned from this %u-token graph over the memory as it is%s, %.3f ms\n",
+                    __func__, ubatch.n_tokens, ok ? "" : " (failed)", (ggml_time_us() - t0)/1000.0);
+            if (!rebuild()) {
+                LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
         tt.build = trace ? ggml_time_us() : 0;
 
+        // the scheduler's plans before this allocation: a re-plan after a change of devices or a graph that outgrew the
+        // plan (ggml_backend_sched_alloc_splits), or the allocator's own re-plan of a single-buffer graph (a CPU)
+        const int n_plans = ggml_backend_sched_get_n_plans(sched_res());
         if (!ggml_backend_sched_alloc_graph(sched_res(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        // LLAMA_SCHED_PER_SIZE_RESERVE=2 (C818): this allocation re-planned the shared scheduler from this graph, sized for
+        // the memory as it is now: plan it from this batch's graph over the whole memory, then build and allocate the
+        // batch's graph again. Nothing has been computed and the re-plan has already waited for the devices
+        if (!ss && sched_shared_whole && ggml_backend_sched_get_n_plans(sched_res()) != n_plans) {
+            sched_shared_replans++;
+            ggml_backend_sched_reset(sched_res());
+            if (!sched_shared_plan(ubatch, gtype)) {
+                LLAMA_LOG_WARN("%s: LLAMA_SCHED_PER_SIZE_RESERVE=2: the shared scheduler could not be planned over the whole memory\n", __func__);
+            }
+            if (!rebuild()) {
+                LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            const int n_again = ggml_backend_sched_get_n_plans(sched_res());
+            if (!ggml_backend_sched_alloc_graph(sched_res(), gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+            if (ggml_backend_sched_get_n_plans(sched_res()) != n_again) {
+                LLAMA_LOG_WARN("%s: LLAMA_SCHED_PER_SIZE_RESERVE=2: the %u-token graph needed a new plan after the plan over the whole memory\n",
+                        __func__, ubatch.n_tokens);
+            }
         }
         tt.alloc = trace ? ggml_time_us() : 0;
 
@@ -6020,6 +6088,70 @@ bool llama_context::sched_small_plan(sched_small_entry & ss, const llama_ubatch 
             ubatch.n_tokens, n_outputs > 0 ? "with" : "without",
             gparams.cparams.head_short_n_plan > 0 ? ", the shortlist head's whole room" : "",
             n_nodes, (ggml_time_us() - t0)/1000.0);
+    return ok;
+}
+
+bool llama_context::sched_shared_plan(const llama_ubatch & ubatch, llm_graph_type gtype) {
+    // C818: the shared scheduler's start plan (sched_reserve) is made from the largest batch (n_ubatch tokens) over the
+    // whole memory, so every later graph fits it, as long as its nodes land on the same devices. A graph whose nodes land
+    // elsewhere (the MTP draft's catch-up reads its hidden rows on the draft's device, the reserve batch from the host)
+    // is planned from itself (ggml_backend_sched_alloc_splits), sized for its own tokens and the memory of the moment,
+    // and every later graph that outgrows that is planned again. This plans the shared scheduler as the start plan is
+    // (the same batch shape, over the whole memory: init_full, every pool of a QSA memory re-pooled), but with this
+    // batch's kind of input: its hidden rows read on the device when this batch reads them there. Reserved in the
+    // scheduler and never computed
+    if (memory == nullptr) {
+        return false;
+    }
+    const int64_t t0 = ggml_time_us();
+
+    llama_memory_context_ptr mctx_full = memory->init_full();
+    if (!mctx_full) {
+        return false;
+    }
+    if (!gf_res_plan) {
+        gf_res_plan.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+    }
+    auto * res = gf_res_plan.get();
+
+    // sched_reserve's prompt batch (graph_reserve)
+    const uint32_t n_seqs     = cparams.n_seq_max;
+    uint32_t       n_tok      = std::min(cparams.n_ctx, cparams.n_ubatch);
+    n_tok = ((n_tok + (n_seqs - 1)) / n_seqs) * n_seqs;
+    const uint32_t n_outs     = std::min(n_tok, cparams.n_outputs_max);
+    const bool     state_rows = ubatch.data && !ubatch.data->embd_state_row.empty();
+
+    llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
+    llama_ubatch ub = balloc.ubatch_reserve(n_tok/n_seqs, n_seqs);
+    ubatch_prepare_reserve(ub, n_outs, sampling.samplers, cparams.n_outputs_max_per_seq);
+    if (state_rows) {
+        ub.data->embd_state_row.assign(ub.n_tokens, 0);
+    }
+
+    const auto save_n_outputs = n_outputs;
+    n_outputs = n_outs;
+    auto gparams = graph_params(res, ub, mctx_full.get(), gtype);
+    n_outputs = save_n_outputs;
+    if (gparams.cparams.head_short_on && gparams.cparams.head_short && gparams.cparams.head_short->n_extra() > 0) {
+        gparams.cparams.head_short_n_plan = std::max<uint32_t>(gparams.cparams.head_short->m_cap, 1);
+    }
+    gparams.sched = sched.get();
+
+    res->reset();
+    ggml_cgraph * gf = model.build_graph(gparams);
+    if (gf == nullptr) {
+        return false;
+    }
+    const int  n_nodes = ggml_graph_n_nodes(gf);
+    const bool ok      = ggml_backend_sched_reserve(sched.get(), gf);
+    // the graph refers to the whole memory's context, which goes now: nothing may reuse it
+    res->reset();
+    sched_shared_plans++;
+
+    LLAMA_LOG_INFO("%s: the shared scheduler planned over the whole memory for a %u-token batch (%u outputs%s%s), after a %u-token batch's re-plan: %d nodes, %.3f ms, plan %d after %d re-plans\n",
+            __func__, ub.n_tokens, n_outs, state_rows ? ", hidden rows on the device" : "",
+            gparams.cparams.head_short_n_plan > 0 ? ", the shortlist head's whole room" : "",
+            ubatch.n_tokens, n_nodes, (ggml_time_us() - t0)/1000.0, sched_shared_plans, sched_shared_replans);
     return ok;
 }
 
