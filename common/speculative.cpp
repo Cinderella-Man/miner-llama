@@ -427,6 +427,23 @@ bool common_spec_adapt_keeps_next(const common_spec_adapt_online & a, const std:
     return w.n_fail == 0 && w.len_next == (int32_t) p.size() + 1 && w.gain > w.thr;
 }
 
+// C820. With x the next token's probability (clamped to [0, 1]): the tests at lengths up to p.size() read only p; the
+// test at p.size() + 1, if it is an allowed length, adds pp * x to a fixed sum; a passing test leaves S as it was (S
+// fixed or run), so the next allowed length's threshold is fixed and its bound adds multiples of pp * x; past p.size() +
+// 1 the bound adds pp * x for each position. Rounded products and sums are monotone, so continue is non-decreasing in x
+// and false at x = 1 means false at every x
+bool common_spec_adapt_stops_next(const common_spec_adapt_online & a, const std::vector<float> & p) {
+    if (a.params == nullptr || a.lengths == nullptr || a.params->online <= 0 ||
+            a.params->s_mode == common_spec_adapt_params::S_STEP) {
+        return false;
+    }
+    std::vector<float> q;
+    q.reserve(p.size() + 1);
+    q.assign(p.begin(), p.end());
+    q.push_back(1.0f);
+    return !common_spec_adapt_continue(a, q);
+}
+
 void common_spec_adapt_state::init(const common_spec_adapt_params & params) {
     tok  = params.s0;
     cost = common_spec_adapt_cost(params, 1);
@@ -2092,11 +2109,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> chain_h;
 
     // a step's last drafting pass copies no hidden row to the host (LLAMA_MTP_SKIP_LAST_ROW, C742), and the draft
-    // context's copies to the host and copies left out since the start
+    // context's copies to the host and copies left out since the start. C820: =2 also when the pass ends every drafting
+    // sequence below n_max (the slot's cap, where LLAMA_SPEC_ADAPT_ONLINE's rule stops whatever the pass samples);
+    // h_skip_short counts the passes =2 left out that =1 copies, h_skip_rule those of them the rule's look-ahead settled
     bool     last_row_on     = false;
+    int      last_row_mode   = 0;
     uint64_t last_row_drafts = 0;
     uint64_t h_host_n        = 0;
     uint64_t h_skip_n        = 0;
+    uint64_t h_skip_short    = 0;
+    uint64_t h_skip_rule     = 0;
 
     // the draft head over a shortlist of tokens (LLAMA_DRAFT_SHORTLIST, Q592) and when each sequence falls back to the
     // full head
@@ -2301,19 +2323,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     // LLAMA_MTP_SKIP_LAST_ROW=1: the drafting pass after which every drafting sequence stops at n_max copies no hidden
-    // row to the host, since no later pass reads it (a p_min cut is known only after the pass: those passes copy theirs)
+    // row to the host, since no later pass reads it (a p_min cut is known only after the pass: those passes copy theirs).
+    // =2 (C820): the drafting pass after which every drafting sequence stops at a length known before the pass, at any
+    // length: n_max, the slot's cap (C744's n_stop) or the last length the rule taken while drafting can keep (C815's
+    // n_last). A stop the rule decides from the pass's own token (common_spec_adapt_continue) is known only after it
     void last_row_init() {
         const char * s = getenv("LLAMA_MTP_SKIP_LAST_ROW");
-        if (s == nullptr || atoi(s) == 0) {
+        if (s == nullptr || atoi(s) <= 0) {
             return;
         }
-        last_row_on = true;
-        SPC_INF("%s", "draft hidden rows: a step's last drafting pass copies none to the host\n");
+        last_row_on   = true;
+        last_row_mode = atoi(s) >= 2 ? 2 : 1;
+        SPC_INF("%s", last_row_mode == 2 ?
+                "draft hidden rows: a step's last drafting pass copies none to the host, at any draft length\n" :
+                "draft hidden rows: a step's last drafting pass copies none to the host\n");
     }
 
     void last_row_report() const {
         SPC_INF("draft hidden rows to the host: %" PRIu64 " copied, %" PRIu64 " left out (the last pass) in %" PRIu64 " drafts\n",
                 h_host_n, h_skip_n, last_row_drafts);
+        if (last_row_mode == 2) {
+            SPC_WRN("C820: %" PRIu64 " drafting steps, %" PRIu64 " hidden rows copied to the host, %" PRIu64
+                    " left out, %" PRIu64 " of them below n_max, %" PRIu64 " of those by the rule's look-ahead\n",
+                    last_row_drafts, h_host_n, h_skip_n, h_skip_short, h_skip_rule);
+        }
     }
 
     // LLAMA_DRAFT_H_CARRY=1: each drafting pass after a step's first reads its h from the previous pass's output on the
@@ -2894,6 +2927,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         int i = 0;
 
+        // C820: this pass asked to leave its rows on the device below n_max, and the context's count of rows left out
+        bool     skip_short      = false;
+        bool     skip_short_rule = false; // a sequence's stop there was the rule's look-ahead
+        uint64_t skip_short0     = 0;
+
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
             // KV is per layer. process() filled this layer's KV only for positions < pos0
@@ -2916,14 +2954,40 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_carry(ctx_dft, i > 0, true);
             }
 
-            // C742: after this pass every drafting sequence has n_max tokens, so no pass reads its hidden rows
+            // C742: after this pass every drafting sequence has n_max tokens, so no pass reads its hidden rows. C820 (=2):
+            // or every drafting sequence stops after it whatever the pass samples: at its n_stop, or under the rule taken
+            // while drafting at its n_last or where the rule stops after any next token (common_spec_adapt_stops_next)
             if (last_row_on) {
-                bool last = true;
+                bool last     = true;
+                bool last_max = true;
+                bool by_rule  = false;
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                    last = last && (!drafting[seq_id] || (int) dparams[seq_id].result->size() + 1 >= params.n_max);
+                    if (!drafting[seq_id]) {
+                        continue;
+                    }
+                    const auto & dp = dparams[seq_id];
+                    const int n_next = (int) dp.result->size() + 1;
+                    last_max = last_max && n_next >= params.n_max;
+                    if (last_row_mode != 2 || !last) {
+                        continue;
+                    }
+                    if (n_next >= n_stop[seq_id] || (online[seq_id] && n_next >= n_last[seq_id])) {
+                        continue;
+                    }
+                    if (online[seq_id] && common_spec_adapt_stops_next(*dp.adapt, *dp.result_p)) {
+                        by_rule = true;
+                        continue;
+                    }
+                    last = false;
                 }
-                if (last) {
+                if (last_max || (last_row_mode == 2 && last)) {
                     llama_skip_embeddings_nextn_next(ctx_dft);
+                    if (!last_max) {
+                        uint64_t n_copied = 0;
+                        llama_embeddings_nextn_host_stats(ctx_dft, &n_copied, &skip_short0);
+                        skip_short      = true;
+                        skip_short_rule = by_rule;
+                    }
                 }
             }
 
@@ -2934,6 +2998,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 break;
             }
             llama_step_trace_mark("mtp.dp.ret");
+
+            // C820: a pass below n_max that left its rows on the device (none when the rows never go to the host)
+            if (skip_short) {
+                uint64_t n_copied  = 0;
+                uint64_t n_skipped = 0;
+                llama_embeddings_nextn_host_stats(ctx_dft, &n_copied, &n_skipped);
+                h_skip_short += n_skipped > skip_short0 ? 1 : 0;
+                h_skip_rule  += n_skipped > skip_short0 && skip_short_rule ? 1 : 0;
+                skip_short = false;
+            }
 
             // C738: this pass is the last and adds one token to every drafting sequence (no p_min cut can stop one, and
             // n_min keeps the draft): its caller may prepare the verify pass while it runs. C815: under the rule taken
