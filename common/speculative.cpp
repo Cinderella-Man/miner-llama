@@ -11,7 +11,7 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
-#include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+#include "../src/llama-ext.h" // the fork's staging API: the h_nextn halves (C703), the head shortlist, the carry, ...
 
 #include <algorithm>
 #include <cassert>
@@ -2265,9 +2265,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (overlap_want) {
                 llama_set_embeddings_nextn_dev_halves(ctx_tgt, 2);
             }
-            dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_embd_state_src(ctx_dft, ctx_tgt);
+            dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_ctx_state_src(ctx_dft, ctx_tgt);
             if (!dev_rows) {
-                llama_set_embd_state_src(ctx_dft, nullptr);
+                llama_set_ctx_state_src(ctx_dft, nullptr);
                 llama_set_embeddings_nextn_dev(ctx_tgt, false);
                 llama_set_embeddings_nextn_dev_halves(ctx_tgt, 1);
             }
@@ -2530,7 +2530,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         auto * ctx_dft = this->params.ctx_dft;
         if (dev_rows) {
-            llama_set_embd_state_src(ctx_dft, nullptr);
+            llama_set_ctx_state_src(ctx_dft, nullptr);
             llama_set_embeddings_nextn_dev(this->params.ctx_tgt, false);
             llama_set_embeddings_nextn_dev_halves(this->params.ctx_tgt, 1);
         }

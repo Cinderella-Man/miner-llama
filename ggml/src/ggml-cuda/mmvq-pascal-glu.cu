@@ -1063,7 +1063,7 @@ bool ggml_cuda_mmvq_pascal_glu_mt(ggml_backend_cuda_context & ctx, const ggml_te
         const int64_t s11 = src1->nb[1] / sizeof(float);
         const int64_t s12 = src1->nb[2] / sizeof(float);
         const int64_t s13 = src1->nb[3] / sizeof(float);
-        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), wg->type, K, s11, s12, s13,
+        quantize_row_q8_1_cuda((const float *) src1->data, src1_q8_1.get(), K, s11, s12, s13,
                                ne10_padded, ncols, 1, 1, stream);
     }
 

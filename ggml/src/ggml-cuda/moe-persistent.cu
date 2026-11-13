@@ -1065,7 +1065,7 @@ void ggml_cuda_op_moe_persistent(ggml_backend_cuda_context & ctx, const ggml_cud
     a.buf         = (char *) st.buf;
     a.err         = st.err_dev;
     if (L.router->type == GGML_TYPE_F16) {
-        const bool hacc = fast_fp16_available(ggml_cuda_info().devices[ctx.device].cc) && L.router_prec == GGML_PREC_DEFAULT;
+        const bool hacc = fast_fp16_available(ggml_cuda_info().devices[ctx.device].cc) && L.router_prec == GGML_PREC_UNDEFINED;
         // the per-op path takes the Pascal F16 product wherever it applies (mmvf.cu), so the router follows it
         const bool pascal = ggml_cuda_mmvf_pascal_f16_applies(L.router->data, H, L.router->nb[1] / sizeof(half));
         a.router_type = pascal ? MOEP_ROUTER_F16_PASCAL : hacc ? MOEP_ROUTER_F16_HACC : MOEP_ROUTER_F16;
