@@ -2,6 +2,7 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+#include "mmvf-f32-rows.h"
 #include "mmvf-pascal.cuh"
 #include "mmvq-pascal.cuh"
 #include "mmf.cuh"
@@ -827,19 +828,24 @@ void ggml_cuda_op_mul_mat_vec_f(
 // router (2560 -> 512) took 4.07 ms a four-token verify pass on mul_mat_vec_f against 2.41 on cuBLAS, while the shared
 // expert's gate (2560 -> 1) took 0.29 against 0.61 (R120b). 32 rows of a 2560-wide row are at most two rounds of
 // blocks on the P106-090's 5 SMs at 4-8 tokens (four or five 256-thread blocks an SM).
+// C822 (Q1436): _ROWS=auto, or a list of limits from 4 tokens on, sets a limit per token count (mmvf-f32-rows.h): on a
+// P106-090 cuBLAS is about three times faster at 4 tokens than at 5-8, so mul_mat_vec_f stops gaining at fewer rows
+// there (R132). A single number keeps C807's meaning; the default stays 32.
+static_assert(GGML_CUDA_MMVF_F32_ROWS_MAX_TOKENS == MMVF_MAX_BATCH_SIZE, "the row limits cover the switch's token counts");
+
 static int mmvf_env_int(const char * name, const int def) {
     const char * env = getenv(name);
     return env ? atoi(env) : def;
 }
 
 bool ggml_cuda_mul_mat_vec_f_f32_mt(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    static const int mode     = mmvf_env_int("GGML_CUDA_MMVF_F32_MT", 0);
-    static const int fault    = mmvf_env_int("GGML_CUDA_MMVF_F32_MT_FAULT", 0);
-    static const int max_rows = mmvf_env_int("GGML_CUDA_MMVF_F32_MT_ROWS", 32);
+    static const int mode  = mmvf_env_int("GGML_CUDA_MMVF_F32_MT", 0);
+    static const int fault = mmvf_env_int("GGML_CUDA_MMVF_F32_MT_FAULT", 0);
+    static const ggml_cuda_mmvf_f32_rows rows = ggml_cuda_mmvf_f32_rows_parse(getenv("GGML_CUDA_MMVF_F32_MT_ROWS"));
     if (mode == 0) {
         return false;
     }
-    if (max_rows > 0 && src0->ne[1] > max_rows) {
+    if (!ggml_cuda_mmvf_f32_rows_take(rows, src0->ne[1], src1->ne[1])) {
         return false;
     }
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
