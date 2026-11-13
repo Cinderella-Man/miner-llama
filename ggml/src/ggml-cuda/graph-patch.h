@@ -8,15 +8,120 @@
 // the groups near a changed node into a scratch capture, sets those CUDA nodes' parameters in the instantiated
 // executables (cudaGraphExecKernelNodeSetParams and its memset and memcpy forms) and replays them.
 //
-// The parts that need no GPU live here: which groups are re-dispatched, how a capture's chain of CUDA nodes is cut into
-// the groups that made it, and whether an evaluation is patched or captured in full. ggml-cuda.cu calls all three;
-// tests/test-cuda-graph-patch.cpp checks them on a CPU through a model of the capture, the patch and their fallbacks.
+// The parts that need no GPU live here: which nodes changed in structure (C826: by the kinds of their sources, not the
+// tensor objects), which groups are re-dispatched, how a capture's chain of CUDA nodes is cut into the groups that made
+// it, whether an evaluation is patched or captured in full, and which CUDA nodes are set (C826: a memset or memcpy whose
+// executable holds its new parameters is left as it is). ggml-cuda.cu calls them; tests/test-cuda-graph-patch.cpp
+// checks them on a CPU through a model of the capture, the patch and their fallbacks.
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
+
+// a node's sources (GGML_MAX_SRC, which ggml-cuda.cu checks) and, after them, its view source
+#define GGML_CUDA_GRAPH_PATCH_N_SRC 11
+
+// C826: what kind of tensor a node's source is. The structure check compares a node's op, type and flags and, for each
+// source and its view source, whether it is there and its kind; what a source holds (its data address, shape and
+// strides) is a property of the node, whose change re-dispatches the node's group. So the scheduler's rotating input
+// copies (separate tensors of one kind at other addresses) change a node's parameters, not its structure. C779 compared
+// the sources as tensor objects, and on a P106 705 of 768 captures fell back as structure changes (R136 part 1)
+struct ggml_cuda_graph_patch_src_kind {
+    int32_t      type   = -1; // -1: no source
+    int32_t      op     = 0;
+    int32_t      flags  = 0;
+    const void * buffer = nullptr;
+    const void * extra  = nullptr;
+};
+
+struct ggml_cuda_graph_patch_node_kind {
+    int32_t op    = 0;
+    int32_t type  = 0;
+    int32_t flags = 0;
+    ggml_cuda_graph_patch_src_kind src[GGML_CUDA_GRAPH_PATCH_N_SRC];
+};
+
+// what differs between two kinds of a node: FIELD_NONE when they are the same structure; else the field, and in src
+// the source it is in (-1: the node itself; GGML_CUDA_GRAPH_PATCH_N_SRC - 1: the view source)
+enum ggml_cuda_graph_patch_kind_field {
+    GGML_CUDA_GRAPH_PATCH_FIELD_NONE = 0,
+    GGML_CUDA_GRAPH_PATCH_FIELD_OP,
+    GGML_CUDA_GRAPH_PATCH_FIELD_TYPE,     // for a source: also one there and one not (type -1)
+    GGML_CUDA_GRAPH_PATCH_FIELD_FLAGS,
+    GGML_CUDA_GRAPH_PATCH_FIELD_BUFFER,
+    GGML_CUDA_GRAPH_PATCH_FIELD_EXTRA,
+};
+
+struct ggml_cuda_graph_patch_kind_diff {
+    int field = GGML_CUDA_GRAPH_PATCH_FIELD_NONE;
+    int src   = -1;
+};
+
+static inline ggml_cuda_graph_patch_kind_diff ggml_cuda_graph_patch_kind_compare(const ggml_cuda_graph_patch_node_kind & a,
+        const ggml_cuda_graph_patch_node_kind & b) {
+    ggml_cuda_graph_patch_kind_diff d;
+    if (a.op != b.op) {
+        d.field = GGML_CUDA_GRAPH_PATCH_FIELD_OP;
+    } else if (a.type != b.type) {
+        d.field = GGML_CUDA_GRAPH_PATCH_FIELD_TYPE;
+    } else if (a.flags != b.flags) {
+        d.field = GGML_CUDA_GRAPH_PATCH_FIELD_FLAGS;
+    }
+    for (int j = 0; d.field == GGML_CUDA_GRAPH_PATCH_FIELD_NONE && j < GGML_CUDA_GRAPH_PATCH_N_SRC; j++) {
+        const ggml_cuda_graph_patch_src_kind & x = a.src[j];
+        const ggml_cuda_graph_patch_src_kind & y = b.src[j];
+        d.src = j;
+        if (x.type != y.type) {
+            d.field = GGML_CUDA_GRAPH_PATCH_FIELD_TYPE;
+        } else if (x.type < 0) {
+            continue; // neither is there
+        } else if (x.op != y.op) {
+            d.field = GGML_CUDA_GRAPH_PATCH_FIELD_OP;
+        } else if (x.flags != y.flags) {
+            d.field = GGML_CUDA_GRAPH_PATCH_FIELD_FLAGS;
+        } else if (x.buffer != y.buffer) {
+            d.field = GGML_CUDA_GRAPH_PATCH_FIELD_BUFFER;
+        } else if (x.extra != y.extra) {
+            d.field = GGML_CUDA_GRAPH_PATCH_FIELD_EXTRA;
+        }
+    }
+    if (d.field == GGML_CUDA_GRAPH_PATCH_FIELD_NONE) {
+        d.src = -1;
+    }
+    return d;
+}
+
+static inline const char * ggml_cuda_graph_patch_field_name(const int f) {
+    switch (f) {
+        case GGML_CUDA_GRAPH_PATCH_FIELD_NONE:   return "none";
+        case GGML_CUDA_GRAPH_PATCH_FIELD_OP:     return "op";
+        case GGML_CUDA_GRAPH_PATCH_FIELD_TYPE:   return "type";
+        case GGML_CUDA_GRAPH_PATCH_FIELD_FLAGS:  return "flags";
+        case GGML_CUDA_GRAPH_PATCH_FIELD_BUFFER: return "buffer";
+        case GGML_CUDA_GRAPH_PATCH_FIELD_EXTRA:  return "extra";
+        default:                                 return "?";
+    }
+}
+
+// C826: how a CUDA node of a re-dispatched group reaches the scratch capture's parameters. A kernel is set in the
+// executable. A memset or memcpy is left as it is when its new parameters equal those the executable holds, which its
+// template node mirrors (every set of one in the executable is also made in the template); else it is set in both.
+// CUDA updates a memcpy in an executable only between 1-D operands, and a memset only in its address and value, so a
+// group dispatched again because a node near it changed would otherwise have its unchanged 2-D copies refused
+enum ggml_cuda_graph_patch_action {
+    GGML_CUDA_GRAPH_PATCH_SET_EXEC = 0, // a kernel: set in the executable
+    GGML_CUDA_GRAPH_PATCH_KEEP,         // a memset or memcpy whose parameters the executable holds already
+    GGML_CUDA_GRAPH_PATCH_SET_BOTH,     // a memset or memcpy with new parameters: set in the executable, then the template
+};
+
+static inline int ggml_cuda_graph_patch_action_for(const bool is_kernel, const bool same_as_held) {
+    if (is_kernel) {
+        return GGML_CUDA_GRAPH_PATCH_SET_EXEC;
+    }
+    return same_as_held ? GGML_CUDA_GRAPH_PATCH_KEEP : GGML_CUDA_GRAPH_PATCH_SET_BOTH;
+}
 
 // one dispatch of the evaluation loop, as the full capture recorded it
 struct ggml_cuda_graph_patch_group {
@@ -100,7 +205,7 @@ static inline bool ggml_cuda_graph_patch_ranges(const std::vector<Node> & chain,
 enum ggml_cuda_graph_patch_reason {
     GGML_CUDA_GRAPH_PATCH_NONE = 0,
     GGML_CUDA_GRAPH_PATCH_NOT_READY,   // no full capture of this graph recorded its groups since it last ran otherwise
-    GGML_CUDA_GRAPH_PATCH_STRUCTURE,   // the node count, or a node's op, type, flags or sources changed
+    GGML_CUDA_GRAPH_PATCH_STRUCTURE,   // the node count, or a node's op, type, flags or its sources' kinds changed
     GGML_CUDA_GRAPH_PATCH_SHARE,       // the groups to re-dispatch hold more than the limit's share of the nodes
     GGML_CUDA_GRAPH_PATCH_SKIP,        // a node the loop skipped would now run, or the reverse
     GGML_CUDA_GRAPH_PATCH_POOL,        // the pool's use before a group differs from the capture's

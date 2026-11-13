@@ -4,14 +4,19 @@
 // (ggml-cuda.cu) over long random runs of prompt micro-batches.
 //
 // The model: a graph of nodes with a fixed topology (ops) and properties that change from evaluation to evaluation as a
-// prompt's do (a few input readers rotate through four input copies, a few cache readers grow, now and then a node's
-// op changes, the node count changes or an evaluation runs eagerly). The dispatch loop fuses patterns of up to six
-// nodes, some of whose conditions read properties of the pattern's later nodes; a group makes one to three CUDA nodes
-// (kernels, sometimes a memset) whose parameters are a function of its nodes' properties, a count that may depend on a
-// property, and a pool use that one op holds into the next group. A full capture cuts the graph into chunks and records
-// each group; a patch follows ggml_cuda_graph_patch step by step. After every evaluation the executables must equal a
-// fresh capture of that evaluation's properties: a patch is only ever exact. A control with a window shorter than the
-// longest pattern must be caught making executables that differ.
+// prompt's do (a few input readers rotate through four input copies, each a separate tensor object holding its own
+// data, a few cache readers grow, now and then a node's op or a source's kind changes, a node is linked to another
+// source, the node count changes or an evaluation runs eagerly). The dispatch loop fuses patterns of up to six nodes,
+// some of whose conditions read properties of the pattern's later nodes or which tensor a node reads; a group makes one
+// to three CUDA nodes (kernels, sometimes a memset or a 2-D copy) whose parameters are a function of its nodes'
+// properties, a count that may depend on a property, and a pool use that one op holds into the next group. A full
+// capture cuts the graph into chunks and records each group; a patch follows ggml_cuda_graph_patch step by step: the
+// structure by the sources' kinds (C826), a memset or copy left as it is when the executable holds its new parameters
+// (its template node mirrors them), and an executable that refuses any update of a 2-D copy, as CUDA does. After every
+// evaluation the executables must equal a fresh capture of that evaluation's properties: a patch is only ever exact.
+// Controls: a window shorter than the longest pattern, and templates that keep the recording's parameters instead of
+// the executable's, must be caught making executables that differ; C779's structure check by tensor object must patch
+// fewer evaluations than the check by kind.
 // Usage: test-cuda-graph-patch   (exit status 0 when every check passes)
 
 #include "../ggml/src/ggml-cuda/graph-patch.h"
@@ -122,18 +127,86 @@ static void test_precheck() {
     }
 }
 
+// C826: the structure check by kind, and what is done with each CUDA node of a re-dispatched group
+static void test_kind() {
+    static int buf_a, buf_b, extra_a;
+    constexpr int VIEW = GGML_CUDA_GRAPH_PATCH_N_SRC - 1;
+    ggml_cuda_graph_patch_node_kind a;
+    a.op = 3; a.type = 1; a.flags = 4;
+    a.src[0] = { 0, 0, 3, &buf_a, nullptr };   // a rotating input copy: op NONE, input and output
+    a.src[1] = { 1, 21, 16, &buf_a, nullptr }; // another node of the graph
+    a.src[VIEW] = { 1, 0, 0, &buf_b, nullptr };
+    ggml_cuda_graph_patch_node_kind b = a;
+    auto same = [](const ggml_cuda_graph_patch_kind_diff & d) { return d.field == GGML_CUDA_GRAPH_PATCH_FIELD_NONE && d.src == -1; };
+    auto diff = [](const ggml_cuda_graph_patch_kind_diff & d, int f, int s) { return d.field == f && d.src == s; };
+
+    // the next copy is another tensor object of the same kind: the same structure (its address is a property)
+    CHECK(same(ggml_cuda_graph_patch_kind_compare(a, b)));
+    b.src[0].type = 2;
+    CHECK(diff(ggml_cuda_graph_patch_kind_compare(a, b), GGML_CUDA_GRAPH_PATCH_FIELD_TYPE, 0));
+    b = a; b.src[1].op = 22;
+    CHECK(diff(ggml_cuda_graph_patch_kind_compare(a, b), GGML_CUDA_GRAPH_PATCH_FIELD_OP, 1));
+    b = a; b.src[1].flags = 0;
+    CHECK(diff(ggml_cuda_graph_patch_kind_compare(a, b), GGML_CUDA_GRAPH_PATCH_FIELD_FLAGS, 1));
+    b = a; b.src[0].buffer = &buf_b;
+    CHECK(diff(ggml_cuda_graph_patch_kind_compare(a, b), GGML_CUDA_GRAPH_PATCH_FIELD_BUFFER, 0));
+    b = a; b.src[0].extra = &extra_a;
+    CHECK(diff(ggml_cuda_graph_patch_kind_compare(a, b), GGML_CUDA_GRAPH_PATCH_FIELD_EXTRA, 0));
+    // a source there in one and not the other
+    b = a; b.src[2] = { 0, 0, 0, &buf_a, nullptr };
+    CHECK(diff(ggml_cuda_graph_patch_kind_compare(a, b), GGML_CUDA_GRAPH_PATCH_FIELD_TYPE, 2));
+    CHECK(diff(ggml_cuda_graph_patch_kind_compare(b, a), GGML_CUDA_GRAPH_PATCH_FIELD_TYPE, 2));
+    // the view source
+    b = a; b.src[VIEW].type = 0;
+    CHECK(diff(ggml_cuda_graph_patch_kind_compare(a, b), GGML_CUDA_GRAPH_PATCH_FIELD_TYPE, VIEW));
+    b = a; b.src[VIEW] = ggml_cuda_graph_patch_src_kind();
+    CHECK(diff(ggml_cuda_graph_patch_kind_compare(a, b), GGML_CUDA_GRAPH_PATCH_FIELD_TYPE, VIEW));
+    // absent sources compare as absent, whatever else their fields hold
+    b = a; a.src[5].op = 5; b.src[5].op = 7; b.src[5].buffer = &buf_b;
+    CHECK(same(ggml_cuda_graph_patch_kind_compare(a, b)));
+    // the node itself, before its sources
+    b = a; b.op = 4; b.src[0].type = 2;
+    CHECK(diff(ggml_cuda_graph_patch_kind_compare(a, b), GGML_CUDA_GRAPH_PATCH_FIELD_OP, -1));
+    b = a; b.type = 0;
+    CHECK(diff(ggml_cuda_graph_patch_kind_compare(a, b), GGML_CUDA_GRAPH_PATCH_FIELD_TYPE, -1));
+    b = a; b.flags = 0;
+    CHECK(diff(ggml_cuda_graph_patch_kind_compare(a, b), GGML_CUDA_GRAPH_PATCH_FIELD_FLAGS, -1));
+    for (int f = GGML_CUDA_GRAPH_PATCH_FIELD_NONE; f <= GGML_CUDA_GRAPH_PATCH_FIELD_EXTRA; f++) {
+        CHECK(ggml_cuda_graph_patch_field_name(f)[0] != '?');
+    }
+
+    CHECK(ggml_cuda_graph_patch_action_for(true, true)   == GGML_CUDA_GRAPH_PATCH_SET_EXEC);
+    CHECK(ggml_cuda_graph_patch_action_for(true, false)  == GGML_CUDA_GRAPH_PATCH_SET_EXEC);
+    CHECK(ggml_cuda_graph_patch_action_for(false, true)  == GGML_CUDA_GRAPH_PATCH_KEEP);
+    CHECK(ggml_cuda_graph_patch_action_for(false, false) == GGML_CUDA_GRAPH_PATCH_SET_BOTH);
+}
+
 // ---- the model -----------------------------------------------------------------------------------------------------
 
-enum { OP_VIEW = 0, OP_A, OP_B, OP_C, OP_D, OP_E, OP_H, OP_M, OP_K, N_OPS };
+enum { OP_VIEW = 0, OP_A, OP_B, OP_C, OP_D, OP_E, OP_H, OP_M, OP_K, OP_T, N_OPS };
 
 struct mnode {
     int op;
     int shape;
-    int ptr;
+    int ptr;      // the data address its source holds
+    int src;      // its source as a tensor object: another node's (node_obj), a leaf's, or one of an input's copies
+    int src_type; // its source's kind
 };
 
+static int node_obj(const int i) {
+    return 1000000 + i;
+}
+
+// C826: a model node's kind for graph-patch.h's structure check (its op, its one source's kind)
+static ggml_cuda_graph_patch_node_kind model_kind(const mnode & m) {
+    ggml_cuda_graph_patch_node_kind k;
+    k.op = m.op;
+    k.src[0].type = m.src_type;
+    return k;
+}
+
 struct cuda_node {
-    int      kind;   // 0 kernel, 1 memset
+    int      kind;   // 0 kernel, 1 memset, 2 a 2-D copy (CUDA refuses any update of one in an executable)
     uint64_t params; // the function and its parameters
     bool operator==(const cuda_node & o) const { return kind == o.kind && params == o.params; }
 };
@@ -159,19 +232,21 @@ static int model_fuse(const std::vector<mnode> & g, const int i) {
     if (op(i) == OP_C && op(i + 1) == OP_D && op(i + 2) == OP_D && g[i + 1].shape == g[i + 2].shape) {
         return 2;
     }
-    // A B, when B's shape is under 40
-    if (op(i) == OP_A && op(i + 1) == OP_B && g[i + 1].shape < 40) {
+    // A B, when B reads A (its source is A's tensor object, as ggml_can_fuse checks) and B's shape is under 40
+    if (op(i) == OP_A && op(i + 1) == OP_B && g[i + 1].src == node_obj(i) && g[i + 1].shape < 40) {
         return 1;
     }
     return 0;
 }
 
-// the CUDA nodes group [i, i + k] makes: K makes one more kernel when its shape is over 50 (as attention may add a
-// combine kernel); M makes a memset first
+// the CUDA nodes group [i, i + k] makes, from what its nodes hold (never which tensor objects they read): K makes one
+// more kernel when its shape is over 50 (as attention may add a combine kernel); M makes a memset first, whose
+// parameters change with its nodes' addresses; T makes a kernel and then a 2-D copy of a fixed part of its result
+// (as top-k's argsort path does), whose parameters change only with its shape
 static std::vector<cuda_node> model_make(const std::vector<mnode> & g, const int i, const int k) {
     uint64_t h = 1469598103934665603ull;
     for (int j = i; j <= i + k; j++) {
-        h = mix(mix(mix(h, (uint64_t) g[j].op), (uint64_t) g[j].shape), (uint64_t) g[j].ptr);
+        h = mix(mix(mix(mix(h, (uint64_t) g[j].op), (uint64_t) g[j].shape), (uint64_t) g[j].ptr), (uint64_t) g[j].src_type);
     }
     std::vector<cuda_node> out;
     if (g[i].op == OP_M) {
@@ -180,6 +255,9 @@ static std::vector<cuda_node> model_make(const std::vector<mnode> & g, const int
     out.push_back({ 0, h });
     if (g[i].op == OP_K && g[i].shape > 50) {
         out.push_back({ 0, mix(h, 9) });
+    }
+    if (g[i].op == OP_T) {
+        out.push_back({ 2, mix(mix(13, (uint64_t) g[i].shape), 11) });
     }
     return out;
 }
@@ -192,12 +270,13 @@ struct model_record {
     bool ready = false;
     std::vector<ggml_cuda_graph_patch_group> groups;
     std::vector<int32_t> node_group;
+    std::vector<std::vector<uint64_t>> held; // the template: per chunk and CUDA node, the parameters it holds
 };
 
 static constexpr int CHUNK = 16;
 
-// the dispatch loop as a capture: the chunks' chains, and the groups with their tails when rec is given. H holds pool
-// memory into the next group, which starts with a nonzero pool use
+// the dispatch loop as a capture: the chunks' chains, and the groups with their tails and the template when rec is
+// given. H holds pool memory into the next group, which starts with a nonzero pool use
 static model_exec model_capture(const std::vector<mnode> & g, model_record * rec) {
     model_exec ex;
     ex.chunks.emplace_back();
@@ -254,6 +333,12 @@ static model_exec model_capture(const std::vector<mnode> & g, model_record * rec
     end_chunk();
     if (rec) {
         rec->ready = ok;
+        rec->held.assign(ex.chunks.size(), {});
+        for (size_t c = 0; c < ex.chunks.size(); c++) {
+            for (const cuda_node & n : ex.chunks[c]) {
+                rec->held[c].push_back(n.params);
+            }
+        }
     }
     return ex;
 }
@@ -273,21 +358,37 @@ static std::vector<size_t> model_pool(const std::vector<mnode> & g) {
     return at;
 }
 
+// how a run's patches decide; the defaults are ggml_cuda_graph_patch's
+struct model_opts {
+    int  window         = LONGEST - 1;
+    int  max_pct        = 100;
+    bool by_object      = false; // control: C779's structure check, which compares the sources as tensor objects
+    bool stale_template = false; // control: a set leaves the template with the recording's parameters
+};
+
 // ggml_cuda_graph_patch on the model: GGML_CUDA_GRAPH_PATCH_NONE and the executable patched, or why not
-static int model_patch(const std::vector<mnode> & g, const std::vector<mnode> & prev, const model_record & rec,
-        model_exec & ex, const int window, const int max_pct, int & n_dirty_groups) {
+static int model_patch(const std::vector<mnode> & g, const std::vector<mnode> & prev, model_record & rec,
+        model_exec & ex, const model_opts & o, int & n_dirty_groups, long & n_kept) {
     n_dirty_groups = 0;
-    const bool structure = g.size() != prev.size() ||
-        !std::equal(g.begin(), g.end(), prev.begin(), [](const mnode & a, const mnode & b) { return a.op == b.op; });
+    // the structure: the node count, and each node's kind (its op and its source's kind; C826); C779 also compared
+    // the source objects
+    bool structure = g.size() != prev.size();
+    for (size_t i = 0; !structure && i < g.size(); i++) {
+        structure = ggml_cuda_graph_patch_kind_compare(model_kind(prev[i]), model_kind(g[i])).field != GGML_CUDA_GRAPH_PATCH_FIELD_NONE ||
+                    (o.by_object && g[i].src != prev[i].src);
+    }
+    // the properties: the node's own, and its source as an object (ggml-cuda.cu compares the node's copy, which holds
+    // its source pointers) and what it holds
     std::vector<uint8_t> changed(g.size(), 0);
     for (size_t i = 0; i < g.size() && i < prev.size(); i++) {
-        changed[i] = g[i].op != prev[i].op || g[i].shape != prev[i].shape || g[i].ptr != prev[i].ptr;
+        changed[i] = g[i].op != prev[i].op || g[i].shape != prev[i].shape || g[i].ptr != prev[i].ptr ||
+                     g[i].src != prev[i].src || g[i].src_type != prev[i].src_type;
     }
     int n_dirty_nodes = 0;
     const std::vector<int> dirty = structure ? std::vector<int>() :
-        ggml_cuda_graph_patch_dirty(rec.groups, rec.node_group, changed, window, n_dirty_nodes);
+        ggml_cuda_graph_patch_dirty(rec.groups, rec.node_group, changed, o.window, n_dirty_nodes);
     int r = ggml_cuda_graph_patch_precheck(rec.ready, structure, ex.chunks.size(), ex.chunks.size(), n_dirty_nodes,
-        (int) g.size(), max_pct);
+        (int) g.size(), o.max_pct);
     if (r != GGML_CUDA_GRAPH_PATCH_NONE) {
         return r;
     }
@@ -329,10 +430,25 @@ static int model_patch(const std::vector<mnode> & g, const std::vector<mnode> & 
             }
         }
     }
+    // the parameters (C826): a kernel is set; a memset or copy is kept when its template holds its new parameters,
+    // else set in the executable (which refuses a 2-D copy: the caller then captures in full) and in the template
     for (size_t d = 0; d < dirty.size(); d++) {
         const ggml_cuda_graph_patch_group & grp = rec.groups[dirty[d]];
         for (uint32_t j = 0; j < grp.count; j++) {
-            ex.chunks[grp.chunk][grp.first + j] = scratch[made[d].first + j];
+            const cuda_node & now  = scratch[made[d].first + j];
+            uint64_t &        held = rec.held[grp.chunk][grp.first + j];
+            const int act = ggml_cuda_graph_patch_action_for(now.kind == 0, now.params == held);
+            if (act == GGML_CUDA_GRAPH_PATCH_KEEP) {
+                n_kept++;
+                continue;
+            }
+            if (now.kind == 2) {
+                return GGML_CUDA_GRAPH_PATCH_API;
+            }
+            ex.chunks[grp.chunk][grp.first + j] = now;
+            if (act == GGML_CUDA_GRAPH_PATCH_SET_BOTH && !o.stale_template) {
+                held = now.params;
+            }
         }
     }
     n_dirty_groups = (int) dirty.size();
@@ -347,27 +463,37 @@ static std::vector<mnode> random_graph(std::mt19937 & rng, const int n) {
         if (o == OP_H && rng() % 4 != 0) {
             o = OP_A; // a group that holds pool memory into the next is rare
         }
-        g[i] = { o, 10 + (int) (rng() % 20), (int) (rng() % 1000) };
+        // most nodes read the node before them, the others a leaf (a weight)
+        const int src = i > 0 && rng() % 4 != 0 ? node_obj(i - 1) : 2000000 + (int) (rng() % 1000);
+        g[i] = { o, 10 + (int) (rng() % 20), (int) (rng() % 1000), src, (int) (rng() % 3) };
     }
     // a few long patterns, so that the six-node fusion and its condition on its last node occur
     for (int p = 0; p + 6 < n; p += 30 + (int) (rng() % 21)) {
-        g[p] = { OP_C, 10, 1 };
+        g[p].op = OP_C;
+        g[p].shape = 10;
+        g[p].ptr = 1;
         for (int j = 1; j <= 4; j++) {
-            g[p + j] = { OP_D, 20, 2 };
+            g[p + j].op = OP_D;
+            g[p + j].shape = 20;
+            g[p + j].ptr = 2;
         }
-        g[p + 5] = { OP_E, 30 + (int) (rng() % 2), 3 };
+        g[p + 5].op = OP_E;
+        g[p + 5].shape = 30 + (int) (rng() % 2);
+        g[p + 5].ptr = 3;
     }
     return g;
 }
 
 struct run_counts {
-    long evals = 0, patched = 0, full = 0, groups = 0, inexact = 0;
+    long evals = 0, patched = 0, full = 0, groups = 0, inexact = 0, kept = 0;
     long by_reason[GGML_CUDA_GRAPH_PATCH_REASON_COUNT] = {};
 };
 
-// one run of prompt micro-batches: rotating input readers, growing cache readers (those that are E end a long pattern,
-// so the six-node fusion turns on and off), sometimes a structure change, another node count or an eager evaluation
-static run_counts random_run(std::mt19937 & rng, const int window, const int max_pct, const int n_evals) {
+// one run of prompt micro-batches: input readers whose source rotates through four copies (each its own tensor object
+// at its own address), growing cache readers (those that are E end a long pattern, so the six-node fusion turns on and
+// off), sometimes a structure change (an op or a source's kind), a node linked to another source, another node count
+// or an eager evaluation
+static run_counts random_run(std::mt19937 & rng, const model_opts & o, const int n_evals) {
     run_counts rc;
     std::vector<mnode> g = random_graph(rng, 40 + (int) (rng() % 120));
     std::vector<int> inputs, cache;
@@ -386,20 +512,29 @@ static run_counts random_run(std::mt19937 & rng, const int window, const int max
     for (int e = 0; e < n_evals; e++) {
         std::vector<mnode> next = g;
         for (const int i : inputs) {
-            next[i].ptr = 5000 + (e % 4) * 100 + i; // four input copies
+            next[i].src = 3000000 + (e % 4) * 10000 + i; // four input copies: separate objects
+            next[i].ptr = 5000 + (e % 4) * 100 + i;      // at their own addresses
         }
         for (const int i : cache) {
             next[i].shape = g[i].shape + 2 * e + e / 7; // the cache grows every micro-batch, its parity now and then
         }
         const unsigned u = rng() % 1000;
         if (u < 8) {
-            next[rng() % next.size()].op = (int) (rng() % N_OPS); // a structure change
+            next[rng() % next.size()].op = (int) (rng() % N_OPS); // a structure change: an op
             g = next;
         } else if (u < 12) {
-            next.push_back({ OP_A, 11, 7 }); // another node count
+            next.push_back({ OP_A, 11, 7, node_obj((int) next.size() - 1), 0 }); // another node count
+            g = next;
+        } else if (u < 16) {
+            next[rng() % next.size()].src_type ^= 1; // a structure change: a source's kind
+            g = next;
+        } else if (u >= 20 && u < 40) {
+            // a node linked to another source of its kind: a property (an A B fusion may turn on or off)
+            const size_t j = 1 + rng() % (next.size() - 1);
+            next[j].src = rng() % 2 ? node_obj((int) j - 1) : node_obj((int) (rng() % j));
             g = next;
         }
-        const bool eager = u >= 12 && u < 20;
+        const bool eager = u >= 40 && u < 48;
         rc.evals++;
         if (eager) {
             rec.ready = false; // an eager evaluation leaves the executables behind
@@ -407,7 +542,7 @@ static run_counts random_run(std::mt19937 & rng, const int window, const int max
             continue;
         }
         int n_groups = 0;
-        int r = have ? model_patch(next, prev, rec, ex, window, max_pct, n_groups) : GGML_CUDA_GRAPH_PATCH_NOT_READY;
+        int r = have ? model_patch(next, prev, rec, ex, o, n_groups, rc.kept) : GGML_CUDA_GRAPH_PATCH_NOT_READY;
         rc.by_reason[r]++;
         if (r == GGML_CUDA_GRAPH_PATCH_NONE) {
             rc.patched++;
@@ -426,7 +561,8 @@ static run_counts random_run(std::mt19937 & rng, const int window, const int max
 }
 
 static void test_model() {
-    // the model's loop: the recorded groups cover every dispatched node and the pool use is the loop's
+    // the model's loop: the recorded groups cover every dispatched node, the pool use is the loop's and the template
+    // holds the capture's parameters
     {
         std::mt19937 rng(7);
         for (int t = 0; t < 200; t++) {
@@ -446,47 +582,79 @@ static void test_model() {
                 CHECK(grp.first + grp.count <= ex.chunks[grp.chunk].size());
             }
             CHECK(counted == n_cuda);
+            CHECK(rec.held.size() == ex.chunks.size());
+            for (size_t c = 0; c < ex.chunks.size() && c < rec.held.size(); c++) {
+                CHECK(rec.held[c].size() == ex.chunks[c].size());
+            }
         }
     }
 
-    long patched = 0, full = 0, groups = 0, evals = 0, ctl_inexact = 0, ctl_runs = 0;
-    long reasons[GGML_CUDA_GRAPH_PATCH_REASON_COUNT] = {};
-    for (int seed = 1; seed <= 2000; seed++) {
-        std::mt19937 r_on(seed);
-        const run_counts on = random_run(r_on, LONGEST - 1, seed % 2 ? 100 : 60, 300);
-        CHECK(on.inexact == 0);
-        patched += on.patched;
-        full    += on.full;
-        groups  += on.groups;
-        evals   += on.evals;
-        for (int r = 0; r < GGML_CUDA_GRAPH_PATCH_REASON_COUNT; r++) {
-            reasons[r] += on.by_reason[r];
+    run_counts on, obj, stale;
+    long ctl_inexact = 0, ctl_runs = 0, stale_runs = 0;
+    const auto add = [](run_counts & to, const run_counts & r) {
+        to.evals += r.evals; to.patched += r.patched; to.full += r.full; to.groups += r.groups;
+        to.inexact += r.inexact; to.kept += r.kept;
+        for (int k = 0; k < GGML_CUDA_GRAPH_PATCH_REASON_COUNT; k++) {
+            to.by_reason[k] += r.by_reason[k];
         }
+    };
+    for (int seed = 1; seed <= 2000; seed++) {
+        model_opts o;
+        o.max_pct = seed % 2 ? 100 : 60;
+        std::mt19937 r_on(seed);
+        const run_counts a = random_run(r_on, o, 300);
+        CHECK(a.inexact == 0);
+        add(on, a);
+        // C779's structure check by tensor object: as exact, but every rotation of an input copy is a full capture
+        model_opts ob = o;
+        ob.by_object = true;
+        std::mt19937 r_obj(seed);
+        const run_counts b = random_run(r_obj, ob, 300);
+        CHECK(b.inexact == 0);
+        add(obj, b);
         // the control: a window shorter than the longest pattern misses a fusion that a changed last node turns on
+        model_opts w;
+        w.window = 2;
         std::mt19937 r_ctl(seed);
-        const run_counts ctl = random_run(r_ctl, 2, 100, 300);
+        const run_counts ctl = random_run(r_ctl, w, 300);
         ctl_inexact += ctl.inexact;
         ctl_runs    += ctl.inexact > 0;
+        // the control: a template that keeps the recording's parameters lets a memset keep stale ones once its
+        // parameters come back to the recording's (the fourth input copy after the first)
+        model_opts st = o;
+        st.stale_template = true;
+        std::mt19937 r_st(seed);
+        const run_counts s = random_run(r_st, st, 300);
+        add(stale, s);
+        stale_runs += s.inexact > 0;
     }
-    CHECK(patched > 0 && full > 0);
+    CHECK(on.patched > 0 && on.full > 0 && on.kept > 0);
     for (int r = GGML_CUDA_GRAPH_PATCH_NONE; r < GGML_CUDA_GRAPH_PATCH_REASON_COUNT; r++) {
-        if (r != GGML_CUDA_GRAPH_PATCH_SKIP && r != GGML_CUDA_GRAPH_PATCH_API) {
-            CHECK(reasons[r] > 0); // the model reaches every reason but the two it has no part for
+        if (r != GGML_CUDA_GRAPH_PATCH_SKIP) {
+            CHECK(on.by_reason[r] > 0); // the model reaches every reason but the one it has no part for
         }
     }
+    CHECK(obj.patched < on.patched);
+    CHECK(obj.by_reason[GGML_CUDA_GRAPH_PATCH_STRUCTURE] > on.by_reason[GGML_CUDA_GRAPH_PATCH_STRUCTURE]);
     CHECK(ctl_runs > 0);
+    CHECK(stale_runs > 0);
     printf("random runs: 2000 x 300 evaluations (%ld); window %d: %ld patched (%.1f groups each), %ld full captures, "
-           "every executable a fresh capture's;", evals, LONGEST - 1, patched, patched ? (double) groups / patched : 0.0, full);
+           "%ld memset and copy nodes kept, every executable a fresh capture's;", on.evals, LONGEST - 1, on.patched,
+           on.patched ? (double) on.groups / on.patched : 0.0, on.full, on.kept);
     for (int r = GGML_CUDA_GRAPH_PATCH_NOT_READY; r < GGML_CUDA_GRAPH_PATCH_REASON_COUNT; r++) {
-        printf(" %s %ld", ggml_cuda_graph_patch_reason_name(r), reasons[r]);
+        printf(" %s %ld", ggml_cuda_graph_patch_reason_name(r), on.by_reason[r]);
     }
-    printf("; the control (window 2) made other executables in %ld evaluations of %ld runs\n", ctl_inexact, ctl_runs);
+    printf("\nthe structure by tensor object (C779): %ld patched, structure %ld, every executable a fresh capture's\n",
+           obj.patched, obj.by_reason[GGML_CUDA_GRAPH_PATCH_STRUCTURE]);
+    printf("controls: window 2 made other executables in %ld evaluations of %ld runs; templates with the recording's "
+           "parameters in %ld evaluations of %ld runs\n", ctl_inexact, ctl_runs, stale.inexact, stale_runs);
 }
 
 int main() {
     test_dirty();
     test_ranges();
     test_precheck();
+    test_kind();
     test_model();
     printf("test-cuda-graph-patch: %d checks, %d failed\n", n_checks, n_fail);
     return n_fail == 0 ? 0 : 1;
