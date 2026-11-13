@@ -204,6 +204,12 @@ bool common_spec_adapt_continue(const common_spec_adapt_online & a, const std::v
 // probability: common_spec_adapt_choose then keeps all p.size() + 1 tokens of any draft of that length starting with p
 bool common_spec_adapt_keeps_next(const common_spec_adapt_online & a, const std::vector<float> & p);
 
+// C820: whether common_spec_adapt_continue is false after the token drafted next (position p.size()) whatever its
+// probability, so that the drafting pass that drafts it is the draft's last. Decided at probability 1, the most a token
+// can add: with S fixed or run, every test and bound the walk makes after p only grows with that probability. Always
+// false with S_STEP (a passing test there also raises the next one's threshold) and with params->online <= 0
+bool common_spec_adapt_stops_next(const common_spec_adapt_online & a, const std::vector<float> & p);
+
 // S_RUN's running speed-up: exponential averages of the tokens a step yields and of its modelled cost
 struct common_spec_adapt_state {
     double tok  = 0.0;

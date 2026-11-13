@@ -272,6 +272,7 @@ static void test_random() {
 // next token of probability 0 completes a length the rule keeps", after which any probability keeps it
 static void test_online() {
     std::mt19937 rng(815);
+    std::mt19937 rng820(820); // C820's draws, apart so that C815's cases stay the same
     std::uniform_real_distribution<double> u(0.0, 1.0);
 
     auto same = [](const common_spec_adapt_choice & a, const common_spec_adapt_choice & b) {
@@ -299,6 +300,10 @@ static void test_online() {
     int64_t n_next   = 0;
     int64_t n_kept   = 0;
     int64_t passes[3] = { 0, 0, 0 }; // as built, online 1, online 2
+    // C820, at online 1 and 2: stops_next asked, true, and drafts whose last pass was known before it ran
+    int64_t n_sn[3]         = { 0, 0, 0 };
+    int64_t n_sn_true[3]    = { 0, 0, 0 };
+    int64_t n_last_known[3] = { 0, 0, 0 };
     for (int it = 0; it < 20000; ++it) {
         common_spec_adapt_params p;
         if (it % 5 == 0) {
@@ -390,6 +395,30 @@ static void test_online() {
             }
             passes[online] += stop;
 
+            // C820: stops_next before each pass: when it says the pass is the last, continue is false after it at
+            // every probability tried (so the drafter stops there); with S fixed or run it is exactly continue at 1
+            for (int32_t j = 0; j < stop; ++j) {
+                const std::vector<float> q0(draft.begin(), draft.begin() + j);
+                const bool sn = common_spec_adapt_stops_next(a, q0);
+                std::vector<float> q1 = q0;
+                q1.push_back(1.0f);
+                CHECK(sn == (p.s_mode != common_spec_adapt_params::S_STEP && !common_spec_adapt_continue(a, q1)));
+                if (sn) {
+                    CHECK(j + 1 == stop);
+                    for (const float x : { 0.0f, 1.0f, draft[j], (float) u(rng820), (float) (u(rng820) * 1e-3), 7.0f, -1.0f }) {
+                        q1.back() = x;
+                        CHECK(!common_spec_adapt_continue(a, q1));
+                    }
+                    n_sn_true[online]++;
+                }
+                n_sn[online]++;
+            }
+            // the draft's last pass known before it runs: n_max, the last allowed length, or the look-ahead
+            if (stop == n_max || stop == lengths.back() ||
+                    common_spec_adapt_stops_next(a, std::vector<float>(draft.begin(), draft.begin() + stop - 1))) {
+                n_last_known[online]++;
+            }
+
             // a settled prefix: whatever follows it, the rule keeps the same
             for (int e = 0; e < 4; ++e) {
                 std::vector<float> ext = pre;
@@ -434,6 +463,10 @@ static void test_online() {
            "extensions of a settled prefix; %lld of %lld next tokens kept whatever their probability\n",
            (long long) n_drafts, (double) passes[0] / n_drafts, (double) passes[1] / n_drafts,
            (double) passes[2] / n_drafts, (long long) n_ext, (long long) n_kept, (long long) n_next);
+    printf("stops_next (C820): online 1: %lld of %lld passes known last, %lld of %lld drafts' last pass known before "
+           "it ran; online 2: %lld of %lld, %lld of %lld\n",
+           (long long) n_sn_true[1], (long long) n_sn[1], (long long) n_last_known[1], (long long) n_drafts,
+           (long long) n_sn_true[2], (long long) n_sn[2], (long long) n_last_known[2], (long long) n_drafts);
 }
 
 static void test_state() {
