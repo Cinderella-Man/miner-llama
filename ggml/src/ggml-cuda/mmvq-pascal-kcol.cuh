@@ -15,7 +15,8 @@
 // GGML_CUDA_MMVQ_PASCAL_KCOL: 0 off; 1 (default) 2 to 8 columns, and 1 column for Q3_K and IQ4_NL (which have no other
 // Pascal kernel) and for Q8_0 rows whose 64-weight chunks aren't a multiple of 4 (the one-token kernel loads those 32
 // bits at a time); 2 every product of 1 to 8 columns of these types. GGML_CUDA_MMVQ_PASCAL_KCOL_SKIP=q4_K,q6_K: types
-// left to the other kernels. GGML_CUDA_MMVQ_PASCAL_KCOL_R=1|2 rows per lane group, _KCOL_ITT=n iterations per activation
+// left to the other kernels at 1 to 4 columns, the Pascal kernels' range (C828; at 5 to 8 these kernels keep them).
+// GGML_CUDA_MMVQ_PASCAL_KCOL_R=1|2 rows per lane group, _KCOL_ITT=n iterations per activation
 // tile, _KCOL_SMEM=bytes of shared memory per block (at most 49152), _KCOL_NSM=n the SM count and _KCOL_SMSM=bytes the
 // shared memory per SM the shape is chosen for (=5 and =98304: a P106's shapes on another card): launch shapes for
 // tuning. Any of R, ITT and SMEM selects the shape as before Q823 with those values (_KCOL_SMEM=49152:
@@ -37,8 +38,13 @@ bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tens
 
 // Whether the k-column kernels are on for weights of type (GGML_CUDA_MMVQ_PASCAL_KCOL not 0, the type one of theirs and
 // not in GGML_CUDA_MMVQ_PASCAL_KCOL_SKIP); the caller checks GGML_CUDA_MMVQ_PASCAL. For kernels that keep their sums
-// (mmvq-pascal-q3kmt.cu: Q3_K's one-token kernel is the k-column kernel).
+// (mmvq-pascal-q3kmt.cu: Q3_K's one-token kernel is the k-column kernel). A skipped type's products of 5 to 8 columns
+// stay with the k-column kernels themselves (C828).
 bool ggml_cuda_mmvq_pascal_kcol_on(ggml_type type);
+
+// Whether GGML_CUDA_MMVQ_PASCAL_KCOL_SKIP leaves a product of ncols columns of type to the other kernels: its types at
+// 1 to 4 columns only (C828). Host code; needs no device (the routing check calls it).
+bool ggml_cuda_mmvq_pascal_kcol_skips(ggml_type type, int64_t ncols);
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 namespace kcol { struct params; }

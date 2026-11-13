@@ -71,6 +71,11 @@ static bool kcol_skip_type(const ggml_type type) {
     return std::find(skip.begin(), skip.end(), type) != skip.end();
 }
 
+// C828: the skip hands a type's products to the Pascal kernels (mmvq-pascal.cu), which take 1 to 4 columns
+// (MMVQP_MAX_COLS); products of 5 to 8 columns stay with these kernels, as without the switch (on a P106 llama.cpp's
+// mul_mat_vec_q, where they went before, is slower there: R150)
+static constexpr int64_t kcol_skip_max_cols = 4;
+
 static int kcol_type(const ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q8_0:   return kcol::KQ8_0;
@@ -223,6 +228,10 @@ bool ggml_cuda_mmvq_pascal_kcol_on(const ggml_type type) {
     return kcol_mode() != 0 && kcol_type(type) >= 0 && !kcol_skip_type(type);
 }
 
+bool ggml_cuda_mmvq_pascal_kcol_skips(const ggml_type type, const int64_t ncols) {
+    return ncols >= 1 && ncols <= kcol_skip_max_cols && kcol_skip_type(type);
+}
+
 bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                 ggml_tensor * dst) {
     const int mode = kcol_mode();
@@ -230,7 +239,7 @@ bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tens
         return false;
     }
     const int t = kcol_type(src0->type);
-    if (t < 0 || kcol_skip_type(src0->type)) {
+    if (t < 0) {
         return false;
     }
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
@@ -250,6 +259,10 @@ bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tens
     }
     if (src0->nb[1] > INT_MAX || nrows > INT_MAX || K > INT_MAX || src1->nb[1] / sizeof(float) > INT_MAX ||
             dst->nb[1] / sizeof(float) > INT_MAX) {
+        return false;
+    }
+    // GGML_CUDA_MMVQ_PASCAL_KCOL_SKIP's types at 1 to 4 columns (C828)
+    if (ggml_cuda_mmvq_pascal_kcol_skips(src0->type, ncols)) {
         return false;
     }
     // GGML_CUDA_MMVQ_PASCAL_Q5K_MT (_Q5K_1R, _RO8): Q5_K's products of 2 to 4 columns (1, 5 to 8) go to
@@ -345,6 +358,11 @@ bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tens
 
 bool ggml_cuda_mmvq_pascal_kcol_on(const ggml_type type) {
     GGML_UNUSED(type);
+    return false;
+}
+
+bool ggml_cuda_mmvq_pascal_kcol_skips(const ggml_type type, const int64_t ncols) {
+    GGML_UNUSED_VARS(type, ncols);
     return false;
 }
 
