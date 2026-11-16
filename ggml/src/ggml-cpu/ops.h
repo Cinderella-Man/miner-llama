@@ -56,8 +56,6 @@ void ggml_compute_forward_get_rows(const struct ggml_compute_params * params, st
 void ggml_compute_forward_get_rows_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_set_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_diag(const struct ggml_compute_params * params, struct ggml_tensor * dst);
-void ggml_compute_forward_diag_mask_inf(const struct ggml_compute_params * params, struct ggml_tensor * dst);
-void ggml_compute_forward_diag_mask_zero(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_soft_max(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_soft_max_ext_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rope(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -81,6 +79,7 @@ void ggml_compute_forward_pad_reflect_1d(const struct ggml_compute_params * para
 void ggml_compute_forward_roll(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_arange(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_kq_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_range_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_timestep_embedding(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_argsort(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_top_k(const struct ggml_compute_params * params, struct ggml_tensor * dst);

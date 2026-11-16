@@ -68,6 +68,7 @@ struct llama_ubatch {
         std::vector<float>          embd;
         std::vector<float>          embd_state;
         std::vector<int32_t>        embd_row;
+        std::vector<int32_t>        embd_state_row; // the state is this row of ctx_state_src's h_nextn device buffer, empty if none
         std::vector<llama_pos>      pos;
         std::vector<int32_t>        n_seq_id;
         std::vector<llama_seq_id *> seq_id;      // these point into the seq_id_data below
@@ -118,6 +119,7 @@ struct llama_batch_ext {
         bool         has_state = false; // whether state_off is set
         size_t       state_off = 0; // index offset in the state array
         int32_t      embd_row = -1; // row of ctx_other's layer input device buffer used as embd, -1 if none
+        int32_t      state_row = -1; // row of ctx_state_src's h_nextn device buffer used as state, -1 if none
         bool         output = false; // TODO: have dedicated output flags
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
         std::unordered_set<llama_seq_id> seq_ids;
@@ -150,6 +152,7 @@ struct llama_batch_ext {
     bool set_token_embd(int32_t idx, llama_embd embd_in);
     bool set_token_state(int32_t idx, llama_embd state_in);
     bool set_token_embd_row(int32_t idx, int32_t row);
+    bool set_token_state_row(int32_t idx, int32_t row);
     bool set_token_pos(int32_t idx, const llama_pos * pos_in);
     bool set_output(int32_t idx, bool output_last);
     bool set_decision_order(int32_t idx, int32_t order);
@@ -199,6 +202,13 @@ public:
 
     const llama_batch & get_batch() const;
 
+    // C738 (llama_decode_prepare): token i of the current batch is id (a token batch, i < get_n_tokens()); the ubatches
+    // already split from it keep their own copies
+    void set_token(uint32_t i, llama_token id) {
+        GGML_ASSERT(i < token_vec.size());
+        token_vec[i] = id;
+    }
+
     uint32_t get_n_tokens()  const;
     uint32_t get_n_outputs() const;
     uint32_t get_n_used()    const;
@@ -237,13 +247,25 @@ public:
     // of one sequence
     bool is_one_seq_tokens() const;
 
+    // C217: cuts (token offsets) in the current batch: a split stops at the next cut and treats it as the end of the
+    // batch (the trailing tokens of split_equal's n_keep_tail too), so the batch splits into the micro-batches of
+    // separate calls cut there. For batches of one sequence (is_one_seq); init() clears them, empty = no cuts
+    void set_ubatch_cuts(std::vector<uint32_t> cuts);
+
+    // all tokens of one sequence (the cuts apply)
+    bool is_one_seq() const;
+
 private:
     void clear();
 
     // the most tokens the next split may take under the plan, n_ubatch without one
     uint32_t plan_cap(uint32_t n_ubatch) const;
 
+    // C217: the first cut after the tokens used so far, UINT32_MAX without one
+    uint32_t cut_next() const;
+
     std::vector<uint32_t> ubatch_plan;
+    std::vector<uint32_t> ubatch_cuts;
 
     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed
@@ -273,6 +295,7 @@ private:
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
     std::vector<float>          state_vec;    // owned state embeddings built from llama_batch_ext, llama_batch has no slot for them
     std::vector<int32_t>        embd_row_vec; // owned embd rows built from llama_batch_ext, llama_batch has no slot for them
+    std::vector<int32_t>        state_row_vec; // owned state rows built from llama_batch_ext, llama_batch has no slot for them
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;

@@ -11,6 +11,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-ngram-prefetch.h"
 #include "llama-pipe-drafter.h"
 
 #include "ggml-cpp.h"
@@ -62,6 +63,20 @@ struct llama_state_store {
 
     // a copy of that blob: a restore or a host copy checks that it is given the blob of this fill
     std::vector<uint8_t> meta;
+
+    // C217: a fill inside a decode (llama_state_seq_store_at) queues its copies on the backends that compute the state,
+    // with an event recorded on each after them; a host copy waits for these first. Empty after a fill that waited
+    std::vector<ggml_backend_event_ptr> fences;
+};
+
+// LLAMA_TENSOR_HASH=<prefix>[,<prefix>...] (C762, checks): every graph node whose name starts with one of the prefixes is
+// hashed (FNV-1a over its bytes) once it is computed, through the scheduler's eval callback, and logged with the buffer
+// that holds it, so that two runs' intermediate tensors can be compared byte for byte; unused when the caller sets
+// cb_eval. The callback makes the scheduler compute each split in pieces that end at those nodes
+struct llama_tensor_hash {
+    std::vector<std::string> prefixes;
+    char     role = 'v'; // 'v' a target context, 'd' an MTP draft context
+    uint64_t n    = 0;   // tensors hashed so far
 };
 
 struct llama_context {
@@ -117,6 +132,7 @@ struct llama_context {
     float * get_embeddings_layer_inp(uint32_t lid);
 
     ggml_tensor * get_layer_inp_dev() const { return layer_inp_dev; }
+    ggml_tensor * get_h_nextn_dev()   const { return h_nextn_dev; }
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -150,6 +166,24 @@ struct llama_context {
 
     // whether decode accepts entries whose embd is a row of ctx_other's layer input device buffer
     bool supports_embd_row() const;
+
+    // h_nextn device buffer, see llama_set_embeddings_nextn_dev()
+    bool set_embeddings_nextn_dev(bool value);
+    bool get_h_nextn_rows(int64_t row0, int64_t n_rows, float * out);
+    bool set_h_nextn_rows(int64_t row0, int64_t n_rows, const float * data);
+
+    // two halves of the h_nextn device buffer (C703), see llama_set_embeddings_nextn_dev_halves()
+    bool    set_h_nextn_halves(int32_t n);
+    bool    hold_h_nextn();
+    int64_t get_h_nextn_row0() const { return h_nextn_dev ? h_nextn_last*h_nextn_half_rows() : 0; }
+    int64_t h_nextn_half_rows() const { return h_nextn_dev ? h_nextn_dev->ne[1]/h_nextn_halves : 0; }
+    int32_t h_nextn_half_of(int64_t row) const { return h_nextn_halves > 1 && row >= h_nextn_half_rows() ? 1 : 0; }
+    // the halves the buffer holds now, 0 without a buffer (C813: one until the first hold with LLAMA_MTP_HROW_LAZY)
+    int32_t get_h_nextn_halves() const { return h_nextn_dev ? h_nextn_halves : 0; }
+
+    // state rows read from the h_nextn device buffer of ctx_src, see llama_set_ctx_state_src()
+    bool set_ctx_state_src(llama_context * ctx_src);
+    bool supports_state_row() const;
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_screen_head(bool value);
@@ -158,8 +192,6 @@ struct llama_context {
     bool         set_ubatch_taper(const char * spec);
     const char * get_ubatch_taper() const;
     void         set_ubatch_taper_next(int32_t head, int32_t tail);
-
-    void set_warmup(bool value);
 
     // a shortlist for this (draft) context's output head (llama_head_shortlist_*)
     bool     head_shortlist_init(uint32_t k_low, uint32_t m_cap);
@@ -175,6 +207,13 @@ struct llama_context {
     // the (draft) context's hidden rows kept on its layer's card between passes (llama_nextn_carry_init)
     bool nextn_carry_init();
     void set_nextn_carry(bool in, bool out);
+
+    // the next decode copies no h_nextn rows to the host (llama_skip_embeddings_nextn_next), and the counts
+    void skip_h_nextn_next() { h_nextn_skip_next = true; }
+    void h_nextn_host_stats(uint64_t * n_copied, uint64_t * n_skipped) const;
+
+    // the prefix of this context's marks in a step trace (llama_step_trace_role)
+    void set_step_trace_role(char role) { step_trace_role = role; }
 
     // the device of the MTP layer's weights and this context's backend for it
     bool mtp_layer_device(ggml_backend_dev_t & dev, ggml_backend_t & backend) const;
@@ -218,8 +257,37 @@ struct llama_context {
             llama_memory_context_i * mctx,
                        ggml_status & ret);
 
+    // the host's times of a ubatch for LLAMA_UBATCH_TRACE [TAG_UBATCH_TRACE]
+    struct ubatch_trace_times {
+        int64_t      t0    = 0;
+        int64_t      pre   = 0;
+        int64_t      build = 0;
+        int64_t      alloc = 0;
+        const char * why   = nullptr; // why the graph was rebuilt
+    };
+
+    // process_ubatch's first part: the memory applied, the graph chosen (reused, or built and allocated) and the
+    // scheduler's caller_sync set for it (the caller clears it); nullptr with ret set on a failure
+    llm_graph_result * process_ubatch_graph(
+                const llama_ubatch & ubatch,
+                    llm_graph_type   gtype,
+            llama_memory_context_i * mctx,
+                       ggml_status & ret,
+                ubatch_trace_times & tt);
+
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
+
+    // C738 (LLAMA_VERIFY_PREPARE, llama_decode_prepare): the host part of a decode done before the ids of some of its
+    // tokens are known: the batch split, the memory's slots applied, the graph chosen and the inputs that need no token
+    // id set (with LLAMA_VERIFY_PREPARE=2 also the first device split's graph inputs uploaded). The next decode() submits
+    // it: it must bring the same batch, token ids aside, or the process aborts. Returns 0 if prepared, 1 if not (then
+    // nothing was done that the next decode would not do the same way first), < 0 on an error
+    int  decode_prepare(const llama_batch_ext & batch_inp);
+    bool decode_prepared() const { return vprep.active; }
+    // a prepared decode that will not be submitted (error paths): the sequences it holds lose every cell (the memory
+    // cannot give back exactly what apply() took before the graph ran); false if there were any
+    bool decode_prepare_drop();
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -244,6 +312,12 @@ struct llama_context {
     size_t state_seq_store_get_size_host(llama_seq_id seq_id, int32_t store);
     size_t state_seq_store_get_data_host(llama_seq_id seq_id, int32_t store, const uint8_t * src, size_t src_size, uint8_t * dst, size_t dst_size);
     void   state_seq_store_free(llama_seq_id seq_id, int32_t store);
+
+    // C217: micro-batch cuts for the following decodes (llama_set_ubatch_cuts), and device-store fills inside the next
+    // decode (llama_state_seq_store_at, llama_state_seq_store_at_get)
+    void   set_ubatch_cuts(const uint32_t * cuts, size_t n);
+    void   state_seq_store_at(llama_seq_id seq_id, int32_t store, uint32_t i_end, llama_state_seq_flags flags);
+    size_t state_seq_store_at_get(llama_seq_id seq_id, int32_t store, uint8_t * dst, size_t size, llama_pos * pos_min, llama_pos * pos_max) const;
 
     bool state_load_file(
             const char * filepath,
@@ -327,6 +401,12 @@ private:
     // (re)allocate the device buffer for cparams.embeddings_layer_inp_dev
     void layer_inp_dev_alloc();
 
+    // (re)allocate the device buffer for cparams.embeddings_nextn_dev, false if it does not fit
+    bool h_nextn_dev_alloc();
+
+    // C813: make the second half of a one-half buffer, the rows of the first copied over; false if it does not fit
+    bool h_nextn_grow();
+
     ggml_backend_t backend_from_dev(ggml_backend_dev_t dev) const;
 
     //
@@ -334,7 +414,7 @@ private:
     //
 
 public:
-    uint32_t graph_max_nodes(uint32_t n_tokens) const;
+    uint32_t graph_max_nodes() const;
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
@@ -378,8 +458,22 @@ private:
     llm_graph_cb graph_get_cb() const;
     llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_graph) const;
 
-    // create a new backend scheduler for a graph of the specified size and register the callbacks below
-    void sched_new(size_t max_nodes, bool parallel);
+    // parameters defining the backend scheduler instance
+    struct sched_params {
+        size_t max_nodes  = 0;
+        bool   parallel   = false;
+        bool   op_offload = false;
+
+        // a scheduler can serve any graph of up to max_nodes nodes
+        bool can_reuse(const sched_params & other) const {
+            return parallel   == other.parallel
+                && op_offload == other.op_offload
+                && max_nodes  <= other.max_nodes;
+        }
+    };
+
+    // create a new backend scheduler with the given parameters, unless the current one can be reused
+    void sched_new(const sched_params & params);
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
@@ -484,6 +578,8 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    sched_params sched_params_cur;
+
     bool sched_need_reserve = true;
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
@@ -544,9 +640,46 @@ private:
         uint32_t               key;
         ggml_backend_sched_ptr sched;
         llm_graph_result     * ready; // the graph allocated in this scheduler, nullptr when it has to be rebuilt
+        bool                   in_flight; // with mtp_graph_keep: a graph of this scheduler submitted since the last wait
+        bool                   planned;       // LLAMA_SCHED_PER_SIZE_RESERVE: planned over the whole memory (sched_small_plan)
+        bool                   planned_extra; // and with the shortlist head's further ids in that plan
     };
     std::vector<sched_small_entry> sched_small;
     bool sched_per_size = false;
+
+    // env: LLAMA_SCHED_PER_SIZE_RESERVE=1 (C803), with per-size schedulers (LLAMA_MTP_GRAPH_KEEP=1 or
+    // LLAMA_SCHED_PER_SIZE=1): a per-size scheduler is planned once, when it is made, from its batch's graph over the
+    // whole memory (and the head shortlist's whole room), as the shared scheduler is at the context's start, so that no
+    // later graph of its shape outgrows the plan; without it the first graph's plan grows with the context, a re-plan
+    // and a larger compute buffer each time (FN84, R60, R85: the MTP draft's 2 to 5 reallocations a request)
+    bool sched_small_reserve = false;
+    llm_graph_result_ptr gf_res_plan; // the graph sched_small_plan and sched_shared_plan build, never computed
+    bool sched_small_plan(sched_small_entry & ss, const llama_ubatch & ubatch, llm_graph_type gtype);
+
+    // env: LLAMA_SCHED_PER_SIZE_RESERVE=2 (C818): =1, and the shared scheduler planned over the whole memory again
+    // whenever it re-plans. Its start plan is made over the whole memory (sched_reserve), so a growing context fits it;
+    // but a graph whose nodes land on other cards than in that plan's graph (the MTP draft's catch-up reads the hidden
+    // rows on the draft's card, the reserve graph takes them from the host) is planned from the graph in hand, sized for
+    // the context of the moment, and from then on the shared scheduler re-plans as the context grows (R130: 18 times in
+    // FN84's prompts, after that one change of cards). With it, a pass whose allocation re-planned the shared scheduler
+    // plans it again as at the start (the largest batch, over the whole memory) but with that batch's kind of input
+    // (sched_shared_plan), then builds and allocates its own graph again, before anything is computed. A re-plan is
+    // any plan the allocation made (ggml_backend_sched_get_n_plans): the scheduler's after a change of devices or a
+    // graph that outgrew the plan, the allocator's own on a single buffer
+    bool sched_shared_whole = false;
+    int32_t sched_shared_replans = 0; // with =2: the passes whose allocation re-planned the shared scheduler
+    int32_t sched_shared_plans   = 0; // and its plans over the whole memory (sched_shared_plan)
+    bool sched_shared_plan(const llama_ubatch & ubatch, llm_graph_type gtype);
+
+    // env: LLAMA_SCHED_TEST_REPLAN=1 (C818, a test): once per context, the first pass of more than 8 tokens that builds
+    // a graph in the shared scheduler first plans it from that graph over the memory as it is, which is what a change of
+    // cards does on a machine with several devices (a CPU has one buffer type, so its cards never change). Nothing
+    // computed changes
+    bool sched_test_replan = false;
+
+    // env: LLAMA_MTP_GRAPH_KEEP=1 (C619), an MTP context only: schedulers per size, keyed also by the head's shortlist
+    // and the hidden-row carry (gf_res_key), and a per-size scheduler waits only for its own graph in flight
+    bool mtp_graph_keep = false;
 
     // env: LLAMA_GRAPH_PER_SIZE=0 keeps the two arenas of llama.cpp before #31156 (batches with and without outputs), so
     // verify batches of every width share one arena and one CUDA graph key, as on -ladder2; 1 (default, as #31156) gives
@@ -555,6 +688,35 @@ private:
 
     // scheduler of the graph of the last process_ubatch(), nullptr for the shared one
     ggml_backend_sched_t sched_active = nullptr;
+
+    // C738: the decode prepared by decode_prepare(), and the mode decode() and process_ubatch() run in: 0 a plain call,
+    // 1 preparing (up to the inputs that need no token id), 2 submitting the prepared call (from the other inputs on)
+    struct verify_prep {
+        bool                                 active = false;
+        std::vector<llama_batch_ext::token>  tokens; // the prepared batch, which the next decode must bring
+        llama_memory_context_ptr             mctx;   // applied
+        llm_graph_result                   * res   = nullptr;
+        ggml_backend_sched_t                 sched = nullptr; // sched_active of the prepared ubatch
+        int32_t                              h_nextn_w = 0;
+        // the settings the graph was chosen with
+        bool                                 embeddings  = false;
+        bool                                 causal_attn = true;
+        bool                                 screen_head = false;
+        std::map<llama_seq_id, llama_sampler *> samplers;
+        // the first device split's inputs uploaded ahead (LLAMA_VERIFY_PREPARE=2)
+        int                                  n_preup     = 0;
+        size_t                               preup_bytes = 0;
+    } vprep;
+    int vprep_mode  = 0;
+    int vprep_level = 0; // LLAMA_VERIFY_PREPARE, read at construction (2: also the uploads)
+    uint64_t vprep_n_prepared = 0;
+    uint64_t vprep_n_refused  = 0;
+    uint64_t vprep_n_dropped  = 0;
+    uint64_t vprep_n_preup    = 0; // inputs uploaded ahead, in all
+
+    // C738: the next decode() brings the prepared batch: compare it, and put its token ids where the prepared call keeps
+    // them (the batch allocator, the ubatch, the memory's cells)
+    void vprep_take_batch(const llama_batch_ext & batch_inp);
 
     ggml_backend_sched_t sched_res() const { return sched_active ? sched_active : sched.get(); }
 
@@ -632,6 +794,23 @@ private:
     std::unique_ptr<llama_embd_cache> embd_cache;
     ggml_backend_t                    embd_cache_backend = nullptr;
 
+    // LLAMA_TENSOR_HASH: the nodes hashed after they are computed, cparams.cb_eval's user data when set (checks)
+    llama_tensor_hash tensor_hash;
+    // LLAMA_NGRAM_PREFETCH (C761): the n-gram rows of a call's later micro-batches prefetched by a helper thread, or
+    // only counted (LLAMA_UBATCH_TRACE, LLAMA_NGRAM_PREFETCH_STATS); nullptr when neither is set or the model has no
+    // mapped n-gram table. ngram_pf_begin plans a decode call (the batch, the first micro-batch's size and the tokens
+    // before the call from the attention cells)
+    std::unique_ptr<llama_ngram_prefetch> ngram_pf;
+    void ngram_pf_begin(uint32_t n_tokens_all, uint32_t n_first);
+
+    // LLAMA_UBATCH_TRACE: the last micro-batch's input times (C761)
+    std::vector<llm_graph_result::input_time> trace_inputs;
+
+public:
+    const llama_ngram_prefetch * get_ngram_pf() const { return ngram_pf.get(); }
+
+private:
+
     // the exact bound and the full-head fallback for the main model's shortlist head (head_bound_init); requested with
     // set_head_bound, used by the decodes with one output
     std::unique_ptr<llama_head_bound> head_bound;
@@ -700,6 +879,36 @@ private:
     ggml_backend_event_ptr ev_layer_inp_read;
     bool ev_layer_inp_read_recorded = false;
 
+    // device buffer with the h_nextn rows, F32 [n_embd_out, n_batch + n_seq_max]:
+    // row r < n_batch is the token at batch index r of the last decode, row n_batch + s is set by the host for seq s
+    // ordered with the reader context like the layer input buffer
+    ggml_context_ptr        ctx_h_nextn_dev;
+    ggml_backend_buffer_ptr buf_h_nextn_dev;
+    ggml_tensor *           h_nextn_dev = nullptr;
+    ggml_backend_dev_t      h_nextn_dev_dev = nullptr;
+    ggml_backend_t          h_nextn_backend = nullptr;
+    // C703: with two halves (h_nextn_halves = 2, LLAMA_MTP_CATCHUP_OVERLAP) the buffer holds the rows above twice, a
+    // decode writes the half of the last one unless a reader holds those rows (hold_h_nextn()), then the other half;
+    // each half has its own events. One half (the default) is the buffer above, events [0]
+    int32_t                 h_nextn_halves    = 1;
+    int32_t                 h_nextn_last      = 0;     // the half the last decode wrote
+    bool                    h_nextn_held      = false; // the next decode writes the other half
+    int64_t                 h_nextn_row0      = 0;     // the first row the decode's graphs write, see build_h_nextn_dev()
+    ggml_backend_event_ptr  ev_h_nextn_written[2];
+    ggml_backend_event_ptr  ev_h_nextn_read[2];
+    bool ev_h_nextn_written_recorded[2] = { false, false };
+    bool ev_h_nextn_read_recorded[2]    = { false, false };
+    // LLAMA_MTP_HROW_LAZY (C813): with two halves asked for, the buffer keeps one half until the first hold, which makes the
+    // second (1), the held rows copied over, so the second half's memory is used only once a call's rows are held while
+    // the next call runs; 2 never makes it (a check of the no-room path). Without room the hold is refused for good and
+    // the reader reads the rows before the next decode, as with one half
+    int32_t                 h_nextn_lazy        = 0;
+    int32_t                 h_nextn_halves_want = 1;     // the halves set_h_nextn_halves() asked for
+    bool                    h_nextn_no_room     = false;
+    // LLAMA_MTP_H_DEV (C693): 1 (default) the buffer above where the output device has events (upstream #31927), 0 the
+    // rows extracted to host memory (the path before #31927), 2 as 1 and also on the CPU without events (checks)
+    int32_t                 h_nextn_dev_mode  = 1;
+
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
@@ -707,6 +916,27 @@ private:
     // thread and its writer are kept apart by the caller)
     std::map<std::pair<llama_seq_id, int32_t>, llama_state_store> state_stores;
     std::mutex state_stores_mtx;
+
+    // C217: the caller's micro-batch cuts, and the device-store fills requested for the next decode (store_at_next)
+    // and taken by the last one (store_at_last, with their blobs)
+    struct store_at_req {
+        llama_seq_id          seq_id;
+        int32_t               store;
+        uint32_t              i_end;
+        llama_state_seq_flags flags;
+
+        bool      done    = false;
+        llama_pos pos_min = -1;
+        llama_pos pos_max = -1;
+
+        std::vector<uint8_t> blob;
+    };
+    std::vector<uint32_t>     ubatch_cuts;
+    std::vector<store_at_req> store_at_next;
+    std::vector<store_at_req> store_at_last;
+
+    // fills r's store from the state as the host holds it now, the copies queued behind the work queued so far
+    bool state_seq_fill_store_at(store_at_req & r);
 
     bool has_evaluated_once = false;
 
@@ -724,6 +954,13 @@ private:
     int32_t            taper_next_head = -1;
     int32_t            taper_next_tail = -1;
 
+    // C742: the next decode copies no h_nextn rows to the host (llama_skip_embeddings_nextn_next), which that call
+    // consumes; since the context was created, the micro-batches that copied their rows to the host and those that left
+    // them out for the mark
+    bool     h_nextn_skip_next = false;
+    uint64_t n_h_nextn_host    = 0;
+    uint64_t n_h_nextn_skipped = 0;
+
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;
 
@@ -739,6 +976,10 @@ private:
     // a graph was handed to the scheduler since the last synchronize(), so with pipeline parallelism it may still be
     // computing on the devices
     mutable bool gf_in_flight = false;
+
+    // LLAMA_STEP_TRACE (C405, llama-step-trace.h): mark the stages of decode() and the waits, as "<role>.<stage>"
+    bool step_trace      = false;
+    char step_trace_role = 'v';
 
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls

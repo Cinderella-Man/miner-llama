@@ -364,6 +364,10 @@ extern "C" {
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
+    // The number of plans of the scheduler's graph allocator so far: each reserve, each re-plan after the backends
+    // changed or a graph outgrew the plan, and the allocator's own re-plan of a single-buffer graph
+    GGML_API int                  ggml_backend_sched_get_n_plans(ggml_backend_sched_t sched);
+
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
@@ -378,6 +382,10 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
+
+    // With LLAMA_UBATCH_TRACE set: ggml_time_us() when the last evaluation launched its first split on a backend other
+    // than the CPU, 0 if none (or the trace is off)
+    GGML_API int64_t              ggml_backend_sched_get_trace_t_dev0(ggml_backend_sched_t sched);
 
     // The caller guarantees that the previous evaluation of this scheduler has finished on every backend before it
     // computes the next one (for example by waiting on an event recorded after the last split). The scheduler then

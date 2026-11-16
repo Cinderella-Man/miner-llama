@@ -2,11 +2,20 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+#include "mmvf-f32-rows.h"
 #include "mmvf-pascal.cuh"
 #include "mmvq-pascal.cuh"
 #include "mmf.cuh"
 #include "moe-tail.cuh"
 #include "convert.cuh"
+
+static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t * x, const int col2) {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    return ggml_cuda_cast<float2>(reinterpret_cast<const __nv_fp8x2_e4m3 *>(x)[col2]);
+#else
+    return make_float2(ggml_cuda_cast<float>(x[2*col2]), ggml_cuda_cast<float>(x[2*col2 + 1]));
+#endif
+}
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
@@ -59,16 +68,24 @@ static __global__ void mul_mat_vec_f(
     bool use_gate = false;
     bool use_bias = false;
     bool use_gate_bias = false;
+    bool use_scale = false;
+    bool use_gate_scale = false;
     ggml_glu_op glu_op = ggml_glu_op::GGML_GLU_OP_SWIGLU;
     float glu_limit = 0.0f;
     const T * gate_x = nullptr;
     const float * x_bias = nullptr;
     const float * gate_bias = nullptr;
+    const float * x_scale = nullptr;
+    const float * gate_scale = nullptr;
 
     if constexpr (has_fusion) {
         use_gate = fusion.gate != nullptr;
         use_bias = fusion.x_bias != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr;
+        if constexpr (std::is_same_v<T, ggml_fp8_e4m3_t>) {
+            use_scale = fusion.x_scale != nullptr;
+            use_gate_scale = fusion.gate_scale != nullptr && use_gate;
+        }
         glu_op = fusion.glu_op;
         glu_limit = fusion.glu_limit;
 
@@ -83,6 +100,12 @@ static __global__ void mul_mat_vec_f(
             use_gate_bias = use_gate;
         } else {
             use_gate_bias = false;
+        }
+        if (use_scale) {
+            x_scale = static_cast<const float *>(fusion.x_scale);
+        }
+        if (use_gate_scale) {
+            gate_scale = static_cast<const float *>(fusion.gate_scale);
         }
     }
 
@@ -99,8 +122,6 @@ static __global__ void mul_mat_vec_f(
             gate_bias += int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
         }
     }
-
-    const float2 * y2 = (const float2 *) y;
 
     extern __shared__ char data_mmv[];
     float * buf_iw = (float *) data_mmv;
@@ -131,6 +152,7 @@ static __global__ void mul_mat_vec_f(
     }
 
     if constexpr (std::is_same_v<T, float>) {
+        const float2 * y2 = (const float2 *) y;
         const float2 * x2 = (const float2 *) x;
         [[maybe_unused]] const float2 * gate_x2 = nullptr;
         if constexpr (has_fusion) {
@@ -163,6 +185,7 @@ static __global__ void mul_mat_vec_f(
             }
         }
     } else if constexpr (std::is_same_v<T, half>) {
+        const float2 * y2 = (const float2 *) y;
         const half2 * x2 = (const half2 *) x;
         [[maybe_unused]] const half2 * gate_x2 = nullptr;
         if constexpr (has_fusion) {
@@ -238,6 +261,7 @@ static __global__ void mul_mat_vec_f(
 #endif // FP16_AVAILABLE
         }
     } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
+        const float2 * y2 = (const float2 *) y;
 //TODO: add support for ggml_cuda_mad for hip_bfloat162
 #if defined(GGML_USE_HIP)
         const int * x2 = (const int *) x;
@@ -304,6 +328,28 @@ static __global__ void mul_mat_vec_f(
             }
         }
 #endif
+    } else if constexpr (std::is_same_v<T, ggml_fp8_e4m3_t>) {
+        const float2 * y2 = (const float2 *) y;
+        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+            const float2 tmpx = mmvf_load_fp8x2(x, col2);
+            float2 tmpx_gate = {};
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    tmpx_gate = mmvf_load_fp8x2(gate_x, col2);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const float2 tmpy = y2[j*stride_col_y2 + col2];
+                ggml_cuda_mad(sumf[j], tmpx, tmpy);
+
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        ggml_cuda_mad(sumf_gate[j], tmpx_gate, tmpy);
+                    }
+                }
+            }
+        }
     } else {
         static_assert(std::is_same_v<T, void>, "unsupported type");
     }
@@ -351,12 +397,18 @@ static __global__ void mul_mat_vec_f(
     float value = sumf[tid];
 
     if constexpr (has_fusion) {
+        if (use_scale) {
+            value *= x_scale[ids ? channel_x : 0];
+        }
         if (use_bias) {
             value += x_bias[tid*stride_col_dst + row];
         }
 
         if (use_gate) {
             float gate_value = sumf_gate[tid];
+            if (use_gate_scale) {
+                gate_value *= gate_scale[ids ? channel_x : 0];
+            }
             if (use_gate_bias) {
                 gate_value += gate_bias[tid*stride_col_dst + row];
             }
@@ -383,7 +435,11 @@ static __global__ void mul_mat_vec_f(
     dst[tid*stride_col_dst + row] = value;
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, glu_limit, gate_x, x_bias, gate_bias, sumf_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, glu_op, glu_limit, gate_x, x_bias, gate_bias,
+            x_scale, gate_scale, sumf_gate);
+    }
+    if constexpr (!std::is_same_v<T, ggml_fp8_e4m3_t>) {
+        GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale);
     }
 }
 
@@ -398,7 +454,8 @@ static void mul_mat_vec_f_switch_fusion(
 
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+        fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
     if constexpr (ncols_dst == 1) {
         if (has_fusion) {
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
@@ -619,7 +676,7 @@ static void mul_mat_vec_f_cuda(
         const int64_t ids_stride, enum ggml_prec prec, cudaStream_t stream) {
 
     if constexpr(std::is_same_v<T, half>) {
-        if (prec == GGML_PREC_DEFAULT) {
+        if (prec == GGML_PREC_UNDEFINED) {
             mul_mat_vec_f_cuda_switch_ncols_dst<T, half>
                 (x, y, ids, fusion, dst, ncols, nrows, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
@@ -668,9 +725,11 @@ static void ggml_cuda_mul_mat_vec_f_impl(ggml_backend_cuda_context & ctx, const 
     GGML_ASSERT(        nb10       == ts_src1);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
     GGML_ASSERT(        nb0        == ts_dst);
+    GGML_ASSERT(src0->type != GGML_TYPE_F8_E4M3 || (uintptr_t) src0->data % alignof(uint16_t) == 0);
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst->op_params[0]) : GGML_PREC_F32;
+    // the fused GLU path gets the GLU node as dst, which carries no matmul precision, so it accumulates in F32
+    const enum ggml_prec prec = fast_fp16_available(cc) && !(fusion && fusion->gate) ? ggml_prec_get_acc(dst) : GGML_PREC_F32;
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
@@ -681,6 +740,7 @@ static void ggml_cuda_mul_mat_vec_f_impl(ggml_backend_cuda_context & ctx, const 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
         GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_F8_E4M3);
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
@@ -689,6 +749,7 @@ static void ggml_cuda_mul_mat_vec_f_impl(ggml_backend_cuda_context & ctx, const 
         }
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
+            GGML_ASSERT(src0->type != GGML_TYPE_F8_E4M3 || (uintptr_t) fusion->gate->data % alignof(uint16_t) == 0);
             fusion_local.gate = fusion->gate->data;
         }
         if (fusion->gate_bias) {
@@ -696,6 +757,18 @@ static void ggml_cuda_mul_mat_vec_f_impl(ggml_backend_cuda_context & ctx, const 
             GGML_ASSERT(fusion->gate_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
             fusion_local.gate_bias = fusion->gate_bias->data;
+        }
+        if (fusion->x_scale) {
+            GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
+            GGML_ASSERT(ggml_nelements(fusion->x_scale) == (ids ? src0->ne[2] : 1));
+            fusion_local.x_scale = fusion->x_scale->data;
+        }
+        if (fusion->gate_scale) {
+            GGML_ASSERT(fusion->gate_scale->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_is_contiguous(fusion->gate_scale));
+            GGML_ASSERT(ggml_nelements(fusion->gate_scale) == (ids ? src0->ne[2] : 1));
+            fusion_local.gate_scale = fusion->gate_scale->data;
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
@@ -748,6 +821,12 @@ static void ggml_cuda_mul_mat_vec_f_impl(ggml_backend_cuda_context & ctx, const 
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
         } break;
+        case GGML_TYPE_F8_E4M3: {
+            const ggml_fp8_e4m3_t * src0_d = (const ggml_fp8_e4m3_t *) src0->data;
+            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+                ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+                ne03, ne3, s03, s13, s3, ids_stride, prec, ctx.stream());
+        } break;
         default:
             GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));
     }
@@ -769,7 +848,7 @@ void ggml_cuda_op_mul_mat_vec_f(
 
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
-    const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst->op_params[0]) : GGML_PREC_F32;
+    const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec_get_acc(dst) : GGML_PREC_F32;
 
     // ggml_cuda_op provides single, contiguous matrices
     const int64_t stride_row         = ne00;
@@ -814,7 +893,78 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
-bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
+// GGML_CUDA_MMVF_F32_MT (C754, Q1330): llama.cpp takes F32 weights on mul_mat_vec_f only up to 3 tokens on NVIDIA cards
+// (below), so on compute 6.1 cuBLAS computes them at 4 to 8 tokens, in its own order. mul_mat_vec_f picks its block size
+// from the row width alone and adds each token's sum in its own chain (a thread's FMAs over its pairs of weights, then
+// the warps' butterflies), so at 4 to 8 tokens it gives each token the one-token kernel's sums bit for bit, reading each
+// weight once. 1: on compute 6.1, 2: on any NVIDIA GPU (tests); for a 2-D matrix outside the graph's compute buffers
+// (weights), times 4 to 8 contiguous columns, that mul_mat_vec_f takes at one token.
+// GGML_CUDA_MMVF_F32_MT_FAULT=1 (checks only): those products add the first half of each row only.
+// GGML_CUDA_MMVF_F32_MT_ROWS (C807, Q1413; default 32): the switch takes a matrix of at most that many rows; 0: any
+// number (C754's rule, for timing). mul_mat_vec_f runs a block per row, and each block reads every token's activations
+// again, so a matrix of many rows reads them once per row where cuBLAS reads them once per tile: on a P106-090 the
+// router (2560 -> 512) took 4.07 ms a four-token verify pass on mul_mat_vec_f against 2.41 on cuBLAS, while the shared
+// expert's gate (2560 -> 1) took 0.29 against 0.61 (R120b). 32 rows of a 2560-wide row are at most two rounds of
+// blocks on the P106-090's 5 SMs at 4-8 tokens (four or five 256-thread blocks an SM).
+// C822 (Q1436): _ROWS=auto, or a list of limits from 4 tokens on, sets a limit per token count (mmvf-f32-rows.h): on a
+// P106-090 cuBLAS is about three times faster at 4 tokens than at 5-8, so mul_mat_vec_f stops gaining at fewer rows
+// there (R132). A single number keeps C807's meaning; the default stays 32.
+static_assert(GGML_CUDA_MMVF_F32_ROWS_MAX_TOKENS == MMVF_MAX_BATCH_SIZE, "the row limits cover the switch's token counts");
+
+static int mmvf_env_int(const char * name, const int def) {
+    const char * env = getenv(name);
+    return env ? atoi(env) : def;
+}
+
+bool ggml_cuda_mul_mat_vec_f_f32_mt(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    static const int mode  = mmvf_env_int("GGML_CUDA_MMVF_F32_MT", 0);
+    static const int fault = mmvf_env_int("GGML_CUDA_MMVF_F32_MT_FAULT", 0);
+    static const ggml_cuda_mmvf_f32_rows rows = ggml_cuda_mmvf_f32_rows_parse(getenv("GGML_CUDA_MMVF_F32_MT_ROWS"));
+    if (mode == 0) {
+        return false;
+    }
+    if (!ggml_cuda_mmvf_f32_rows_take(rows, src0->ne[1], src1->ne[1])) {
+        return false;
+    }
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || (mode == 1 && cc != GGML_CUDA_CC_DP4A)) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src1->ne[1] < 4 || src1->ne[1] > MMVF_MAX_BATCH_SIZE) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            (src0->buffer && ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE)) {
+        return false;
+    }
+    if (src1->nb[0] != sizeof(float) || src1->nb[1] % (2*sizeof(float)) != 0 || dst->nb[0] != sizeof(float) ||
+            (uintptr_t) src0->data % (2*sizeof(float)) != 0 || (uintptr_t) src1->data % (2*sizeof(float)) != 0) {
+        return false;
+    }
+    if (!ggml_cuda_should_use_mmvf(src0, cc, warp_size, /*ne11 =*/ 1)) {
+        return false;
+    }
+    if (fault) {
+        ggml_tensor x = *src0;
+        ggml_tensor y = *src1;
+        x.ne[0] = (src0->ne[0] / 2) & ~int64_t(1);
+        y.ne[0] = x.ne[0];
+        ggml_cuda_mul_mat_vec_f(ctx, &x, &y, nullptr, dst);
+        return true;
+    }
+    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+    return true;
+}
+
+bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, int64_t ne11) {
+    const ggml_type type = src0->type;
+    const int64_t * src0_ne = src0->ne;
+    const size_t * src0_nb = src0->nb;
+
     if (src0_ne[0] % 2 != 0) {
         return false;
     }
@@ -824,11 +974,8 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
         return false;
     }
 
-    // Pointers not aligned to the size of half2/nv_bfloat162/float2 would result in a crash:
-    for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
-        if (src0_nb[i] % (2*ts) != 0) {
-            return false;
-        }
+    if (!ggml_cuda_is_aligned(src0, 2*ts)) {
+        return false;
     }
 
     switch (type) {
@@ -888,6 +1035,18 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                 if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
                     return ne11 <= MMVF_MAX_BATCH_SIZE;
                 }
+                // MMF tiles 32 rows per block, so a matrix of few rows leaves most SMs idle while MMVF runs a block
+                // per row: with a long enough K, MMVF wins for the small batches of speculative decoding as long as
+                // its work (rows x batch) stays small relative to the SM count, with a budget that grows with K
+                if (src0_small && src0_ne[0] >= 1024) {
+                    const bool    blackwell = cc >= GGML_CUDA_CC_BLACKWELL;
+                    const int     nsm       = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+                    const int64_t max_ncols = blackwell ? MMVF_MAX_BATCH_SIZE : 5;
+                    const int64_t max_k     = blackwell ? 6144 : 4096;
+                    if (ne11 <= max_ncols && src0_ne[1]*ne11*256 <= nsm*std::min(src0_ne[0], max_k)) {
+                        return true;
+                    }
+                }
                 if (ampere_mma_available(cc)) {
                     return src0_small && ne11 == 1;
                 }
@@ -907,6 +1066,8 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                 }
                 return ne11 <= MMVF_MAX_BATCH_SIZE;
             }
+            return ne11 <= MMVF_MAX_BATCH_SIZE;
+        case GGML_TYPE_F8_E4M3:
             return ne11 <= MMVF_MAX_BATCH_SIZE;
         default:
             return false;

@@ -23,11 +23,8 @@ bool ggml_op_can_inplace(enum ggml_op op) {
     switch (op) {
         case GGML_OP_FILL:
         case GGML_OP_SCALE:
-        case GGML_OP_DIAG_MASK_ZERO:
-        case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_ADD:
         case GGML_OP_ADD_ID:
-        case GGML_OP_ADD1:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
@@ -493,6 +490,8 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    int n_plans; // the plans made (ggml_gallocr_reserve_n, the automatic one of a single buffer included)
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -822,6 +821,33 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
+// LLAMA_UBATCH_TRACE (C701): why a graph needs a new plan, and which compute buffers grow [TAG_UBATCH_TRACE]
+static bool ggml_gallocr_trace(void) {
+    static int trace = -1;
+    if (trace < 0) {
+        const char * env = getenv("LLAMA_UBATCH_TRACE");
+        trace = env != NULL && atoi(env) != 0;
+    }
+    return trace != 0;
+}
+
+// a tensor larger than its place in the plan: kind, index, its name (and its reader's, for a source), shape and sizes
+static void ggml_gallocr_trace_tensor(ggml_gallocr_t galloc, const char * kind, int i, const struct ggml_tensor * reader,
+        const struct ggml_tensor * t, const struct tensor_alloc * talloc) {
+    if (talloc->buffer_id < 0) {
+        // the plan gave this place no memory (a view, or a tensor with memory of its own, when the plan was made)
+        GGML_LOG_WARN("galloc-trigger: %s %d '%s'%s%s%s (%s) ne = [%lld, %lld, %lld, %lld] needs %zu bytes, planned none\n",
+                kind, i, t->name, reader ? " of '" : "", reader ? reader->name : "", reader ? "'" : "", ggml_op_desc(t),
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], ggml_nbytes(t));
+        return;
+    }
+    GGML_LOG_WARN("galloc-trigger: %s %d '%s'%s%s%s (%s) ne = [%lld, %lld, %lld, %lld] needs %zu bytes in %s, planned %zu\n",
+            kind, i, t->name, reader ? " of '" : "", reader ? reader->name : "", reader ? "'" : "", ggml_op_desc(t),
+            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+            ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], t),
+            ggml_backend_buft_name(galloc->bufts[talloc->buffer_id]), talloc->size_max);
+}
+
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
@@ -932,6 +958,11 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
+            if (ggml_gallocr_trace()) {
+                GGML_LOG_WARN("galloc-grow: %s buffer %.2f -> %.2f MiB%s\n", ggml_backend_buft_name(galloc->bufts[i]),
+                        (galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0) / 1024.0 / 1024.0,
+                        new_size / 1024.0 / 1024.0, no_alloc ? " (size only)" : "");
+            }
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
@@ -960,7 +991,12 @@ void ggml_gallocr_reserve_n_size(
 }
 
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    galloc->n_plans++;
     return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false);
+}
+
+int ggml_gallocr_get_n_plans(ggml_gallocr_t galloc) {
+    return galloc->n_plans;
 }
 
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
@@ -1011,6 +1047,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
 #endif
+        if (ggml_gallocr_trace()) {
+            GGML_LOG_WARN("galloc-trigger: nodes %d -> %d\n", galloc->n_nodes, graph->n_nodes);
+        }
         return true;
     }
 
@@ -1018,6 +1057,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
 #endif
+        if (ggml_gallocr_trace()) {
+            GGML_LOG_WARN("galloc-trigger: leafs %d -> %d\n", galloc->n_leafs, graph->n_leafs);
+        }
         return true;
     }
 
@@ -1029,6 +1071,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
 #endif
+            if (ggml_gallocr_trace()) {
+                ggml_gallocr_trace_tensor(galloc, "node", i, NULL, node, &node_alloc->dst);
+            }
             return true;
         }
 
@@ -1041,6 +1086,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
 #endif
+                if (ggml_gallocr_trace()) {
+                    ggml_gallocr_trace_tensor(galloc, "src", j, node, src, &node_alloc->src[j]);
+                }
                 return true;
             }
         }
@@ -1054,6 +1102,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: leaf %s is not valid\n", __func__, leaf->name);
 #endif
+            if (ggml_gallocr_trace()) {
+                ggml_gallocr_trace_tensor(galloc, "leaf", i, NULL, leaf, &galloc->leaf_allocs[i].leaf);
+            }
             return true;
         }
     }

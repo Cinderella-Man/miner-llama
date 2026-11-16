@@ -43,9 +43,6 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
-    bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
-    bool fused_gdn_ch;       // use fused gated delta net (chunked)
-    bool auto_fgdn;
     bool fused_lid;          // use fused lightning indexer
     bool auto_flid;
     bool fused_dsv4_hc_pre;
@@ -57,7 +54,6 @@ struct llama_cparams {
     bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
     bool auto_fkvr;
     bool no_perf;
-    bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
@@ -67,11 +63,19 @@ struct llama_cparams {
     bool     screen_head;    // screened output head: exact logits only for the candidates of the model's output_screen
     uint32_t screen_head_m;  // number of candidates; 0 = the model's output_screen.top_m
 
+    // the backend samplers' top-k over every output row at once (C691, LLAMA_SAMPLING_TOP_K_ROWS): when every chain
+    // starts with a top-k, one top-k per k and one gather of the logits replace each chain's own, and the chains read
+    // rows of the logits without the padded copy (llm_graph_context::build_sampling)
+    bool sampling_top_k_rows = false;
+
     // a draft's head over a shortlist of tokens (llama_head_shortlist_*), used while head_short_on; head_short_n is the
     // number of further ids at the last change, so that a change rebuilds the graph
     const llama_head_shortlist * head_short    = nullptr;
     bool                         head_short_on = false;
     uint32_t                     head_short_n  = 0;
+    // LLAMA_SCHED_PER_SIZE_RESERVE (C803): set only in the graph a per-size scheduler is planned with, which builds the
+    // shortlist head's further ids for this many ids (its whole room) instead of the list's, 0 otherwise
+    uint32_t                     head_short_n_plan = 0;
 
     // a draft's token embedding rows on its layer's card (llama_embd_cache_init, Q961); embd_cache_on is set per micro-
     // batch, when the batch's tokens read their rows from it, so that the two kinds of batch keep separate graphs
@@ -85,6 +89,12 @@ struct llama_cparams {
     ggml_tensor * nextn_carry     = nullptr;
     bool          nextn_carry_in  = false;
     bool          nextn_carry_out = false;
+
+    // the draft's catch-up writes only its layer's caches (Q1105, LLAMA_MTP_KV_ONLY=1, off by default): an MTP pass with
+    // no output row (the catch-up over a prompt or a verify step's tokens) builds the K and V of its rows, and with QSA
+    // their indexer keys and the pooled keys of the blocks they complete, and nothing else, see
+    // llm_graph_context::kv_only_pass()
+    bool mtp_kv_only = false;
 
     // fewer routed experts on confident tokens (Q618, llama_set_moe_tail, LLAMA_MOE_TAIL): after the router's top-k a
     // slot's weight becomes 0 when the shares of the slots ranked above it already sum to moe_tail_p, or when its own
@@ -122,6 +132,7 @@ struct llama_cparams {
     bool head_bound_on = false;
 
     size_t moe_cache_size;
+    float  moe_cache_cpu_share;
 
     // card-to-card hops (LLAMA_HOP_CAST, off by default): the residual crosses each marked layer boundary as hop_type,
     // cast on the card before the boundary and back to F32 on the card after it (llm_graph_context::build_hop_cast);
@@ -131,6 +142,7 @@ struct llama_cparams {
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
+    bool embeddings_nextn_dev;     // write the unmasked h_nextn rows to a device buffer instead of host, see llama_set_embeddings_nextn_dev()
 
     // staircase drafter (llama_pipe_draft_*): layer inputs the pipe evaluations copy out (kept as graph outputs), and
     // whether a micro-batch with fewer outputs than tokens also computes every position's final hidden state
@@ -145,4 +157,7 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()
+    llama_context * ctx_state_src;
 };

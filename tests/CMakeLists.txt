@@ -161,7 +161,7 @@ if (NOT WIN32)
         NAME test-tokenizers-ggml-vocabs
         LABEL behavior
         WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
-        ARGS https://huggingface.co/ggml-org/vocabs ${PROJECT_SOURCE_DIR}/models/ggml-vocabs
+        ARGS https://huggingface.co/ggml-org-dev/vocabs ${PROJECT_SOURCE_DIR}/models/ggml-vocabs
     )
 endif()
 
@@ -195,6 +195,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-spec-dump.cpp  LABEL behavior)
     llama_build_and_test(test-spec-adapt.cpp  LABEL behavior)
     llama_build_and_test(test-ubatch-taper.cpp  LABEL behavior  LINK llama)
+    llama_build_and_test(test-kv-cache.cpp LABEL behavior)
+    target_include_directories(test-kv-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-chat.cpp  LABEL behavior  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -239,6 +241,12 @@ llama_build(test-bytes-switches.cpp)
 llama_build(test-moe-ids.cpp)
 # route once per verify block (Q860) on a model file, e.g. one test-llama-archs wrote: run by hand
 llama_build(test-route-once.cpp)
+# the QSA k-pool tables kept on the devices (C100) on a qwen4exp file, e.g. one test-llama-archs wrote: run by hand
+llama_build(test-kpool-dev.cpp)
+# the small k-pool inputs in the tables' update (C720) on a qwen4exp file: run by hand
+llama_build(test-kpool-stage.cpp)
+# the QSA pool mask built on the devices (C719) on a qwen4exp file, e.g. one test-llama-archs wrote: run by hand
+llama_build(test-pool-mask-dev.cpp)
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_build(test-fp8.cpp)
     set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
@@ -248,7 +256,9 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     set_tests_properties(test-generate-fp8-models PROPERTIES FIXTURES_SETUP fp8-models)
     llama_test(test-fp8 NAME test-fp8-requantize LABEL "main behavior backend"
         ARGS --models "${FP8_MODEL_DIR}")
-    set_tests_properties(test-fp8-requantize PROPERTIES FIXTURES_REQUIRED fp8-models)
+    llama_test(test-fp8 NAME test-fp8-kv LABEL "main behavior backend"
+        ARGS --models "${FP8_MODEL_DIR}" --kv)
+    set_tests_properties(test-fp8-requantize test-fp8-kv PROPERTIES FIXTURES_REQUIRED fp8-models)
 endif()
 
 set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
@@ -284,6 +294,15 @@ llama_build_and_test(test-speculative-rejection-sampling.cpp ARGS
     -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
 set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQUIRED speculative-model)
 
+# LLAMA_SPEC_REJECT_STOP (Q1187), on the same model: its default off, then on from the environment
+llama_build_and_test(test-spec-reject-stop.cpp ARGS
+    -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
+set_tests_properties(test-spec-reject-stop PROPERTIES FIXTURES_REQUIRED speculative-model)
+llama_test(test-spec-reject-stop NAME test-spec-reject-stop-env ARGS
+    -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
+set_tests_properties(test-spec-reject-stop-env PROPERTIES FIXTURES_REQUIRED speculative-model
+    ENVIRONMENT "LLAMA_SPEC_REJECT_STOP=1")
+
 # Test context state handling across all architectures, using the generated dummy models
 llama_test(
     test-llama-context
@@ -313,6 +332,12 @@ llama_test_cmd(python3
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
     ARGS -m unittest discover -s tests -p test_conversion_fp8.py -v
 )
+llama_test_cmd(python3
+    NAME test-kv-cache-scales
+    LABEL "python behavior"
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    ARGS -m unittest discover -s tests -p test_kv_cache_scales.py -v
+)
 llama_build_and_test(test-json-schema.cpp  LABEL behavior)
 llama_build_and_test(test-chat-auto-parser.cpp  LABEL behavior  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp  LABEL behavior)
@@ -323,6 +348,15 @@ llama_build_and_test(test-cuda-profile-light.cpp  LABEL behavior)
 
 # GGML_CUDA_KEEPALIVE's settings, poll decision and start/stop controller, with a thread for each card's block
 llama_build_and_test(test-cuda-keepalive.cpp  LABEL behavior)
+
+# GGML_CUDA_MMVF_F32_MT_ROWS's limits per token count and GGML_CUDA_MMVF_F32_MT's row decision (C807, C822)
+llama_build_and_test(test-cuda-mmvf-f32-rows.cpp  LABEL behavior)
+
+# GGML_CUDA_GRAPHS_FORCE's choice of graphs and its capture decisions, in a model of the warm-up and capture logic
+llama_build_and_test(test-cuda-graph-force.cpp  LABEL behavior)
+
+# GGML_CUDA_GRAPHS_PATCH's dirty groups, chain cutting and decision, in a model of the recording capture and the patch
+llama_build_and_test(test-cuda-graph-patch.cpp  LABEL behavior)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
@@ -336,15 +370,16 @@ llama_build_and_test(
 )
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
-    set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
+    set(MODEL_NAME "stories15M-q4_0.gguf")
     set(MODEL_HASH "SHA256=66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739")
 else()
-    set(MODEL_NAME "tinyllamas/stories15M-be.Q4_0.gguf")
+    set(MODEL_NAME "stories15M-be.Q4_0.gguf")
     set(MODEL_HASH "SHA256=9aec857937849d976f30397e97eb1cabb53eb9dcb1ce4611ba8247fb5f44c65d")
 endif()
 set(MODEL_DEST "${CMAKE_BINARY_DIR}/${MODEL_NAME}")
 
 add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
+    -DREPO=ggml-org-dev/stories15M
     -DDEST=${MODEL_DEST}
     -DNAME=${MODEL_NAME}
     -DHASH=${MODEL_HASH}
@@ -377,6 +412,13 @@ endif()
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
+
+if (BUILD_SHARED_LIBS)
+    llama_build_and_test(test-llama-mmap.cpp ${PROJECT_SOURCE_DIR}/src/llama-impl.cpp ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp LABEL behavior)
+    target_compile_definitions(test-llama-mmap PRIVATE LLAMA_BUILD)
+else()
+    llama_build_and_test(test-llama-mmap.cpp LABEL behavior)
+endif()
 
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")

@@ -11,6 +11,7 @@
 #include <iterator>
 #include <limits>
 #include <set>
+#include <string>
 #include <vector>
 
 #if defined(__GNUC__)
@@ -582,6 +583,55 @@ public:
         seq_pos_add(i);
 
         has_shift = true;
+    }
+
+    // appends every field of the cells to out as raw bytes, so that two sets of cells in the same state give the same
+    // bytes (used by llama_memory_debug_state, for tests): the cells that are used or carry a sequence (index,
+    // position, shift, ext, sequence bits), the used set, and each sequence's (pos, cell) index and cell bits
+    void debug_state(std::string & out) const {
+        auto put = [&out](const void * p, size_t n) { out.append((const char *) p, n); };
+        auto put_u32 = [&put](uint32_t v) { put(&v, sizeof(v)); };
+
+        put_u32((uint32_t) pos.size());
+        put_u32(has_shift ? 1 : 0);
+
+        for (uint32_t i = 0; i < pos.size(); ++i) {
+            if (pos[i] == -1 && seq[i].none() && shift[i] == 0) {
+                continue;
+            }
+            put_u32(i);
+            put(&pos[i],   sizeof(pos[i]));
+            put(&shift[i], sizeof(shift[i]));
+            put(&ext[i].x, sizeof(ext[i].x));
+            put(&ext[i].y, sizeof(ext[i].y));
+            put(&ext[i].tok, sizeof(ext[i].tok));
+            for (uint32_t w = 0; w < LLAMA_MAX_SEQ/64; ++w) {
+                uint64_t word = 0;
+                for (uint32_t b = 0; b < 64; ++b) {
+                    word |= (uint64_t) seq[i].test(64*w + b) << b;
+                }
+                put(&word, sizeof(word));
+            }
+        }
+
+        put_u32((uint32_t) used.size());
+        for (const uint32_t i : used) {
+            put_u32(i);
+        }
+
+        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (seq_pos[s].empty() && seq_bits[s].empty()) {
+                continue;
+            }
+            put_u32(s);
+            put_u32((uint32_t) seq_pos[s].size());
+            for (const auto & [p, i] : seq_pos[s]) {
+                put(&p, sizeof(p));
+                put_u32(i);
+            }
+            put_u32((uint32_t) seq_bits[s].size());
+            put(seq_bits[s].data(), seq_bits[s].size()*sizeof(uint64_t));
+        }
     }
 
 private:

@@ -64,9 +64,23 @@
 #include <sys/systemcfg.h>
 #endif
 
+#if defined(_WIN32)
+#   define COMMON_ENVIRON _environ
+#elif defined(__APPLE__) && defined(__MACH__)
+#   include <crt_externs.h>
+#   define COMMON_ENVIRON (*_NSGetEnviron())
+#else
+extern char ** environ;
+#   define COMMON_ENVIRON environ
+#endif
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
+
+// C770: the LLAMA_ and GGML_ names the sources read, written at build time by common/switch-names.cmake
+extern const char * const common_switch_names[];
+extern const size_t       common_switch_names_n;
 
 common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
@@ -427,6 +441,10 @@ void common_params_print_info(const common_params & params, bool print_devices) 
     const int verbosity = common_log_get_verbosity_thold();
     COM_INF("%s: verbosity = %d (adjust with the `-lv N` CLI arg)\n", __func__, verbosity);
 
+    // C770: the switches at the INFO level, which llama-server shows at its default verbosity; the library's own
+    // lines that announce a switch are at the library's INFO level (verbosity 4), which it does not
+    COM_INF("%s: %s\n", __func__, common_switches_info().c_str());
+
     // device enumeration creates a primary context on CUDA backends, skip it when the caller does not own any device
     if (print_devices && verbosity >= LOG_LEVEL_TRACE) {
         COM_TRC("%s", "device_info:\n");
@@ -438,6 +456,70 @@ void common_params_print_info(const common_params & params, bool print_devices) 
         }
     }
     COM_TRC("%s\n", common_params_get_system_info(params).c_str());
+}
+
+std::string common_switches_info() {
+    const std::unordered_set<std::string> known(common_switch_names, common_switch_names + common_switch_names_n);
+    // common_arg reads LLAMA_ARG_NO_<X> for every LLAMA_ARG_<X> that has a negative form
+    const auto is_known = [&known](const std::string & name) {
+        return known.count(name) > 0 ||
+            (name.rfind("LLAMA_ARG_NO_", 0) == 0 && known.count("LLAMA_ARG_" + name.substr(13)) > 0);
+    };
+    const auto is_secret = [](const std::string & name) {
+        for (const char * s : { "KEY", "TOKEN", "SECRET", "PASSWORD" }) {
+            if (name.find(s) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::vector<std::pair<std::string, std::string>> vars;
+    for (char ** e = COMMON_ENVIRON; e != nullptr && *e != nullptr; ++e) {
+        const std::string kv = *e;
+        if (kv.rfind("LLAMA_", 0) != 0 && kv.rfind("GGML_", 0) != 0) {
+            continue;
+        }
+        const size_t eq = kv.find('=');
+        vars.emplace_back(kv.substr(0, eq), eq == std::string::npos ? "" : kv.substr(eq + 1));
+    }
+    std::sort(vars.begin(), vars.end());
+
+    // NAME=value, one line: a value that is empty or holds a space is quoted, control characters become '?'
+    const auto item = [&is_secret](const std::pair<std::string, std::string> & v) {
+        if (is_secret(v.first)) {
+            return v.first + "=(hidden)";
+        }
+        std::string value = v.second;
+        for (char & c : value) {
+            if ((unsigned char) c < 0x20 || c == 0x7f) {
+                c = '?';
+            }
+        }
+        if (value.empty() || value.find(' ') != std::string::npos) {
+            value = "\"" + value + "\"";
+        }
+        return v.first + "=" + value;
+    };
+    std::string read;
+    std::string unread;
+    for (const auto & v : vars) {
+        std::string & out = is_known(v.first) ? read : unread;
+        out += (out.empty() ? "" : " ") + item(v);
+    }
+
+    std::ostringstream os;
+    os << "switches: ";
+    if (vars.empty()) {
+        os << "none set";
+    } else {
+        os << vars.size() << " set:" << (read.empty() ? "" : " ") << read;
+        if (!unread.empty()) {
+            os << (read.empty() ? "" : ";") << " not read by this build: " << unread;
+        }
+    }
+    os << " (this build reads " << common_switch_names_n << " LLAMA_ and GGML_ names)";
+    return os.str();
 }
 
 std::string common_params_get_system_info(const common_params & params) {
@@ -896,27 +978,7 @@ bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
     return true;
 }
 
-#include <iostream>
-
-
 #ifdef _WIN32
-std::wstring utf8_to_wstring(const std::string & str) {
-    if (str.empty()) {
-        return std::wstring();
-    }
-
-    int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), NULL, 0);
-
-    if (size <= 0) {
-        return std::wstring();
-    }
-
-    std::wstring wstr(size, 0);
-    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &wstr[0], size);
-
-    return wstr;
-}
-
 std::string wstring_to_utf8(const std::wstring & str) {
     if (str.empty()) {
         return std::string();
@@ -984,20 +1046,9 @@ void common_set_env(const std::string & name, const std::string & value) {
 #endif
 }
 
-std::filesystem::path common_get_path_from_env(const std::string & name) {
-#if defined(_WIN32)
-    const std::wstring wname = utf8_to_wstring(name);
-    const wchar_t * wvalue = _wgetenv(wname.c_str());
-    return wvalue ? std::filesystem::path(wvalue) : std::filesystem::path();
-#else
-    const char * value = std::getenv(name.c_str());
-    return value ? std::filesystem::path(value) : std::filesystem::path();
-#endif
-}
-
 #if !defined(_WIN32)
 static std::filesystem::path get_home_directory() {
-    std::filesystem::path home = common_get_path_from_env("HOME");
+    std::filesystem::path home = common_get_env("HOME");
     if (!home.empty()) {
         return home;
     }
@@ -1010,19 +1061,19 @@ static std::filesystem::path get_home_directory() {
 #endif
 
 std::filesystem::path fs_get_cache_directory() {
-    std::filesystem::path cache_directory = common_get_path_from_env("LLAMA_CACHE");
+    std::filesystem::path cache_directory = common_get_env("LLAMA_CACHE");
     if (!cache_directory.empty()) {
         return cache_directory;
     }
 #if defined(_WIN32)
-    cache_directory = common_get_path_from_env("LOCALAPPDATA");
+    cache_directory = common_get_env("LOCALAPPDATA");
     if (cache_directory.empty()) {
         throw std::runtime_error("Failed to find %LOCALAPPDATA% directory");
     }
 #elif defined(__APPLE__)
     cache_directory = get_home_directory() / "Library/Caches";
 #else
-    cache_directory = common_get_path_from_env("XDG_CACHE_HOME");
+    cache_directory = common_get_env("XDG_CACHE_HOME");
     if (cache_directory.empty()) {
         cache_directory = get_home_directory() / ".cache";
     }
@@ -1033,12 +1084,12 @@ std::filesystem::path fs_get_cache_directory() {
 std::filesystem::path fs_get_config_directory() {
     std::filesystem::path config_directory;
 #if defined(_WIN32)
-    config_directory = common_get_path_from_env("APPDATA");
+    config_directory = common_get_env("APPDATA");
     if (config_directory.empty()) {
         throw std::runtime_error("Failed to find %APPDATA% directory");
     }
 #else
-    config_directory = common_get_path_from_env("XDG_CONFIG_HOME");
+    config_directory = common_get_env("XDG_CONFIG_HOME");
     if (config_directory.empty()) {
         config_directory = get_home_directory() / ".config";
     }
@@ -1054,7 +1105,7 @@ std::filesystem::path fs_get_cache_file(const std::string & filename) {
     if (ec) {
         throw std::runtime_error("failed to create cache directory: " + cache_directory.string());
     }
-    return cache_directory / std::filesystem::u8path(filename);
+    return cache_directory / filename;
 }
 
 //
@@ -1295,13 +1346,13 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
     mparams_dft.share_src     = nullptr;
 
     const common_fit_extra_model extra = {
-        /*.path_model   =*/ params_dft.model.path.c_str(),
+        /*.paths_model  =*/ params_dft.model.get_paths(),
         /*.mparams      =*/ &mparams_dft,
         /*.cparams      =*/ &cparams_dft,
         /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
     };
 
-    common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+    common_fit_params(params.model.get_paths(), &mparams, &cparams,
         params.tensor_split,
         params.tensor_buft_overrides.data(),
         params.fit_params_target.data(),
@@ -1317,7 +1368,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     common_fit_apply(params, mparams, cparams);
 
-    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    llama_model * model = common_model_load(params.model.get_paths(), mparams);
     if (model == NULL) {
         return;
     }
@@ -1348,6 +1399,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_outputs_max_per_seq = 1;
 
         LOG_INF("%s", "decision model reads the embeddings output, enabling embedding mode\n");
+    }
+
+    if (llama_model_classifier_free_guidance(model)) {
+        params.kv_unified   = true;
+        cparams.kv_unified  = true;
+        cparams.n_seq_max  *= 2;
     }
 
     // embeddings need the whole batch in one ubatch, so n_batch must not be larger than n_ubatch
@@ -2035,6 +2092,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+struct llama_model * common_model_load(const std::vector<std::string> & paths, const struct llama_model_params & mparams) {
+    if (paths.size() == 1) {
+        return llama_model_load_from_file(paths[0].c_str(), mparams);
+    }
+
+    std::vector<const char *> c_paths;
+    c_paths.reserve(paths.size());
+    for (const auto & path : paths) {
+        c_paths.push_back(path.c_str());
+    }
+    return llama_model_load_from_splits(c_paths.data(), c_paths.size(), mparams);
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
@@ -2071,7 +2141,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
-    cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_size      = params.moe_cache_size;
+    cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
 
     return cparams;
 }
@@ -2554,6 +2625,14 @@ bool common_batch::set_embd_state(int32_t idx, llama_embd state) {
     return true;
 }
 
+bool common_batch::set_embd_state_row(int32_t idx, int32_t row) {
+    if (idx < 0 || idx >= size() || row < 0 || tokens[idx].state.data != nullptr || tokens[idx].state_row >= 0) {
+        return false;
+    }
+    tokens[idx].state_row = row;
+    return true;
+}
+
 int32_t common_batch::add_embd(llama_embd embd, const llama_pos * pos, llama_seq_id seq_id, bool output) {
     token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, embd, { nullptr, 0, 0 }, {} };
     for (int32_t j = 0; j < n_pos; ++j) {
@@ -2618,6 +2697,9 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         }
         if (t.state.data) {
             llama_batch_ext_set_embd_state(res, idx, t.state); // contexts without a state input ignore it
+        }
+        if (t.state_row >= 0 && !llama_batch_ext_set_embd_state_row(res, idx, t.state_row)) {
+            GGML_ABORT("%s: failed to set the state row of the entry at index %d\n", __func__, i);
         }
         if (t.decision_order != 0) {
             llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);

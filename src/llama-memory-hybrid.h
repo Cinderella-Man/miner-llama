@@ -120,6 +120,9 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    bool tokens_settable() const override;
+    void set_tokens() override;
+
     //
     // llama_memory_hybrid_context
     //

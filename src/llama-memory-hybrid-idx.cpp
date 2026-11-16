@@ -5,13 +5,67 @@
 #include "llama-io.h"
 #include "llama-model.h"
 
+#include "ggml-cpp.h"
+
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
+#include <map>
 #include <stdexcept>
 #include <type_traits>
+
+// LLAMA_QSA_KPOOL_DEV (C100): the k-pool tables kept on the devices
+struct llama_memory_hybrid_idx::kpool_dev_state {
+    struct table {
+        ggml_tensor * cells = nullptr; // I32 [1, cap + n_dump]
+        ggml_tensor * idxs  = nullptr; // I32 [kpool, cap + n_dump]
+        uint64_t      gen   = 0;       // the commit this copy holds: it holds what the host holds while gen == host_gen
+    };
+
+    // the padded entries of an update write their own rows past the end, which no graph reads
+    static constexpr uint32_t n_dump = 256;
+
+    std::vector<ggml_context_ptr>        ctxs;
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    std::vector<table>                   tables; // one per device
+    std::vector<int32_t>                 table_of_il; // per model layer, -1 without an indexer cache
+
+    uint32_t cap   = 0; // rows a graph reads at most: the padded count of every pool the cache can hold
+    uint32_t kpool = 0;
+
+    // what every copy in step holds in rows [0, n_valid)
+    std::vector<int32_t> cells;
+    std::vector<int32_t> idxs;
+    uint32_t n_valid  = 0;
+    uint64_t host_gen = 1;
+
+    // the update the last applied ubatch built (rows into cells and idxs), staged by its graph and committed by next()
+    std::vector<uint32_t> rows;
+    std::vector<int32_t>  sent; // the copies that ubatch's graph updates
+    uint32_t n_valid_next = 0;
+    bool     pending      = false;
+    bool     staged       = false;
+
+    // LLAMA_QSA_KPOOL_DEV_CHECK: what the copies held before the update
+    bool check = false;
+    std::vector<int32_t> prev_cells;
+    std::vector<int32_t> prev_idxs;
+    uint32_t prev_n_valid = 0;
+    bool     prev_in_step = false;
+
+    // LLAMA_QSA_KPOOL_STAGE=1 (C720): the small k-pool inputs ride in the update's stage, see qwen4exp's llm_graph_input_kpool
+    bool stage_small = false;
+
+    uint64_t n_ubatch  = 0;
+    uint64_t n_full    = 0; // updates that rewrote every row a graph reads
+    uint64_t n_rows    = 0; // rows uploaded
+    uint64_t n_read    = 0; // rows the graphs read (what the host used to upload)
+    uint64_t n_checked = 0;
+};
 
 //
 // llama_memory_hybrid_idx
@@ -69,7 +123,10 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, no_alloc, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    kpool_dev_init(model, no_alloc, offload);
+    pool_mask_dev_init(model);
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -248,6 +305,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
         }
     }
 
+    if (kpool_dev) {
+        for (const auto & buf : kpool_dev->bufs) {
+            mb[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+        }
+    }
+
     return mb;
 }
 
@@ -356,6 +419,10 @@ struct llama_memory_hybrid_idx_context::kpool_state {
     uint32_t n_pool_real = 0;
     uint32_t n_new       = 0;
     uint32_t n_new_g     = 1; // graph size of the new pool list, stable across decode steps
+
+    // LLAMA_QSA_KPOOL_DEV: rows of the tables' update (kpool_dev_build) and its graph size, stable across decode steps
+    uint32_t n_upd       = 0;
+    uint32_t n_upd_g     = 1;
 };
 
 namespace {
@@ -363,6 +430,10 @@ namespace {
 // The last padded pool is always unused.
 uint32_t kpool_pad(uint32_t n_pool) {
     return std::max<uint32_t>(64u, GGML_PAD(n_pool + 1, 64u));
+}
+
+uint32_t kpool_dev_n_dump() {
+    return llama_memory_hybrid_idx::kpool_dev_state::n_dump;
 }
 
 // Rank of (pos, cell) in a sequence's cells sorted by position then cell, or -1 when absent.
@@ -374,7 +445,239 @@ int64_t kpool_rank(const std::vector<std::pair<llama_pos, uint32_t>> & cells, ll
 
 }
 
-llama_memory_hybrid_idx::~llama_memory_hybrid_idx() = default;
+llama_memory_hybrid_idx::~llama_memory_hybrid_idx() {
+    if (kpool_dev && kpool_dev->n_ubatch > 0) {
+        const auto & dv = *kpool_dev;
+        LLAMA_LOG_INFO("%s: k-pool tables on %zu devices: %" PRIu64 " ubatches, %" PRIu64 " full, %" PRIu64 " of %" PRIu64
+                       " rows uploaded (%.1f a ubatch), %" PRIu64 " checked\n", __func__, dv.tables.size(), dv.n_ubatch, dv.n_full,
+                       dv.n_rows, dv.n_read, (double) dv.n_rows/dv.n_ubatch, dv.n_checked);
+    }
+    if (pool_mask_st.n_ubatch > 0) {
+        LLAMA_LOG_INFO("%s: QSA pool mask built on the devices: %" PRIu64 " ubatches, %" PRIu64 " checked (%" PRIu64 " masks)\n",
+                       __func__, pool_mask_st.n_ubatch, pool_mask_st.n_checked, pool_mask_st.n_masks);
+    }
+}
+
+void llama_memory_hybrid_idx::pool_mask_dev_init(const llama_model & model) {
+    // read per memory, as LLAMA_QSA_KPOOL_DEV
+    const char * env = getenv("LLAMA_QSA_POOL_MASK_DEV");
+    const int mode = env ? atoi(env) : 0;
+    if (mode <= 0 || mem_idx == nullptr || get_kpool() == 0 || model.arch != LLM_ARCH_QWEN4EXP) {
+        return;
+    }
+
+    const std::vector<uint32_t> layer_ids = mem_idx->get_layer_ids();
+    const bool draft = !layer_ids.empty() && std::all_of(layer_ids.begin(), layer_ids.end(),
+            [&](uint32_t il) { return il >= model.hparams.n_layer(); });
+    if (mode == 2 && !draft) {
+        return;
+    }
+    // tensor split spreads a layer over the devices, so a layer has no one device to build its mask on
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        LLAMA_LOG_WARN("%s: LLAMA_QSA_POOL_MASK_DEV needs no tensor split, keeping the host mask\n", __func__);
+        return;
+    }
+
+    const char * env_check = getenv("LLAMA_QSA_POOL_MASK_DEV_CHECK");
+    pool_mask_check = env_check != nullptr && atoi(env_check) != 0;
+    pool_mask_dev   = true;
+
+    LLAMA_LOG_INFO("%s: QSA pool mask built on the devices (%s)%s\n", __func__, draft ? "MTP draft" : "model",
+            pool_mask_check ? ", checked" : "");
+}
+
+void llama_memory_hybrid_idx::kpool_dev_init(const llama_model & model, bool no_alloc, bool offload) {
+    // read per memory, so that a process can hold contexts with the switch and without it
+    const char * env = getenv("LLAMA_QSA_KPOOL_DEV");
+    const int mode = env ? atoi(env) : 0;
+    if (mode <= 0 || no_alloc || mem_idx == nullptr || get_kpool() == 0 || model.arch != LLM_ARCH_QWEN4EXP) {
+        return;
+    }
+
+    const std::vector<uint32_t> layer_ids = mem_idx->get_layer_ids();
+    const bool draft = !layer_ids.empty() && std::all_of(layer_ids.begin(), layer_ids.end(),
+            [&](uint32_t il) { return il >= model.hparams.n_layer(); });
+    if (mode == 2 && !draft) {
+        return;
+    }
+    // tensor split spreads each tensor over the devices by name, and a cache on the host has no device to keep them on
+    if (!offload || model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        LLAMA_LOG_WARN("%s: LLAMA_QSA_KPOOL_DEV needs the indexer cache offloaded and no tensor split, keeping the uploads\n", __func__);
+        return;
+    }
+
+    const uint32_t kpool   = get_kpool();
+    const uint64_t n_cells = (uint64_t) mem_idx->get_size()*mem_idx->get_n_stream();
+    const uint64_t n_pool  = uint64_t(mem_idx->get_size() / kpool) * mem_idx->get_n_seq_max();
+
+    auto dv = std::make_unique<kpool_dev_state>();
+    dv->kpool = kpool;
+    dv->cap   = kpool_pad((uint32_t) n_pool);
+    // the update carries rows and cells as F32, exact below 2^24
+    GGML_ASSERT(n_cells < (1u << 24) && dv->cap + kpool_dev_state::n_dump < (1u << 24));
+
+    const int64_t n_rows = (int64_t) dv->cap + kpool_dev_state::n_dump;
+
+    dv->table_of_il.assign(model.hparams.n_layer_all, -1);
+    std::map<ggml_backend_buffer_type_t, int32_t> table_of_buft;
+    for (uint32_t il : layer_ids) {
+        if (model.hparams.dsv4_compress_ratios[il] == 0) {
+            continue;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(mem_idx->get_k_storage(il)->buffer);
+
+        auto it = table_of_buft.find(buft);
+        if (it == table_of_buft.end()) {
+            ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+            ggml_context * ctx = ggml_init(ip);
+            GGML_ASSERT(ctx != nullptr);
+            dv->ctxs.emplace_back(ctx);
+
+            kpool_dev_state::table t;
+            t.cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1,     n_rows);
+            t.idxs  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool, n_rows);
+            ggml_format_name(t.cells, "kpool_dev_cells_%zu", dv->tables.size());
+            ggml_format_name(t.idxs,  "kpool_dev_idxs_%zu",  dv->tables.size());
+
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+            if (buf == nullptr) {
+                throw std::runtime_error(format("failed to allocate the k-pool tables in %s", ggml_backend_buft_name(buft)));
+            }
+            // placed like weights: the update that writes them runs where they are
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ggml_backend_buffer_clear(buf, 0);
+            dv->bufs.emplace_back(buf);
+
+            it = table_of_buft.emplace(buft, (int32_t) dv->tables.size()).first;
+            dv->tables.push_back(t);
+        }
+        dv->table_of_il[il] = it->second;
+    }
+    if (dv->tables.empty()) {
+        return;
+    }
+
+    dv->cells.assign(dv->cap, 0);
+    dv->idxs.assign((size_t) dv->cap*kpool, 0);
+    dv->rows.reserve(dv->cap);
+
+    const char * env_check = getenv("LLAMA_QSA_KPOOL_DEV_CHECK");
+    dv->check = env_check != nullptr && atoi(env_check) != 0;
+
+    const char * env_stage = getenv("LLAMA_QSA_KPOOL_STAGE");
+    dv->stage_small = env_stage != nullptr && atoi(env_stage) != 0;
+    if (dv->stage_small) {
+        LLAMA_LOG_INFO("%s: k_idxs, tail_idxs, new_pool_idxs, new_pool_rep and new_pool_pos go up in the k-pool tables' update\n", __func__);
+    }
+
+    size_t size = 0;
+    for (const auto & buf : dv->bufs) {
+        size += ggml_backend_buffer_get_size(buf.get());
+    }
+    LLAMA_LOG_INFO("%s: k-pool tables kept on %zu devices (%s): %u rows, %.2f MiB on the devices, %.2f MiB on the host%s\n",
+            __func__, dv->tables.size(), draft ? "MTP draft" : "model", dv->cap, size/1024.0/1024.0,
+            (dv->cells.size() + dv->idxs.size())*sizeof(int32_t)/1024.0/1024.0, dv->check ? ", checked" : "");
+
+    kpool_dev    = std::move(dv);
+    kpool_dev_on = true;
+}
+
+bool llama_memory_hybrid_idx::kpool_dev_check_on() const {
+    return kpool_dev_on && kpool_dev->check;
+}
+
+void llama_memory_hybrid_idx::kpool_dev_disable() {
+    if (kpool_dev_on) {
+        LLAMA_LOG_INFO("%s: pipelined decoding: the k-pool tables are uploaded whole again\n", __func__);
+    }
+    kpool_dev_on = false;
+}
+
+void llama_memory_hybrid_idx::kpool_dev_commit() {
+    if (!kpool_dev_on) {
+        return;
+    }
+    auto & dv = *kpool_dev;
+    // a ubatch whose graph never staged its update stays pending, so the next build starts over
+    if (!dv.pending || !dv.staged) {
+        return;
+    }
+    dv.n_valid = dv.n_valid_next;
+    dv.host_gen++;
+    for (int32_t t : dv.sent) {
+        dv.tables[t].gen = dv.host_gen;
+    }
+    dv.pending = false;
+    dv.staged  = false;
+}
+
+bool llama_memory_hybrid_idx::kpool_dev_stats(uint64_t * n_ubatch, uint64_t * n_full, uint64_t * n_rows, uint64_t * n_checked) const {
+    if (!kpool_dev) {
+        return false;
+    }
+    if (n_ubatch)  { *n_ubatch  = kpool_dev->n_ubatch;  }
+    if (n_full)    { *n_full    = kpool_dev->n_full;    }
+    if (n_rows)    { *n_rows    = kpool_dev->n_rows;    }
+    if (n_checked) { *n_checked = kpool_dev->n_checked; }
+    return true;
+}
+
+void llama_memory_hybrid_idx::debug_state(std::string & out) const {
+    auto put = [&out](const void * p, size_t n) { out.append((const char *) p, n); };
+    auto put_u32 = [&put](uint32_t v) { put(&v, sizeof(v)); };
+    auto put_u64 = [&put](uint64_t v) { put(&v, sizeof(v)); };
+    auto put_vec = [&put, &put_u32](const auto & v) {
+        put_u32((uint32_t) v.size());
+        put(v.data(), v.size()*sizeof(v[0]));
+    };
+
+    put(mem_idx_stale.data(), mem_idx_stale.size()*sizeof(mem_idx_stale[0]));
+
+    put_u32(kpool_lay ? 1 : 0);
+    if (kpool_lay) {
+        const auto & lay = *kpool_lay;
+        put_u32(lay.n_pool_real);
+        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            const auto & sq = lay.seqs[s];
+            if (sq.cells.empty() && sq.pools.empty() && sq.j_next == 0 && sq.pos_min == 0 && sq.strm == 0) {
+                continue;
+            }
+            put_u32(s);
+            put(&sq.pos_min, sizeof(sq.pos_min));
+            put_u32(sq.strm);
+            put_vec(sq.cells);
+            put_vec(sq.pools);
+            put_u64(sq.j_next);
+        }
+    }
+
+    put_u32(kpool_dev ? 1 : 0);
+    if (kpool_dev) {
+        const auto & dv = *kpool_dev;
+        put_vec(dv.cells);
+        put_vec(dv.idxs);
+        put_u32(dv.n_valid);
+        put_u64(dv.host_gen);
+        put_vec(dv.rows);
+        put_vec(dv.sent);
+        put_u32(dv.n_valid_next);
+        put_u32(dv.pending ? 1 : 0);
+        put_u32(dv.staged  ? 1 : 0);
+        put_u32((uint32_t) dv.tables.size());
+        for (const auto & t : dv.tables) {
+            put_u64(t.gen);
+        }
+        put_u64(dv.n_ubatch);
+        put_u64(dv.n_full);
+        put_u64(dv.n_rows);
+        put_u64(dv.n_read);
+        put_u64(dv.n_checked);
+    }
+
+    put_u64(pool_mask_st.n_ubatch);
+    put_u64(pool_mask_st.n_checked);
+    put_u64(pool_mask_st.n_masks);
+}
 
 const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_layout_get() const {
     GGML_ASSERT(kpool_lay != nullptr);
@@ -487,6 +790,9 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
         st.n_new   = st.n_pool_real;
         st.n_new_g = std::max(st.n_new, 1u);
+        // a full update of every row, or the padded bound of a short one
+        st.n_upd   = kpool_pad(st.n_pool_real);
+        st.n_upd_g = std::max(st.n_upd, kpool_dev_n_dump());
         kpool_st = std::make_unique<kpool_state>(std::move(st));
         i_kpool  = 0;
     }
@@ -526,6 +832,11 @@ bool llama_memory_hybrid_idx_context::next() {
         mem->mem_idx_stale_clear();
     }
 
+    // so is the update of the k-pool tables on the devices
+    if (mem != nullptr && i_kpool == i_cur) {
+        mem->kpool_dev_commit();
+    }
+
     if (ctx_idx) {
         ctx_idx->next();
     }
@@ -550,9 +861,24 @@ bool llama_memory_hybrid_idx_context::apply() {
         }
         kpool_build_state(get_ubatch());
         i_kpool  = i_cur;
+        if (kpool_dev_on()) {
+            kpool_dev_build(get_ubatch());
+        }
     }
 
     return res;
+}
+
+// C738: the attention and indexer caches keep token ids, the k-pool state none
+bool llama_memory_hybrid_idx_context::tokens_settable() const {
+    return llama_memory_hybrid_context::tokens_settable() && (!ctx_idx || ctx_idx->tokens_settable());
+}
+
+void llama_memory_hybrid_idx_context::set_tokens() {
+    llama_memory_hybrid_context::set_tokens();
+    if (ctx_idx) {
+        ctx_idx->set_tokens();
+    }
 }
 
 bool llama_memory_hybrid_idx_context::kpool_track() const {
@@ -593,6 +919,20 @@ ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::scatter_pooled(ggml
 
 ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::gather_pooled(ggml_tensor * idxs) const {
     return ggml_get_rows(ctx, pooled, idxs);
+}
+
+ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::pooled_cells(ggml_tensor * scattered) const {
+    GGML_ASSERT(scattered->op == GGML_OP_SET_ROWS && scattered->src[2] == pooled);
+
+    return ggml_view_3d(ctx, scattered, pooled->ne[0], 1, pooled->ne[1], pooled->nb[1], pooled->nb[1], 0);
+}
+
+bool llama_memory_hybrid_idx_context::kpool_access::indexer_rows() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_QSA_INDEXER_ROWS");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
 }
 
 llama_memory_hybrid_idx_context::kpool_access llama_memory_hybrid_idx_context::get_kpool_access(
@@ -727,12 +1067,357 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
     return kpool_cur().n_new_g;
 }
 
+bool llama_memory_hybrid_idx_context::kpool_dev_on() const {
+    return mem != nullptr && mem->kpool_dev_get() != nullptr;
+}
+
+bool llama_memory_hybrid_idx_context::kpool_dev_check_on() const {
+    return mem != nullptr && mem->kpool_dev_check_on();
+}
+
+bool llama_memory_hybrid_idx_context::kpool_stage_on() const {
+    const auto * dv = mem != nullptr ? mem->kpool_dev_get() : nullptr;
+    return dv != nullptr && dv->stage_small;
+}
+
+bool llama_memory_hybrid_idx_context::pool_mask_dev_on() const {
+    return mem != nullptr && mem->pool_mask_dev_on();
+}
+
+bool llama_memory_hybrid_idx_context::pool_mask_dev_check_on() const {
+    return mem != nullptr && mem->pool_mask_dev_check_on();
+}
+
+void llama_memory_hybrid_idx_context::pool_mask_dev_sent() const {
+    GGML_ASSERT(pool_mask_dev_on());
+    mem->pool_mask_stats().n_ubatch++;
+}
+
+void llama_memory_hybrid_idx_context::pool_mask_dev_check(const std::vector<const ggml_tensor *> & masks, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(pool_mask_dev_check_on());
+
+    // set_input_kpool filled it with this ubatch's ranges
+    const auto & ref = mem->pool_mask_ref();
+
+    std::vector<ggml_fp16_t> got(ref.size());
+    for (const ggml_tensor * m : masks) {
+        const int64_t n_pool = m->ne[0];
+        GGML_ASSERT(m->type == GGML_TYPE_F16 && m->ne[1] == (int64_t) ubatch->n_tokens);
+        GGML_ASSERT(ref.size() == (size_t) n_pool*ubatch->n_tokens);
+
+        ggml_backend_tensor_get(m, got.data(), 0, ggml_nbytes(m));
+        if (memcmp(got.data(), ref.data(), ggml_nbytes(m)) != 0) {
+            size_t n_diff = 0;
+            size_t first  = SIZE_MAX;
+            for (size_t k = 0; k < ref.size(); ++k) {
+                if (got[k] != ref[k]) {
+                    first = std::min(first, k);
+                    n_diff++;
+                }
+            }
+            LLAMA_LOG_ERROR("%s: %s in %s differs from the host mask in %zu of %zu entries, the first pool %zu of token %zu\n",
+                    __func__, m->name, ggml_backend_buffer_name(m->buffer), n_diff, ref.size(),
+                    (size_t) (first % n_pool), (size_t) (first / n_pool));
+            GGML_ABORT("LLAMA_QSA_POOL_MASK_DEV_CHECK: a device's pool mask differs from the host mask");
+        }
+    }
+
+    auto & st = mem->pool_mask_stats();
+    st.n_checked++;
+    st.n_masks += masks.size();
+    if (st.n_checked == 1 || st.n_checked % 256 == 0) {
+        LLAMA_LOG_INFO("%s: %" PRIu64 " ubatches checked: %zu masks built on the devices identical to the host mask "
+                       "(n_pool %" PRId64 ", %u tokens)\n", __func__, st.n_checked, masks.size(),
+                       masks.empty() ? (int64_t) 0 : masks[0]->ne[0], ubatch->n_tokens);
+    }
+}
+
+uint32_t llama_memory_hybrid_idx_context::get_n_kpool_upd() const {
+    return kpool_cur().n_upd_g;
+}
+
+void llama_memory_hybrid_idx_context::kpool_plan_for(const llama_ubatch & ubatch) {
+    if (kpool_st == nullptr) {
+        return;
+    }
+    auto & st = *kpool_st;
+
+    const auto *   idx   = mem->get_mem_idx();
+    const uint32_t kpool = mem->get_kpool();
+
+    // the bounds kpool_build_state and kpool_dev_build pad a ubatch's lists to; a list past them (a long re-pool after
+    // a sequence edit) is padded further and plans again, as without the plan
+    const uint32_t n_pool_max = idx->get_size() / kpool * idx->get_n_seq_max();
+    const uint32_t bound_new  = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
+    st.n_new   = 0;
+    st.n_new_g = std::max(1u, std::min({bound_new, kpool_pad(st.n_pool_real) - 1, n_pool_max}));
+
+    const uint32_t bound_upd = std::min<uint32_t>(GGML_PAD(64 + ubatch.n_tokens/kpool + 2*ubatch.n_seqs_unq + 8, 64u), kpool_dev_n_dump());
+    st.n_upd   = 0;
+    st.n_upd_g = bound_upd;
+}
+
+int32_t llama_memory_hybrid_idx_context::kpool_dev_table(int32_t il, ggml_tensor ** cells, ggml_tensor ** idxs) const {
+    const auto * dv = mem != nullptr ? mem->kpool_dev_get() : nullptr;
+    GGML_ASSERT(dv != nullptr);
+
+    const int32_t t = il >= 0 && (size_t) il < dv->table_of_il.size() ? dv->table_of_il[il] : -1;
+    if (t >= 0) {
+        *cells = dv->tables[t].cells;
+        *idxs  = dv->tables[t].idxs;
+    }
+
+    return t;
+}
+
+// The rows of pool_cells and pool_idxs that differ from what the copies on the devices hold, as set_input_kpool fills
+// them without the switch: each pool's rep cell and member cells (n_kv for a sequence absent from a multi-stream ubatch),
+// then the padded pools on a cell of the ubatch and n_kv. They go into the host's copy at once; next() commits them
+// once the graph that writes them to the devices has run.
+void llama_memory_hybrid_idx_context::kpool_dev_build(const llama_ubatch & ubatch) {
+    auto & dv = *mem->kpool_dev_get();
+    auto & st = *kpool_st;
+
+    const auto & lay = mem->kpool_layout_get();
+
+    const uint32_t kpool       = mem->get_kpool();
+    const uint32_t n_kv        = get_idx()->get_n_kv();
+    const uint32_t n_pool      = kpool_pad(st.n_pool_real);
+    const uint32_t kv_size     = mem->get_mem_idx()->get_size();
+    const uint32_t n_stream_kv = mem->get_mem_idx()->get_n_stream();
+
+    GGML_ASSERT(n_pool <= dv.cap);
+
+    // an update no graph wrote, or a copy a graph left out: the copies may not hold the host's rows, so rewrite them all
+    bool in_step = !dv.pending;
+    for (const auto & t : dv.tables) {
+        in_step = in_step && t.gen == dv.host_gen;
+    }
+    if (!in_step) {
+        dv.n_valid = 0;
+    }
+    dv.pending = false;
+    dv.staged  = false;
+
+    if (dv.check) {
+        dv.prev_cells   = dv.cells;
+        dv.prev_idxs    = dv.idxs;
+        dv.prev_n_valid = dv.n_valid;
+        dv.prev_in_step = in_step;
+    }
+
+    const uint32_t n_valid = dv.n_valid;
+    dv.rows.clear();
+
+    auto put = [&](uint32_t ip, int32_t cell, const int32_t * idxs) {
+        int32_t * c = dv.cells.data() + ip;
+        int32_t * m = dv.idxs.data() + (size_t) ip*kpool;
+        if (ip >= n_valid || *c != cell || memcmp(m, idxs, kpool*sizeof(int32_t)) != 0) {
+            *c = cell;
+            memcpy(m, idxs, kpool*sizeof(int32_t));
+            dv.rows.push_back(ip);
+        }
+    };
+
+    std::vector<uint8_t> seq_in_ub(LLAMA_MAX_SEQ, 0);
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+            seq_in_ub[ubatch.seq_id[i][k]] = 1;
+        }
+    }
+
+    const int32_t sentinel = (int32_t) n_kv;
+
+    std::vector<int32_t> row(kpool);
+
+    uint32_t ip = 0;
+    for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        const auto & sq = lay.seqs[s];
+
+        const bool inert = n_stream_kv > 1 && !seq_in_ub[s];
+
+        for (size_t pi = 0; pi < sq.pools.size(); ++pi, ++ip) {
+            const uint32_t j = sq.pools[pi];
+            GGML_ASSERT(ip + 1 < n_pool);
+
+            for (uint32_t k = 0; k < kpool; ++k) {
+                row[k] = inert ? sentinel : (int32_t) sq.cells[j + k].second;
+            }
+            put(ip, (int32_t) ((int64_t) sq.strm*kv_size + sq.cells[j + kpool - 1].second), row.data());
+        }
+    }
+    GGML_ASSERT(ip == st.n_pool_real);
+
+    // the padded pools: a cell of this ubatch, written before any read, and the sentinel
+    int32_t dummy_cell = 0;
+    {
+        const auto & sq = lay.seqs[ubatch.seq_id[0][0]];
+        auto it = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(ubatch.pos[0], 0u));
+        GGML_ASSERT(it != sq.cells.end() && it->first == ubatch.pos[0]);
+        dummy_cell = (int32_t) ((int64_t) sq.strm*kv_size + it->second);
+    }
+    std::fill(row.begin(), row.end(), sentinel);
+    for (; ip < n_pool; ++ip) {
+        put(ip, dummy_cell, row.data());
+    }
+
+    dv.n_valid_next = std::max(n_valid, n_pool);
+    dv.pending      = true;
+
+    // a decode step updates the pads and a pool or two, rarely more after a sequence edit: pad to a stable bound, so its
+    // graph is reused; a longer update is padded to the next multiple of 64
+    const uint32_t n_upd = (uint32_t) dv.rows.size();
+    const uint32_t bound = std::min<uint32_t>(GGML_PAD(64 + ubatch.n_tokens/kpool + 2*ubatch.n_seqs_unq + 8, 64u), kpool_dev_n_dump());
+
+    st.n_upd   = n_upd;
+    st.n_upd_g = n_upd <= bound ? bound : GGML_PAD(n_upd, 64u);
+    GGML_ASSERT(st.n_upd_g - st.n_upd <= kpool_dev_n_dump());
+
+    dv.n_ubatch++;
+    dv.n_full += n_valid == 0;
+    dv.n_rows += n_upd;
+    dv.n_read += n_pool;
+}
+
+void llama_memory_hybrid_idx_context::set_input_kpool_upd(ggml_tensor * upd, const std::vector<int32_t> & tables) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(upd->buffer) && upd->type == GGML_TYPE_F32);
+
+    auto & dv = *mem->kpool_dev_get();
+    const auto & st = kpool_cur();
+
+    const uint32_t kpool = dv.kpool;
+    const uint32_t n_g   = st.n_upd_g;
+    const uint32_t n_upd = st.n_upd;
+
+    GGML_ASSERT(dv.pending && n_upd == dv.rows.size());
+    // with LLAMA_QSA_KPOOL_STAGE the small inputs follow, which the caller writes
+    GGML_ASSERT(dv.stage_small ? ggml_nelements(upd) > (int64_t) (2 + kpool)*n_g : ggml_nelements(upd) == (int64_t) (2 + kpool)*n_g);
+
+    float * rows  = (float *) upd->data;
+    float * cells = rows + n_g;
+    float * idxs  = rows + 2*n_g;
+
+    for (uint32_t i = 0; i < n_upd; ++i) {
+        const uint32_t ip = dv.rows[i];
+        rows [i] = (float) ip;
+        cells[i] = (float) dv.cells[ip];
+        for (uint32_t k = 0; k < kpool; ++k) {
+            idxs[(size_t) i*kpool + k] = (float) dv.idxs[(size_t) ip*kpool + k];
+        }
+    }
+    for (uint32_t i = n_upd; i < n_g; ++i) {
+        rows [i] = (float) (dv.cap + (i - n_upd));
+        cells[i] = 0.0f;
+        std::fill(idxs + (size_t) i*kpool, idxs + (size_t) (i + 1)*kpool, 0.0f);
+    }
+
+    dv.sent   = tables;
+    dv.staged = true;
+}
+
+void llama_memory_hybrid_idx_context::kpool_dev_check(const ggml_tensor * pool_mask, const ggml_tensor * tail_idxs,
+        const ggml_tensor * new_pool_idxs, const ggml_tensor * new_pool_rep, const ggml_tensor * new_pool_pos,
+        const ggml_tensor * upd, const std::vector<int32_t> & tables, const llama_ubatch * ubatch) const {
+    auto & dv = *mem->kpool_dev_get();
+    const auto & st = kpool_cur();
+
+    const uint32_t kpool  = dv.kpool;
+    const uint32_t n_pool = get_n_kpool();
+    const uint32_t n_g    = st.n_upd_g;
+
+    // the inputs as the host builds them without the switch, into tensors of their own
+    const int n_t = 7;
+    ggml_init_params ip = { n_t*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(ip));
+    auto dup = [&](const ggml_tensor * t) { return t ? ggml_dup_tensor(ctx.get(), t) : nullptr; };
+
+    ggml_tensor * h_cells = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_pool);
+    ggml_tensor * h_idxs  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, kpool, n_pool);
+    ggml_tensor * h_mask  = dup(pool_mask);
+    ggml_tensor * h_tail  = dup(tail_idxs);
+    ggml_tensor * h_nidx  = dup(new_pool_idxs);
+    ggml_tensor * h_nrep  = dup(new_pool_rep);
+    ggml_tensor * h_npos  = dup(new_pool_pos);
+
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
+    GGML_ASSERT(buf);
+
+    set_input_kpool(h_cells, h_idxs, h_mask, h_tail, nullptr, h_nidx, h_nrep, ubatch, h_npos);
+
+    auto same = [&](const ggml_tensor * a, const ggml_tensor * b, const char * name) {
+        if (a == nullptr) {
+            return;
+        }
+        if (ggml_nbytes(a) != ggml_nbytes(b) || memcmp(a->data, b->data, ggml_nbytes(a)) != 0) {
+            GGML_ABORT("%s: %s differs from the host's without the switch (ubatch %" PRIu64 ")", __func__, name, dv.n_ubatch);
+        }
+    };
+    same(pool_mask,     h_mask, "pool_mask");
+    same(tail_idxs,     h_tail, "tail_idxs");
+    same(new_pool_idxs, h_nidx, "new_pool_idxs");
+    same(new_pool_rep,  h_nrep, "new_pool_rep");
+    same(new_pool_pos,  h_npos, "new_pool_pos");
+
+    // the host's copy, which the update leaves on the devices
+    if (memcmp(dv.cells.data(), h_cells->data, ggml_nbytes(h_cells)) != 0 ||
+        memcmp(dv.idxs.data(),  h_idxs->data,  ggml_nbytes(h_idxs))  != 0) {
+        GGML_ABORT("%s: the host's copy of the tables differs from the tables without the switch (ubatch %" PRIu64 ")", __func__, dv.n_ubatch);
+    }
+
+    // each copy as the graphs before left it (the caller synchronized), then this update on it
+    const float * u_rows  = (const float *) upd->data;
+    const float * u_cells = u_rows + n_g;
+    const float * u_idxs  = u_rows + 2*n_g;
+
+    std::vector<int32_t> d_cells((size_t) dv.cap + kpool_dev_n_dump());
+    std::vector<int32_t> d_idxs (d_cells.size()*kpool);
+    for (int32_t t : tables) {
+        const auto & tb = dv.tables[t];
+        ggml_backend_tensor_get(tb.cells, d_cells.data(), 0, ggml_nbytes(tb.cells));
+        ggml_backend_tensor_get(tb.idxs,  d_idxs.data(),  0, ggml_nbytes(tb.idxs));
+
+        if (dv.prev_in_step) {
+            if (memcmp(d_cells.data(), dv.prev_cells.data(), dv.prev_n_valid*sizeof(int32_t)) != 0 ||
+                memcmp(d_idxs.data(),  dv.prev_idxs.data(),  (size_t) dv.prev_n_valid*kpool*sizeof(int32_t)) != 0) {
+                GGML_ABORT("%s: copy %d (%s) does not hold what the host held (ubatch %" PRIu64 ")", __func__, t,
+                        ggml_backend_buffer_name(tb.cells->buffer), dv.n_ubatch);
+            }
+        }
+
+        for (uint32_t i = 0; i < n_g; ++i) {
+            const int64_t r = (int64_t) u_rows[i];
+            GGML_ASSERT((float) r == u_rows[i] && r >= 0 && r < (int64_t) d_cells.size());
+            GGML_ASSERT(i < st.n_upd ? r < (int64_t) n_pool : r >= (int64_t) dv.cap);
+            d_cells[r] = (int32_t) u_cells[i];
+            for (uint32_t k = 0; k < kpool; ++k) {
+                d_idxs[(size_t) r*kpool + k] = (int32_t) u_idxs[(size_t) i*kpool + k];
+            }
+        }
+
+        if (memcmp(d_cells.data(), h_cells->data, ggml_nbytes(h_cells)) != 0 ||
+            memcmp(d_idxs.data(),  h_idxs->data,  ggml_nbytes(h_idxs))  != 0) {
+            GGML_ABORT("%s: copy %d (%s) with this update differs from the tables without the switch (ubatch %" PRIu64 ")",
+                    __func__, t, ggml_backend_buffer_name(tb.cells->buffer), dv.n_ubatch);
+        }
+    }
+
+    dv.n_checked++;
+    if (dv.n_checked == 1 || dv.n_checked % 256 == 0) {
+        LLAMA_LOG_INFO("%s: %" PRIu64 " ubatches checked: %zu copies identical to the tables without the switch (n_pool %u, "
+                       "%u rows updated, %s)\n", __func__, dv.n_checked, tables.size(), n_pool, st.n_upd,
+                       dv.prev_in_step ? "in step" : "rewritten");
+    }
+}
+
 void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
         ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
-    GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(pool_idxs->buffer));
+    // without the tables (LLAMA_QSA_KPOOL_DEV) apply() built them into the host's copy, which the pads' search reads
+    const bool tables = pool_cells != nullptr;
+    GGML_ASSERT(tables == (pool_idxs != nullptr) && (tables || kpool_dev_on()));
+    GGML_ASSERT(!tables || ggml_backend_buffer_is_host(pool_cells->buffer));
+    GGML_ASSERT(!tables || ggml_backend_buffer_is_host(pool_idxs->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_mask->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(tail_idxs->buffer));
 
@@ -743,7 +1428,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     const auto & lay = mem->kpool_layout_get();
 
     const uint32_t n_tokens = ubatch->n_tokens;
-    const uint32_t n_pool   = (uint32_t) pool_cells->ne[0];
+    const uint32_t n_pool   = tables ? (uint32_t) pool_cells->ne[0] : kpool_pad(st.n_pool_real);
     const uint32_t n_new    = st.n_new;
     // the graph always pools at least one entry, padded to a stable bound, see kpool_build_state
     const uint32_t n_new_g  = st.n_new_g;
@@ -752,9 +1437,10 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
-    GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
+    // the mask, or each token's range of visible pools (LLAMA_QSA_POOL_MASK_DEV)
+    GGML_ASSERT(pool_mask->ne[0] == (pool_mask->type == GGML_TYPE_I32 ? 2 : (int64_t) n_pool) && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
-    GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
+    GGML_ASSERT(!tables || (pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool));
     GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
     GGML_ASSERT(ggml_nelements(new_pool_idxs) == (int64_t) kpool*n_new_g);
     // the graph always scatters the fresh pooled keys back into the cache, see build_qsa_sel
@@ -825,8 +1511,8 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     std::vector<llama_pos> pool_end;
     pool_end.reserve(n_pool);
 
-    int32_t * pcell = (int32_t *) pool_cells->data;
-    int32_t * pidx  = (int32_t *) pool_idxs->data;
+    int32_t * pcell = tables ? (int32_t *) pool_cells->data : mem->kpool_dev_get()->cells.data();
+    int32_t * pidx  = tables ? (int32_t *) pool_idxs->data  : nullptr;
     int32_t * nidx  = (int32_t *) new_pool_idxs->data;
     int64_t * nrep  = (int64_t *) new_pool_rep->data;
     int32_t * npos  = new_pool_pos != nullptr ? (int32_t *) new_pool_pos->data : nullptr;
@@ -849,10 +1535,12 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
             // The pooled key lives in the last member's row.
             const uint32_t rep = sq.cells[j + kpool - 1].second;
-            pcell[ip] = (int32_t) gcell(sq, rep);
+            if (tables) {
+                pcell[ip] = (int32_t) gcell(sq, rep);
 
-            for (uint32_t k = 0; k < kpool; ++k) {
-                pidx[(size_t) ip*kpool + k] = inert ? sentinel : (int32_t) sq.cells[j + k].second;
+                for (uint32_t k = 0; k < kpool; ++k) {
+                    pidx[(size_t) ip*kpool + k] = inert ? sentinel : (int32_t) sq.cells[j + k].second;
+                }
             }
 
             if (st.is_new[ip] == st.generation) {
@@ -926,14 +1614,17 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     }
 
     const uint32_t n_pool_real = (uint32_t) pool_end.size();
-    for (uint32_t ip = n_pool_real; ip < n_pool; ++ip) {
+    for (uint32_t ip = n_pool_real; ip < n_pool && tables; ++ip) {
         pcell[ip] = (int32_t) dummy_cell; // pool_cells always addresses the K storage
         for (uint32_t k = 0; k < kpool; ++k) {
             pidx[(size_t) ip*kpool + k] = sentinel;
         }
     }
 
-    // a pool is visible when it belongs to the token's sequence and ends at or before it
+    // a pool is visible when it belongs to the token's sequence and ends at or before it: pools [p0, p0 + nv) of its row.
+    // LLAMA_QSA_POOL_MASK_DEV: rng gets each token's range, which ggml_range_mask expands on the devices, and the host
+    // mask (data) is filled only for the check
+    int32_t * rng = pool_mask->type == GGML_TYPE_I32 ? (int32_t *) pool_mask->data : nullptr;
     auto fill_mask = [&](auto * data) {
         using T = std::remove_pointer_t<decltype(data)>;
         const T keep = llama_cast<T>(0.0f);
@@ -943,14 +1634,20 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             const llama_seq_id s = ubatch->seq_id[i][0];
             const llama_pos    p = ubatch->pos[i];
 
-            T * row = data + (size_t) i*n_pool;
-            std::fill(row, row + n_pool, drop);
-
             const uint32_t p0 = seq_pool_start[s];
             const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
             const uint32_t nv = by_order ? std::min(p1 - p0, (uint32_t) ((rank[i] + 1)/kpool)) :
                 (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
-            std::fill(row + p0, row + p0 + nv, keep);
+
+            if (data != nullptr) {
+                T * row = data + (size_t) i*n_pool;
+                std::fill(row, row + n_pool, drop);
+                std::fill(row + p0, row + p0 + nv, keep);
+            }
+            if (rng != nullptr) {
+                rng[2*i + 0] = (int32_t) p0;
+                rng[2*i + 1] = (int32_t) (p0 + nv);
+            }
 
             // Finite visible pools occupy the first min(nv, n_top) ranked slots.
             if (gm != nullptr) {
@@ -961,7 +1658,15 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
     };
-    if (pool_mask->type == GGML_TYPE_F16) {
+    if (rng != nullptr) {
+        auto & ref = mem->pool_mask_ref();
+        if (mem->pool_mask_dev_check_on()) {
+            ref.resize((size_t) n_pool*n_tokens);
+            fill_mask(ref.data());
+        } else {
+            fill_mask((ggml_fp16_t *) nullptr);
+        }
+    } else if (pool_mask->type == GGML_TYPE_F16) {
         fill_mask((ggml_fp16_t *) pool_mask->data);
     } else {
         fill_mask((float *) pool_mask->data);

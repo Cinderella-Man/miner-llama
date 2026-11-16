@@ -10,6 +10,7 @@
 #include "../src/llama-ext.h" // staging API: llama_head_bound_ith / llama_head_bound_full (Q619)
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -904,6 +905,25 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
     return 0.0f;
 }
 
+// LLAMA_SPEC_REJECT_STOP (Q1187). Without it the drafted tokens behind the end of a turn are verified: they are never
+// output, and with a grammar the row after the end fails it and is drawn again from the full vocabulary on the host.
+// Sample-and-match's third stop, after a device resample, is left out: here that resample's token is output only when
+// the step ends at its row, so the later rows' device draws are independent of every token output
+static std::atomic<int> spec_reject_stop_override{-1};
+
+bool common_spec_reject_stop() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SPEC_REJECT_STOP");
+        return e && atoi(e) != 0;
+    }();
+    const int o = spec_reject_stop_override.load(std::memory_order_relaxed);
+    return o < 0 ? on : o != 0;
+}
+
+void common_spec_reject_stop_set(bool on) {
+    spec_reject_stop_override.store(on ? 1 : 0, std::memory_order_relaxed);
+}
+
 // Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
 // Preserves the target distribution exactly, and accepts more often than matching does when the
 // draft samples instead of taking its argmax.
@@ -913,6 +933,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
+
+    const bool stop = common_spec_reject_stop();
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
     // draws come from the sampler's own stream, so they stay independent of what was drafted
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
@@ -969,6 +993,15 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+
+            // as sample-and-match: no drafted token after an EOG, and the full head once the grammar can reject
+            if (stop && llama_vocab_is_eog(vocab, draft[i]) && i + 1 < draft.size()) {
+                break;
+            }
+            if (stop && common_screen_head_grammar() && llama_get_screen_head(ctx) && common_sampler_grammar_active(gsmpl)) {
+                break;
+            }
+
             continue;
         }
 
@@ -1160,7 +1193,8 @@ static llama_token spec_block_draw(const std::vector<llama_token_data> & dist, d
     return dist.back().id;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
+// next = false: a block accepted whole takes no next token (a block cut at an end of generation)
+static std::vector<llama_token> spec_block_verify(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first, bool next) {
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
 
@@ -1271,6 +1305,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_
     }
 
     if (tau == g) {
+        // as sample-and-match, which samples no row after a drafted EOG
+        if (!next) {
+            return result;
+        }
         y = common_sampler_sample(gsmpl, ctx, idxs[g], grammar_first);
     }
 
@@ -1278,6 +1316,36 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_
     result.push_back(y);
 
     return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
+    GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+
+    // LLAMA_SPEC_REJECT_STOP (Q1263): the block ends at its first drafted EOG before the last drafted token. Without it
+    // the walk accepts the EOG and goes on: the rows behind it are never output, and with a grammar the row after the
+    // end fails it and is drawn again from the full vocabulary on the host. Exact: a draft that ends at its first EOG is
+    // a valid draft (its length a function of its prefix), and no token behind an EOG is output
+    size_t g = draft.size();
+    if (common_spec_reject_stop()) {
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+        for (size_t i = 0; i + 1 < draft.size(); ++i) {
+            if (llama_vocab_is_eog(vocab, draft[i])) {
+                g = i + 1;
+                break;
+            }
+        }
+    }
+
+    if (g == draft.size()) {
+        return spec_block_verify(gsmpl, ctx, idxs, draft, draft_q, grammar_first, true);
+    }
+
+    const std::vector<int> idxs_cut(idxs.begin(), idxs.begin() + g + 1);
+    const llama_tokens     draft_cut(draft.begin(), draft.begin() + g);
+    const std::vector<std::vector<llama_token_data>> draft_q_cut(draft_q.begin(), draft_q.begin() + g);
+
+    return spec_block_verify(gsmpl, ctx, idxs_cut, draft_cut, draft_q_cut, grammar_first, false);
 }
 
 void common_sampler_copy_keep_rng(const struct common_sampler * src, struct common_sampler * dst) {

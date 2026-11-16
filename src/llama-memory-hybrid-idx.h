@@ -107,6 +107,44 @@ public:
     const stale_pos_t & mem_idx_stale_get() const { return mem_idx_stale; }
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
 
+    // LLAMA_QSA_KPOOL_DEV (C100, off by default): the k-pool tables (pool_cells, pool_idxs) kept on the devices, one
+    // copy per device that holds a QSA layer's indexer cache, which each ubatch updates with the rows that changed
+    // instead of an upload of the whole tables; the host keeps what the copies hold. 1: every qwen4exp context, 2: the
+    // MTP draft's only. LLAMA_QSA_KPOOL_DEV_CHECK=1 compares, every ubatch, the copies and the update with the tables
+    // the host builds without the switch. Null when off
+    struct kpool_dev_state;
+    kpool_dev_state * kpool_dev_get() const { return kpool_dev_on ? kpool_dev.get() : nullptr; }
+    bool kpool_dev_check_on() const;
+
+    // pipelined decoding (llama_pipe_init) keeps the uploaded tables: its slots' graphs are in flight together
+    void kpool_dev_disable();
+
+    // LLAMA_QSA_POOL_MASK_DEV (C719, off by default): the QSA pool mask built on each device that runs a QSA layer
+    // (ggml_range_mask) from each token's range of visible pools, I32 [2, n_tokens], instead of the host mask's upload,
+    // F16 [n_pool, n_tokens]. 1: every qwen4exp context, 2: the MTP draft's only. LLAMA_QSA_POOL_MASK_DEV_CHECK=1 reads
+    // every device's mask back after each ubatch and compares it with the host mask
+    struct pool_mask_stats_t {
+        uint64_t n_ubatch  = 0; // ubatches that sent the ranges
+        uint64_t n_checked = 0; // ubatches whose masks the check compared
+        uint64_t n_masks   = 0; // masks it compared, one per device and ubatch
+    };
+    bool pool_mask_dev_on()       const { return pool_mask_dev; }
+    bool pool_mask_dev_check_on() const { return pool_mask_dev && pool_mask_check; }
+    pool_mask_stats_t & pool_mask_stats() const { return pool_mask_st; }
+    // the host mask of the ubatch whose ranges set_input_kpool filled last, filled only with the check
+    std::vector<ggml_fp16_t> & pool_mask_ref() const { return pool_mask_host; }
+
+    // the update of the ubatch before succeeded: the copies its graph updated now hold what the host holds
+    void kpool_dev_commit();
+
+    // counts since the memory was created; false when the switch is off
+    bool kpool_dev_stats(uint64_t * n_ubatch, uint64_t * n_full, uint64_t * n_rows, uint64_t * n_checked) const;
+
+    // appends the indexer's own host state to out as raw bytes (the staleness of each sequence's pools, the pool
+    // layout, what the k-pool tables' copies hold and their counts, the pool mask's counts), so that two memories in the
+    // same state give the same bytes; the caches' cells are llama_kv_cache::debug_state's. For tests (C740)
+    void debug_state(std::string & out) const;
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -128,6 +166,19 @@ private:
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
 
     stale_pos_t mem_idx_stale = stale_pos_clean();
+
+    // unique_ptr because kpool_dev_state is incomplete here
+    std::unique_ptr<kpool_dev_state> kpool_dev;
+    bool kpool_dev_on = false;
+
+    void kpool_dev_init(const llama_model & model, bool no_alloc, bool offload);
+
+    bool pool_mask_dev   = false;
+    bool pool_mask_check = false;
+    mutable pool_mask_stats_t        pool_mask_st;
+    mutable std::vector<ggml_fp16_t> pool_mask_host;
+
+    void pool_mask_dev_init(const llama_model & model);
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -137,6 +188,12 @@ public:
         ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
         ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
+        // every cell's pooled slot as [n_embd, 1, n_cells], the keys ggml_lightning_indexer_rows reads in place; a
+        // view of scatter_pooled's result, so that a reader of it follows the scatter in every graph order
+        ggml_tensor * pooled_cells(ggml_tensor * scattered) const;
+
+        // LLAMA_QSA_INDEXER_ROWS=1: the indexer reads each pool's key in its rep row instead of a gathered copy
+        static bool indexer_rows();
 
     private:
         friend class llama_memory_hybrid_idx_context;
@@ -178,6 +235,9 @@ public:
     bool next()  override;
     bool apply() override;
 
+    bool tokens_settable() const override;
+    void set_tokens() override;
+
     //
     // llama_memory_hybrid_idx_context specific API
     //
@@ -194,9 +254,40 @@ public:
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
     // sel_mask (F32 [n_sel, 1, 1, n_tokens], can be null): 0 for the live selection slots, -inf for the dead ones
     // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
+    // pool_cells and pool_idxs null: the tables are on the devices (kpool_dev_on), apply() built them
+    // pool_mask I32 [2, n_tokens]: each token's range [start, end) of visible pools (pool_mask_dev_on), else the mask
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
+
+    // LLAMA_QSA_KPOOL_DEV (C100): the k-pool tables on the devices, see llama_memory_hybrid_idx::kpool_dev_get
+    bool     kpool_dev_on() const;
+    bool     kpool_dev_check_on() const;
+    // LLAMA_QSA_KPOOL_STAGE (C720): k_idxs, tail_idxs, new_pool_idxs, new_pool_rep and new_pool_pos go up after the
+    // update in its F32 input, and each device casts them back; only with the tables on the devices
+    bool     kpool_stage_on() const;
+    uint32_t get_n_kpool_upd() const; // rows of this ubatch's update, padded to a stable bound
+    // LLAMA_SCHED_PER_SIZE_RESERVE (C803): a whole-cache context (init_full) sized for the plan of one ubatch's shape: the
+    // cache's every cell and pool, as the reserve, but the new-pool list and the tables' update at the stable bounds a
+    // ubatch of this size is padded to, which do not grow with the cache, in place of a re-pool of every pool
+    void     kpool_plan_for(const llama_ubatch & ubatch);
+    // the copy on il's device (I32 [1, n_rows] and I32 [kpool, n_rows]) and its number, -1 if il has none
+    int32_t  kpool_dev_table(int32_t il, ggml_tensor ** cells, ggml_tensor ** idxs) const;
+    // upd (F32 [(2 + kpool)*n_upd]): the rows, then their pool_cells, then their pool_idxs, whole numbers as F32; the
+    // padded entries write rows past the tables' end. tables: the copies this graph updates
+    void     set_input_kpool_upd(ggml_tensor * upd, const std::vector<int32_t> & tables) const;
+    // LLAMA_QSA_KPOOL_DEV_CHECK: the host's tables without the switch, the copies (synchronized) and the update agree
+    void     kpool_dev_check(const ggml_tensor * pool_mask, const ggml_tensor * tail_idxs, const ggml_tensor * new_pool_idxs,
+                             const ggml_tensor * new_pool_rep, const ggml_tensor * new_pool_pos, const ggml_tensor * upd,
+                             const std::vector<int32_t> & tables, const llama_ubatch * ubatch) const;
+
+    // LLAMA_QSA_POOL_MASK_DEV (C719): the pool mask built on the devices, see llama_memory_hybrid_idx::pool_mask_dev_on
+    bool pool_mask_dev_on()       const;
+    bool pool_mask_dev_check_on() const;
+    void pool_mask_dev_sent()     const; // counts a ubatch that sent the ranges
+    // LLAMA_QSA_POOL_MASK_DEV_CHECK: the masks the devices built (synchronized) equal the host mask, n_tokens rows of
+    // n_pool each; aborts on any difference
+    void pool_mask_dev_check(const std::vector<const ggml_tensor *> & masks, const llama_ubatch * ubatch) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;
@@ -220,6 +311,9 @@ private:
     kpool_state kpool_build_sizes() const;
     void kpool_build_state(const llama_ubatch & ubatch);
     const kpool_state & kpool_cur() const;
+
+    // LLAMA_QSA_KPOOL_DEV: this ubatch's tables into the host's copy, and the rows that changed
+    void kpool_dev_build(const llama_ubatch & ubatch);
 
     // unique_ptr because kpool_state is incomplete here.
     std::unique_ptr<kpool_state> kpool_st;

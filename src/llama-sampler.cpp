@@ -1641,6 +1641,47 @@ struct llama_sampler * llama_sampler_init_top_k(int32_t k) {
     );
 }
 
+int32_t llama_sampler_chain_backend_top_k(const llama_sampler * sampler, size_t * i_next) {
+    GGML_ASSERT(sampler != nullptr && sampler->iface == &llama_sampler_chain_i);
+
+    const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+    GGML_ASSERT(chain->is_init);
+
+    // the empty samplers (a penalty, DRY or top-n-sigma that does nothing) add nothing to the graph
+    for (size_t i = 0; i < chain->samplers.size() && chain->samplers[i].is_backend; ++i) {
+        const llama_sampler * smpl = chain->samplers[i].ptr;
+        if (smpl->iface == &llama_sampler_empty_i || smpl->iface->backend_apply == nullptr) {
+            continue;
+        }
+        if (smpl->iface != &llama_sampler_top_k_i) {
+            return 0;
+        }
+        *i_next = i + 1;
+        return ((const llama_sampler_top_k *) smpl->ctx)->k;
+    }
+
+    return 0;
+}
+
+void llama_sampler_chain_backend_apply_from(
+        llama_sampler * sampler, ggml_context * ctx, ggml_cgraph * gf, llama_sampler_data * data, size_t i_first) {
+    GGML_ASSERT(sampler != nullptr && sampler->iface == &llama_sampler_chain_i);
+
+    auto * chain = (llama_sampler_chain *) sampler->ctx;
+    GGML_ASSERT(chain->is_init && "llama_sampler_chain_backend_init() not called");
+
+    for (size_t i = i_first; i < chain->samplers.size(); ++i) {
+        auto & smpl = chain->samplers[i];
+        if (!smpl.is_backend) {
+            break;
+        }
+
+        if (smpl.ptr->iface->backend_apply) {
+            smpl.ptr->iface->backend_apply(smpl.ptr, ctx, gf, data);
+        }
+    }
+}
+
 // top-p
 
 struct llama_sampler_top_p : public llama_sampler_backend {
@@ -2799,8 +2840,6 @@ static struct llama_sampler * llama_sampler_init_grammar_impl(
                       const char * grammar_str,
                       const char * grammar_root,
                               bool lazy,
-                     const char ** trigger_words,
-                            size_t num_trigger_words,
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens,
                      const char ** trigger_patterns,
@@ -2829,7 +2868,7 @@ static void llama_sampler_grammar_reset(struct llama_sampler * smpl) {
 static struct llama_sampler * llama_sampler_grammar_clone(const struct llama_sampler * smpl) {
     const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
 
-    auto * result = llama_sampler_init_grammar_impl(ctx->vocab, nullptr, nullptr, false, nullptr, 0, nullptr, 0, nullptr, 0);
+    auto * result = llama_sampler_init_grammar_impl(ctx->vocab, nullptr, nullptr, false, nullptr, 0, nullptr, 0);
     GGML_ASSERT(result);
 
     // copy the state
@@ -2877,8 +2916,6 @@ static struct llama_sampler * llama_sampler_init_grammar_impl(
                       const char * grammar_str,
                       const char * grammar_root,
                               bool lazy,
-                     const char ** trigger_words,
-                            size_t num_trigger_words,
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens,
                      const char ** trigger_patterns,
@@ -2886,26 +2923,7 @@ static struct llama_sampler * llama_sampler_init_grammar_impl(
     auto * ctx = new llama_sampler_grammar;
 
     if (grammar_str != nullptr && grammar_str[0] != '\0') {
-        std::string trigger_pattern;
-        llama_grammar * grammar = nullptr;
-        // TODO: remove trigger_words support.
-        if (trigger_words != nullptr && num_trigger_words > 0) {
-            GGML_ASSERT(trigger_patterns == nullptr && num_trigger_patterns == 0);
-            trigger_pattern = "[\\s\\S]*?(";
-            for (size_t i = 0; i < num_trigger_words; ++i) {
-                static const std::regex special_chars("[.^$|()*+?\\[\\]{}\\\\]");
-                if (i > 0) {
-                    trigger_pattern += "|";
-                }
-                trigger_pattern += std::regex_replace(trigger_words[i], special_chars, "\\$0");
-            }
-            trigger_pattern += ")[\\s\\S]*";
-
-            std::array<const char *, 1> tmp_trigger_patterns = { trigger_pattern.c_str() };
-            grammar = llama_grammar_init_impl(vocab, grammar_str, grammar_root, lazy, tmp_trigger_patterns.data(), tmp_trigger_patterns.size(), trigger_tokens, num_trigger_tokens);
-        } else {
-            grammar = llama_grammar_init_impl(vocab, grammar_str, grammar_root, lazy, trigger_patterns, num_trigger_patterns, trigger_tokens, num_trigger_tokens);
-        }
+        llama_grammar * grammar = llama_grammar_init_impl(vocab, grammar_str, grammar_root, lazy, trigger_patterns, num_trigger_patterns, trigger_tokens, num_trigger_tokens);
         *ctx = {
             /* .vocab        = */ vocab,
             /* .grammar_str  = */ grammar_str,
@@ -2935,18 +2953,7 @@ struct llama_sampler * llama_sampler_init_grammar(
         const struct llama_vocab * vocab,
                       const char * grammar_str,
                       const char * grammar_root) {
-    return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ false, nullptr, 0, nullptr, 0, nullptr, 0);
-}
-
-struct llama_sampler * llama_sampler_init_grammar_lazy(
-        const struct llama_vocab * vocab,
-                      const char * grammar_str,
-                      const char * grammar_root,
-                     const char ** trigger_words,
-                            size_t num_trigger_words,
-               const llama_token * trigger_tokens,
-                            size_t num_trigger_tokens) {
-    return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, trigger_words, num_trigger_words, trigger_tokens, num_trigger_tokens, nullptr, 0);
+    return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ false, nullptr, 0, nullptr, 0);
 }
 
 struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
@@ -2957,7 +2964,7 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
                             size_t num_trigger_patterns,
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens) {
-    return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, nullptr, 0, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
+    return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
 }
 
 bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl) {

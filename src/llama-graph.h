@@ -20,6 +20,7 @@ struct ggml_tensor;
 struct llama_cparams;
 struct llama_embd_cache;
 struct llama_layer;
+struct llama_model;
 struct llama_prec_policy;
 struct llama_hadamard;
 
@@ -37,6 +38,7 @@ class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
+class llama_ngram_prefetch;
 
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
@@ -49,8 +51,6 @@ enum llm_graph_type {
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
     LLM_FUSED_OP_FLASH_ATTN_KV_ROWS,
-    LLM_FUSED_OP_GDN_AR,
-    LLM_FUSED_OP_GDN_CH,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
@@ -118,6 +118,17 @@ public:
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
+    // C738 (llama_decode_prepare): true if set_input reads no token id of the ubatch, and what it does is the same
+    // whenever it runs between the memory's apply() and the graph's evaluation: such an input may be set before the
+    // batch's last token ids are known. Each class answers for itself only: its subclasses answer false unless they
+    // override it
+    virtual bool sets_without_tokens() const { return false; }
+
+    // after the graph has run and the scheduler synchronized: compare what the devices built from the inputs with the
+    // host's own (LLAMA_QSA_POOL_MASK_DEV_CHECK); the caller asks only when needs_check_outputs() says so
+    virtual bool needs_check_outputs() const { return false; }
+    virtual void check_outputs(const llama_ubatch * ubatch) { GGML_UNUSED(ubatch); }
+
     // return true if the resulting input tensors using the provided graph parameters would be
     //   the same as the previous input tensors that we have currently stored in the object
     virtual bool can_reuse(const llm_graph_params & params) {
@@ -167,7 +178,8 @@ public:
 
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
-    ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch]
+    ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch], the host input or the rows gathered with h_rows
+    ggml_tensor * h_rows = nullptr; // I32 [n_batch], rows of the h_nextn device buffer of ctx_state_src, nullptr on the host path
 
     // set when the graph reads the token rows from a draft's row cache (llama_embd_cache): tokens then holds the
     // batch's slots in it, which the context prepared for this micro-batch
@@ -193,6 +205,9 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * idxs = nullptr; // I64 [n_batch]
+
+    // added to each index when the input is set, nullptr for none (the h_nextn half a decode writes, C703)
+    const int64_t * row0 = nullptr;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -202,6 +217,7 @@ public:
     virtual ~llm_graph_input_pos() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool sets_without_tokens() const override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -267,6 +283,7 @@ public:
     virtual ~llm_graph_input_out_ids() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool sets_without_tokens() const override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -337,6 +354,7 @@ public:
     virtual ~llm_graph_input_rs() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool sets_without_tokens() const override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -346,9 +364,6 @@ public:
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
-
-    // I32 [n_slot] = {n_slot - 1, ..., 0}, rollback slot of each conv window, created by the graphs that write them
-    ggml_tensor * s_slot_rev = nullptr;
 
     const llama_memory_recurrent_context * mctx;
 
@@ -466,6 +481,7 @@ public:
     ~llm_graph_input_attn_kv() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool sets_without_tokens() const override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -792,6 +808,7 @@ public:
     virtual ~llm_graph_input_mem_hybrid() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool sets_without_tokens() const override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -894,7 +911,7 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 class llm_graph_result;
 
 struct llm_graph_params {
-    llm_arch arch = LLM_ARCH_UNKNOWN;
+    const llama_model * model = nullptr;
 
     llama_hparams hparams;
     llama_cparams cparams;
@@ -918,6 +935,8 @@ struct llm_graph_params {
 
     ggml_tensor * layer_inp_dev = nullptr; // own layer input device buffer (write)
     ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
+    ggml_tensor * h_nextn_dev   = nullptr; // own h_nextn device buffer (write)
+    ggml_tensor * h_nextn_src   = nullptr; // ctx_state_src's h_nextn device buffer (read)
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -941,6 +960,13 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    // the first row of h_nextn_dev this decode writes, read when the inputs are set (C703); nullptr for row 0
+    const int64_t * h_nextn_row0 = nullptr;
+
+    // LLAMA_NGRAM_PREFETCH (C761): the context's n-gram row prefetch, which the n-gram input issues its rows through;
+    // nullptr when the context has none
+    llama_ngram_prefetch * ngram_pf = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -1033,7 +1059,9 @@ struct llm_graph_params {
             cparams.moe_route_once_hist     == other.cparams.moe_route_once_hist     &&
             cparams.moe_route_once_dry      == other.cparams.moe_route_once_dry      &&
             cparams.head_bound_on           == other.cparams.head_bound_on           &&
-            arch  == other.arch  &&
+            h_nextn_dev   == other.h_nextn_dev   &&
+            h_nextn_src   == other.h_nextn_src   &&
+            model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
@@ -1066,10 +1094,26 @@ public:
 
     int64_t get_max_nodes() const;
 
+    void set_max_nodes(int64_t max_nodes);
+
     void reset();
 
-    void set_inputs(const llama_ubatch * ubatch);
+    // times: LLAMA_UBATCH_TRACE's split of the inputs (C761): each input type's time in set_input, by type name in the
+    // order of the first input of each type, and how many inputs of that type
+    struct input_time {
+        std::string name; // the class name without llm_graph_input_ (a nested class: its own name)
+        int64_t     us;
+        int32_t     n;
+    };
+    void set_inputs(const llama_ubatch * ubatch, std::vector<input_time> * times = nullptr);
+    // C738: set_inputs in two parts, each input once: the inputs that need no token id (sets_without_tokens), then the
+    // others, each part in the inputs' order
+    void set_inputs_part(const llama_ubatch * ubatch, bool without_tokens);
     void set_outputs(const llm_graph_params & params);
+
+    // see llm_graph_input_i::check_outputs
+    bool needs_check_outputs() const;
+    void check_outputs(const llama_ubatch * ubatch);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
     // this can only be done if we determine that the resulting graph using the new graph parameters
@@ -1077,6 +1121,10 @@ public:
     //   contexts of the input tensors of the graph and we can reuse it for another computation
     // return true if the graph was updated and can be reused
     bool can_reuse(const llm_graph_params & params);
+
+    // why the last can_reuse said no, for LLAMA_UBATCH_TRACE: "params", or the type name of the first input that
+    // rejected; nullptr after a yes
+    const char * reuse_reject = nullptr;
 
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
@@ -1113,6 +1161,8 @@ public:
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
 
+    std::vector<ggml_tensor *> t_sampling_all;
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
@@ -1126,9 +1176,9 @@ public:
 
     ggml_cgraph * gf;
 
+private:
     int64_t max_nodes;
 
-private:
     // keep a copy of the previous graph parameters
     // we will use this to determine whether the graph can be reused by comparing them with the new parameters
     // note: these are updated after constructing the new graph
@@ -1172,8 +1222,13 @@ struct llm_moe_cold_tier {
     ggml_tensor * down_s  = nullptr;
 };
 
+struct llm_graph_moe_cache_slots {
+    ggml_tensor * slots;   // [n_expert_used, n_tokens] slots of the selected experts in the MoE cache, or nullptr
+    ggml_tensor * cpu_ids; // [n_expert_used, n_tokens] misses computed from the host experts, -1 for the other experts, or nullptr
+};
+
 struct llm_graph_context {
-    const llm_arch arch;
+    const llama_model & model;
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;
@@ -1225,6 +1280,10 @@ struct llm_graph_context {
 
     ggml_tensor * layer_inp_dev;
     ggml_tensor * layer_inp_src;
+    ggml_tensor * h_nextn_dev;
+    ggml_tensor * h_nextn_src;
+    const int64_t * h_nextn_row0;
+    llama_ngram_prefetch * ngram_pf; // C761
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1280,13 +1339,14 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
-    // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
+    // if slots is set, the experts are selected by slots instead of ids, from the MoE cache if cached (see build_moe_cache_slots)
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s   = nullptr,
-              ggml_tensor * slots = nullptr) const;
+              ggml_tensor * w_s    = nullptr,
+              ggml_tensor * slots  = nullptr,
+                     bool   cached = true) const;
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range
@@ -1395,12 +1455,14 @@ struct llm_graph_context {
     const llm_moe_cold_tier * cold = nullptr) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
-    ggml_tensor * build_moe_cache_slots(
+    // with cpu_part, also the misses computed from the host experts, if the cache leaves any to the CPU
+    llm_graph_moe_cache_slots build_moe_cache_slots(
              ggml_tensor * selected_experts,
              ggml_tensor * up_exps,
              ggml_tensor * gate_exps,
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
+                    bool   cpu_part,
                      int   il) const;
 
     // the router's weights [1, n_expert_used, n_tokens] (slots in router order) with the low-weight tail of each token
@@ -1437,7 +1499,18 @@ struct llm_graph_context {
 
     // tok_scale: applied to token rows only
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
+
+    // the state input of an MTP graph: rows of the h_nextn device buffer of ctx_state_src (see llama_set_ctx_state_src()),
+    // or uploaded from ubatch.embd_state
+    ggml_tensor * build_inp_embd_state(llm_graph_input_embd_h * inp, int64_t n_embd_state) const;
+
     ggml_tensor * build_inp_pos() const;
+
+    // applies the RoPE of layer il, cur is returned as is if the layer has none
+    ggml_tensor * build_rope(ggml_tensor * cur, ggml_tensor * pos, int il) const;
+
+    // same, for the lightning indexer
+    ggml_tensor * build_rope_indexer(ggml_tensor * cur, ggml_tensor * pos, int il) const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;
@@ -1497,6 +1570,18 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // store K and V of layer il in the cache without attention (for graphs that read no outputs; llama.cpp #31750)
+    void build_attn_kv_store(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+                    int   il) const;
+
+    // an MTP pass whose result nobody reads, so that its layer writes only its caches (cparams.mtp_kv_only, Q1105):
+    // no output row, no unmasked h_nextn rows, no embeddings, and no backend sampler that draws a random number per
+    // chain in every graph (dist), whose draws would then come out of step
+    bool kv_only_pass() const;
+
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 
     ggml_tensor * build_attn(
@@ -1536,6 +1621,12 @@ struct llm_graph_context {
 
     // ggml_top_k_mask with top_k viewed in the row layout of kq_mask, see ggml.h
     ggml_tensor * build_fused_top_k_mask(
+            ggml_tensor * kq_mask, // [n_kv, n_tokens/n_stream, 1, n_stream]
+            ggml_tensor * top_k,   // [n_top, n_tokens]
+                    int   il) const;
+
+    // kq_mask with only the cells named by top_k left visible, for sparse attention
+    ggml_tensor * build_top_k_mask(
             ggml_tensor * kq_mask, // [n_kv, n_tokens/n_stream, 1, n_stream]
             ggml_tensor * top_k,   // [n_top, n_tokens]
                     int   il) const;
@@ -1623,6 +1714,17 @@ struct llm_graph_context {
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
 
+    // store the conv history of the ubatch cells, the last n_cols columns of conv_x {n_cols + n_seq_tokens, channels, n_seqs},
+    // at byte offset offs of each row of s, and with n_rs_seq > 0 once per rollback slot of this ubatch
+    // grp: without rollback slots (n_rs_seq 0), the state group the cells are written to (llama_memory_recurrent::n_grp)
+    void build_conv_state_store(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+            ggml_tensor * conv_x,
+                int64_t   n_cols,
+                 size_t   offs,
+               uint32_t   grp = 0) const;
+
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,
         const llama_ubatch & ubatch,
@@ -1670,6 +1772,9 @@ struct llm_graph_context {
 
     // write enabled layer inputs into layer_inp_dev at their batch rows
     void build_layer_inp_dev() const;
+
+    // write the unmasked h_nextn rows into h_nextn_dev at their batch rows
+    void build_h_nextn_dev() const;
 
     //
     // dense (out)

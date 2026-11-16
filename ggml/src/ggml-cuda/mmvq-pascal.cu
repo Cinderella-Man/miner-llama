@@ -1544,6 +1544,10 @@ bool ggml_cuda_mmvq_pascal_active(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && (mode == 2 || (mode == 1 && cc == GGML_CUDA_CC_DP4A));
 }
 
+bool ggml_cuda_mmvq_pascal_skips(const ggml_type type) {
+    return mmvqp_skip_type(type);
+}
+
 bool ggml_cuda_mmvq_pascal(
         const void * vx, ggml_type type, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion,
         float * dst, int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst, int64_t stride_row_x, int64_t stride_col_y,
@@ -1933,6 +1937,11 @@ bool ggml_cuda_mmvf_pascal_f16(const void * x, const float * y, float * dst, con
 
 bool ggml_cuda_mmvq_pascal_active(const int cc) {
     GGML_UNUSED(cc);
+    return false;
+}
+
+bool ggml_cuda_mmvq_pascal_skips(const ggml_type type) {
+    GGML_UNUSED(type);
     return false;
 }
 

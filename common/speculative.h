@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "common.h"
 
+#include <functional>
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -151,12 +153,18 @@ struct common_spec_adapt_params {
     double   ema      = 1.0/32; // S_RUN: the weight of the latest step
     double   scale    = 1.0;    // multiplies the threshold (> 1 for a drafter more confident than it is right)
     std::string log;            // a file for one JSON line per drafted step (empty: none)
+
+    // C815 (LLAMA_SPEC_ADAPT_ONLINE, with enabled): the rule taken while drafting, so that the drafter runs no pass
+    // whose token the rule cannot keep (common_spec_adapt_continue). 1: drafting stops once an allowed length's test
+    // has failed or past the last allowed length; 2: also as soon as no probability of the tokens still to draft can
+    // make the next allowed length pay. The tokens verified are the switch's as built, given the same draft
+    int32_t online = 0;
 };
 
 // parse LLAMA_SPEC_ADAPT (1: enable), LLAMA_SPEC_ADAPT_COST (T(k) in ms as a comma list, or a file of them, one per
 // line or comma separated, '#' comments), LLAMA_SPEC_ADAPT_WIDTHS, LLAMA_SPEC_ADAPT_DRAFT_MS, LLAMA_SPEC_ADAPT_S
-// (run, step or a number), LLAMA_SPEC_ADAPT_S0, LLAMA_SPEC_ADAPT_EMA, LLAMA_SPEC_ADAPT_SCALE, LLAMA_SPEC_ADAPT_LOG;
-// throws std::invalid_argument on a malformed value
+// (run, step or a number), LLAMA_SPEC_ADAPT_S0, LLAMA_SPEC_ADAPT_EMA, LLAMA_SPEC_ADAPT_SCALE, LLAMA_SPEC_ADAPT_LOG,
+// LLAMA_SPEC_ADAPT_ONLINE (0, 1 or 2); throws std::invalid_argument on a malformed value
 common_spec_adapt_params common_spec_adapt_params_from_env();
 
 // T(k) in ms, k >= 1
@@ -176,6 +184,31 @@ struct common_spec_adapt_choice {
 // common_spec_adapt_lengths, of which those <= p.size() are candidates; s_run: S for S_RUN
 common_spec_adapt_choice common_spec_adapt_choose(const common_spec_adapt_params & params,
         const std::vector<int32_t> & lengths, const std::vector<float> & p, double s_run);
+
+// C815: the rule taken while drafting, for a drafter given the server's parameters, its allowed lengths and the S the
+// step's common_spec_adapt_choose will use. The rule walks the allowed lengths upwards and tests each with the
+// probabilities up to it alone, so a drafter can stop where the walk's outcome is settled.
+struct common_spec_adapt_online {
+    const common_spec_adapt_params * params  = nullptr;
+    const std::vector<int32_t>     * lengths = nullptr;
+    double                           s_run   = 1.0;
+};
+
+// whether drafting one more token can change what common_spec_adapt_choose keeps, p holding the probabilities of the
+// tokens drafted so far: false once an allowed length's test has failed, once p reaches the last allowed length, and
+// (params->online >= 2) once the next allowed length cannot pay even with every token still to draft at probability
+// 1. When false, common_spec_adapt_choose keeps the same tokens of p as of any longer draft that starts with p
+bool common_spec_adapt_continue(const common_spec_adapt_online & a, const std::vector<float> & p);
+
+// whether the token drafted next (position p.size()) completes an allowed length whose test passes whatever its
+// probability: common_spec_adapt_choose then keeps all p.size() + 1 tokens of any draft of that length starting with p
+bool common_spec_adapt_keeps_next(const common_spec_adapt_online & a, const std::vector<float> & p);
+
+// C820: whether common_spec_adapt_continue is false after the token drafted next (position p.size()) whatever its
+// probability, so that the drafting pass that drafts it is the draft's last. Decided at probability 1, the most a token
+// can add: with S fixed or run, every test and bound the walk makes after p only grows with that probability. Always
+// false with S_STEP (a passing test there also raises the next one's threshold) and with params->online <= 0
+bool common_spec_adapt_stops_next(const common_spec_adapt_online & a, const std::vector<float> & p);
 
 // S_RUN's running speed-up: exponential averages of the tokens a step yields and of its modelled cost
 struct common_spec_adapt_state {
@@ -222,6 +255,17 @@ struct common_speculative_draft_params {
     // (DFlash2: the selector's softmax over its candidates; the others: their sampler's top 10); drafters without
     // probabilities (the n-gram ones) leave it shorter than result
     std::vector<float> * result_p = nullptr;
+
+    // C738 (LLAMA_VERIFY_PREPARE): when set, draft-mtp calls it once per draft() after it has queued its last drafting
+    // pass and before it waits for that pass, if the pass will add exactly one token to result (no p_min cut can stop
+    // it): result then holds every other token of the draft. The caller may do host work meanwhile, on other contexts
+    std::function<void()> last_pass = nullptr;
+
+    // C815 (LLAMA_SPEC_ADAPT_ONLINE): when set (with result_p), draft-mtp stops drafting a sequence where
+    // common_spec_adapt_continue says no later token can be kept, and draws on its sampler what the passes left out
+    // would have drawn; last_pass is then called only for a pass whose token the rule keeps whatever its probability
+    // (common_spec_adapt_keeps_next). The caller keeps it alive through common_speculative_draft
+    const common_spec_adapt_online * adapt = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -241,6 +285,38 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+
+// LLAMA_MTP_CATCHUP_OVERLAP=1 (C703): process() may leave the draft's catch-up over a prompt call (no output row) pending
+// until the next process(), which runs it first: the target then has its next call queued. Every function above runs a
+// pending catch-up first. A caller that reads or edits the draft context itself while one is pending queues that work
+// behind it with common_speculative_after_catchup() (run at once when none is pending), or runs it with
+// common_speculative_flush().
+bool common_speculative_pending(const common_speculative * spec);
+bool common_speculative_flush(common_speculative * spec);
+void common_speculative_after_catchup(common_speculative * spec, std::function<void()> && fn);
+
+// C217: whether common_speculative_process of a target batch cut with llama_set_ubatch_cuts (the same cuts given to
+// common_speculative_set_cuts) leaves what separate calls cut there leave, with common_speculative_get_state_at for the
+// state at a cut; true without speculation
+bool common_speculative_incall_ok(const common_speculative * spec);
+
+// C217: what common_speculative_get_state would return had the last processed batch ended before its row i_row
+bool common_speculative_get_state_at(common_speculative * spec, llama_seq_id seq_id, int32_t i_row, std::vector<uint8_t> & data);
+
+// C735: a device-store fill of the draft context inside its pass, as llama_state_seq_store_at takes it
+struct common_speculative_store_at {
+    llama_seq_id          seq_id;
+    int32_t               store;
+    uint32_t              i_end;
+    llama_state_seq_flags flags;
+};
+
+// C735: the micro-batch cuts (llama_set_ubatch_cuts) and the device-store fills (llama_state_seq_store_at) of the draft
+// context's pass over the batch given to the next common_speculative_process, in rows of that batch: the pass takes
+// them when it runs, also once it waits for the target's next call (LLAMA_MTP_CATCHUP_OVERLAP), and a fill's result is
+// read with llama_state_seq_store_at_get(ctx_dft, ...) behind it (common_speculative_after_catchup)
+void common_speculative_set_cuts(common_speculative * spec, const std::vector<uint32_t> & cuts,
+        const std::vector<common_speculative_store_at> & fills);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

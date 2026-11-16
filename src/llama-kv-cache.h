@@ -114,7 +114,9 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // lightning indexer keys are rotated with the indexer RoPE parameters
+                       bool   is_indexer = false);
 
     ~llama_kv_cache() = default;
 
@@ -186,6 +188,22 @@ public:
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
 
+    // LLAMA_KV_SEQ_RM_BOUND=1 (C740, off by default; read when the cache is created): seq_rm visits only the cells it
+    // can change instead of every cell of the stream. For one sequence, the cells of its (pos, cell) index in [p0, p1),
+    // in cell order (sorted when a removal and a refill left them out of order; past 64 such cells, the used range
+    // instead); for every sequence (seq_id < 0), the cells from the first used one to the last. Each is visited by the
+    // same steps in the same order as without the switch, so the cells, head, the cells changed for the device copies
+    // and every table built from them are the same
+    bool get_seq_rm_bound() const { return seq_rm_bound; }
+
+    // with the switch on, since the cache was created: calls for one sequence, of them sorted, of them that scanned
+    // the used range, calls for every sequence, cells visited
+    void seq_rm_stats(uint64_t * out) const;
+
+    // appends the host state of the cache to out as raw bytes (each stream's head and cells, the device copies' change
+    // list), so that two caches in the same state give the same bytes; for tests (llama_memory_debug_state)
+    void debug_state(std::string & out) const;
+
     //
     // graph_build API
     //
@@ -204,6 +222,9 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
+    ggml_tensor * get_k_scale(int32_t il) const;
+    ggml_tensor * get_v_scale(int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -226,6 +247,9 @@ public:
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+
+    // C738: the cells' token ids (ext.tok) again from the ubatch that apply_ubatch() placed there, as apply_ubatch() sets them
+    void apply_ubatch_tokens(const slot_info & sinfo, const llama_ubatch & ubatch);
 
     //
     // input API
@@ -325,6 +349,9 @@ private:
         ggml_tensor * k;
         ggml_tensor * v;
 
+        ggml_tensor * k_scale;
+        ggml_tensor * v_scale;
+
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
@@ -342,6 +369,8 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+
+    const bool is_indexer = false;
 
     // env: LLAMA_ATTN_ROT_DISABLE
     uint32_t n_rot_k = 0;
@@ -398,6 +427,16 @@ private:
 
     void kq_cells_mark(uint32_t strm, uint32_t idx);
 
+    // LLAMA_KV_SEQ_RM_BOUND (see get_seq_rm_bound): the switch, the cells of one call and the counts of seq_rm_stats
+    bool seq_rm_bound  = false;
+    bool seq_rm_nosort = false; // LLAMA_KV_SEQ_RM_BOUND=2, a test hook: the cells in position order, unsorted
+    std::vector<uint32_t> seq_rm_idxs;
+    uint64_t seq_rm_n_seq    = 0;
+    uint64_t seq_rm_n_sorted = 0;
+    uint64_t seq_rm_n_scan   = 0;
+    uint64_t seq_rm_n_any    = 0;
+    uint64_t seq_rm_n_cells  = 0;
+
     std::vector<kv_layer> layers;
 
     // model layer id -> KV cache layer id
@@ -411,12 +450,9 @@ private:
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
                    ggml_context * ctx,
-                    ggml_tensor * cur,
+                    ggml_tensor * k,
                     ggml_tensor * shift,
                     ggml_tensor * rot,
-                    ggml_tensor * factors,
-                          float   freq_base,
-                          float   freq_scale,
                        uint32_t   il) const;
 
     ggml_cgraph * build_graph_shift(
@@ -480,6 +516,9 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    bool tokens_settable() const override;
+    void set_tokens() override;
+
     //
     // llama_kv_cache_context specific API
     //
@@ -493,6 +532,9 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    ggml_tensor * get_k_scale(int32_t il) const;
+    ggml_tensor * get_v_scale(int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
@@ -541,6 +583,9 @@ public:
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+
+    // the cache this context reads (C615: the draft prefetch's state is keyed by it)
+    const llama_kv_cache * get_kv() const { return kv; }
 
 private:
     llama_memory_status status;

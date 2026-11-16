@@ -7,7 +7,9 @@
 //   2. exactness by exact enumeration on random context-dependent targets and drafts: the distribution of the first
 //      g + 1 output tokens (accepted tokens, the next token, then the target's own continuation) equals the target's,
 //      also with drafted tokens the target cannot produce (a grammar's zeros), drafts of top-k support, draft lengths
-//      that depend on the drafted prefix and point-mass proposals (llama-server's grammar-forced tokens)
+//      that depend on the drafted prefix and point-mass proposals (llama-server's grammar-forced tokens), and with a
+//      block cut at an end-of-generation token that takes no next token when it is accepted whole
+//      (LLAMA_SPEC_REJECT_STOP, Q1263)
 //   3. block verification accepts no fewer tokens in expectation than token-by-token rejection, on every instance
 //   4. llama_grammar_forced_text on small grammars
 // Exits 0 when every check passes.
@@ -169,6 +171,8 @@ struct toy {
     double p_zero;     // a target token is 0 with this probability (a grammar's mask), never all of them
     double p_point;    // a draft position is a point mass on a token chosen from the prefix (a forced token)
     double p_stop;     // the drafter stops after a prefix with this probability (a function of the prefix)
+    int    eog;        // >= 0: an end-of-generation token. The block ends after it (the cut of LLAMA_SPEC_REJECT_STOP),
+                       // and a block it ends before g_max takes no next token when it is accepted whole
     uint64_t seed;
 
     std::map<llama_tokens, dist_t> mb_cache, ms_cache;
@@ -290,7 +294,7 @@ static void test_instance(toy & t, int g_max, double & e_block, double & e_token
 
     // the drafter's process: draft token by token from M_s until g_max or its stop rule (a function of the prefix)
     std::function<void(llama_tokens, double)> draft_rec = [&](llama_tokens draft, double pd) {
-        const bool done = (int) draft.size() == g_max || (!draft.empty() && t.stop(draft));
+        const bool done = (int) draft.size() == g_max || (!draft.empty() && (t.stop(draft) || draft.back() == t.eog));
         if (!done) {
             for (const auto & e : t.ms(draft)) {
                 llama_tokens next = draft;
@@ -312,6 +316,8 @@ static void test_instance(toy & t, int g_max, double & e_block, double & e_token
         const auto c  = walk([&](const llama_tokens & ctx) { return t.mb(ctx); }, {}, draft, q);
         const auto pt = tau_probs(c.w);
 
+        const bool cut = (int) g < g_max && draft.back() == t.eog;
+
         for (size_t tau = 0; tau <= g; ++tau) {
             if (pt[tau] <= 0.0) {
                 continue;
@@ -319,6 +325,13 @@ static void test_instance(toy & t, int g_max, double & e_block, double & e_token
             e_block += pd * pt[tau] * tau;
 
             const llama_tokens acc(draft.begin(), draft.begin() + tau);
+
+            // a cut block accepted whole: no next token, and the target's own continuation from there
+            if (tau == g && cut) {
+                continue_target(t, acc, pd * pt[tau], L, out_dist);
+                continue;
+            }
+
             dist_t next;
             if (tau == g) {
                 next = t.mb(acc);
@@ -363,7 +376,7 @@ static void test_instance(toy & t, int g_max, double & e_block, double & e_token
 }
 
 static void test_enumeration() {
-    struct config { const char * name; int n_vocab, top_k, g_max; double p_zero, p_point, p_stop; int n; };
+    struct config { const char * name; int n_vocab, top_k, g_max; double p_zero, p_point, p_stop; int n; int eog = -1; };
     const config cfgs[] = {
         { "dense, g = 1",                         3, 0, 1, 0.0,  0.0, 0.0, 300 },
         { "dense, g = 2",                         3, 0, 2, 0.0,  0.0, 0.0, 300 },
@@ -376,6 +389,8 @@ static void test_enumeration() {
         { "point masses (forced tokens), g = 3",  3, 0, 3, 0.2,  0.4, 0.0, 200 },
         { "length set by the prefix, g <= 4",     3, 0, 4, 0.0,  0.0, 0.4, 200 },
         { "all of them, g <= 4",                  3, 2, 4, 0.25, 0.3, 0.3, 200 },
+        { "cut at an EOG, g <= 4",                3, 0, 4, 0.0,  0.0, 0.0, 200, 0 },
+        { "cut at an EOG + all of them, g <= 4",  3, 2, 4, 0.25, 0.3, 0.3, 200, 0 },
     };
 
     for (const auto & cfg : cfgs) {
@@ -390,6 +405,7 @@ static void test_enumeration() {
             t.p_zero  = cfg.p_zero;
             t.p_point = cfg.p_point;
             t.p_stop  = cfg.p_stop;
+            t.eog     = cfg.eog;
             t.seed    = 1000003ull * (uint64_t) (&cfg - cfgs) + (uint64_t) k + 1;
 
             double e_block = 0.0, e_token = 0.0, err = 0.0;

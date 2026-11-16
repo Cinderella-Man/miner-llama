@@ -16,6 +16,7 @@ set(LLAMA_CORE_SOURCES
     llama-chat.cpp
     llama-context.cpp
     llama-cparams.cpp
+    llama-draft-prefetch.cpp
     llama-embd-cache.cpp
     llama-grammar.cpp
     llama-graph.cpp
@@ -37,12 +38,14 @@ set(LLAMA_CORE_SOURCES
     llama-memory-hybrid-idx.cpp
     llama-memory-recurrent.cpp
     llama-mmap.cpp
+    llama-ngram-prefetch.cpp
     llama-model-loader.cpp
     llama-model-saver.cpp
     llama-model.cpp
     llama-pipe-drafter.cpp
     llama-quant.cpp
     llama-sampler.cpp
+    llama-step-trace.cpp
     llama-vocab.cpp
     unicode-data.cpp
     unicode.cpp
@@ -73,7 +76,8 @@ target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
-target_link_libraries(llama PUBLIC ggml)
+find_package(Threads REQUIRED)
+target_link_libraries(llama PUBLIC ggml PRIVATE Threads::Threads)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

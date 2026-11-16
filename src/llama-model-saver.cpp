@@ -57,7 +57,8 @@ void llama_model_saver::add_kv(const enum llm_kv key, const char value) {
 template <typename Container>
 void llama_model_saver::add_kv(const enum llm_kv key, const Container & value, const bool per_layer) {
     GGML_ASSERT(model != nullptr || !per_layer);
-    const size_t n_values = per_layer ? size_t(model->hparams.n_layer()) : value.size();
+    // one value per block, the nextn (MTP) blocks included: the loader reads block_count values
+    const size_t n_values = per_layer ? size_t(model->hparams.n_layer_all) : value.size();
     GGML_ASSERT(n_values <= value.size());
 
     if (n_values == 0) {
@@ -210,6 +211,8 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_MOE_LATENT_SIZE,                   hparams.moe_latent_size);
     add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp);
     add_kv(LLM_KV_EXPERT_CHUNK_FEED_FORWARD_LENGTH,  hparams.n_ff_chexp);
+    add_kv(LLM_KV_SWIGLU_CLAMP, std::vector<float>(
+            hparams.swiglu_clamp.begin(), hparams.swiglu_clamp.begin() + hparams.n_layer_all));
     add_kv(LLM_KV_SWIGLU_CLAMP_EXP, std::vector<float>(
             hparams.swiglu_clamp_exp.begin(), hparams.swiglu_clamp_exp.begin() + hparams.n_layer_all));
     add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP, std::vector<float>(
@@ -329,7 +332,7 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,        hparams.dsv4_o_lora_rank);
     add_kv(LLM_KV_ATTENTION_PASS_LORA_RANK,          hparams.metis_pass_lora_rank);
     add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, hparams.dsv4_compress_rope_base);
-    if (model->arch == LLM_ARCH_DEEPSEEK4 || hparams.dsv4_hc_mult > 0) {
+    if (model->arch == LLM_ARCH_DEEPSEEK4 || (hparams.dsv4_hc_mult > 0 && model->arch != LLM_ARCH_XING4_0)) {
         // the loader requires one compress ratio per layer, including nextn layers
         const std::vector<uint32_t> compress_ratios(
                 hparams.dsv4_compress_ratios.begin(), hparams.dsv4_compress_ratios.begin() + hparams.n_layer_all);

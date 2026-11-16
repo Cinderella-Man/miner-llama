@@ -2,6 +2,9 @@
 #include "mmvq-pascal.cuh"
 #include "mmvq-pascal-kcol.cuh"
 #include "mmvq-pascal-mtok.cuh"
+#include "mmvq-pascal-q5k.cuh"
+#include "mmvq-pascal-dmt.cuh"
+#include "mmvq-pascal-q3kmt.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -31,10 +34,6 @@ static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
         default:
             return false;
     }
-}
-
-static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
-    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
 }
 #endif
 
@@ -867,10 +866,10 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
                     const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
-                    mmvq_prefetch_l2((const char *) vx + off);
+                    ggml_cuda_prefetch_l2((const char *) vx + off);
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            mmvq_prefetch_l2((const char *) vgate + off);
+                            ggml_cuda_prefetch_l2((const char *) vgate + off);
                         }
                     }
                 }
@@ -1719,7 +1718,7 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
     const void * src1_q8 = src1_q8_1_norm != nullptr ? src1_q8_1_norm : (const void *) src1_q8_1.get();
     if (ggml_nrows(src1) == 1) {
@@ -1747,6 +1746,26 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    // 2 to 4 tokens of a plain Q5_K product with GGML_CUDA_MMVQ_PASCAL_Q5K_MT (the output layer of a verify), 5 to 8 with
+    // _RO8, one with _Q5K_1R: each weight decoded once for all tokens, each token's sums those of the one-token kernel
+    if (!ids && !fusion && src0->type == GGML_TYPE_Q5_K && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_cuda_mmvq_pascal_q5k_mt(src0->data, src1_q8, dst_d, ne00, ne01, ne11, nb01, s11, s1, stream)) {
+        return;
+    }
+    // ... and of a plain IQ4_XS or Q4_K product with GGML_CUDA_MMVQ_PASCAL_DMT (5 to 8 with _RO8: the attention and
+    // recurrent projections of a verify and of the draft line's five-token passes), the same way, and of a Q6_K
+    // product with GGML_CUDA_MMVQ_PASCAL_Q6K_MT (C727)
+    if (!ids && !fusion && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_cuda_mmvq_pascal_dmt(src0->type, src0->data, src1_q8, dst_d, ne00, ne01, ne11, nb01, s11, s1, stream)) {
+        return;
+    }
+    // ... and 2 to 8 tokens of a plain Q3_K product with GGML_CUDA_MMVQ_PASCAL_Q3K_MT, each token's sums those of the
+    // k-column kernel at one token (Q3_K's one-token kernel)
+    if (!ids && !fusion && src0->type == GGML_TYPE_Q3_K && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_cuda_mmvq_pascal_q3kmt(src0->data, src1_q8, dst_d, ne00, ne01, ne11, nb01, s11, s1, stream)) {
+        return;
+    }
 
     // 2 to 8 tokens of Q2_0 experts (and since Q713 the grid types' and IQ1_M's): each distinct expert read once for all the
     // tokens that picked it

@@ -2,6 +2,7 @@
 #include "fattn-common.cuh"
 #include "fattn-sparse-pascal-impl.cuh"
 
+#include <algorithm>
 #include <cstdlib>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -9,12 +10,10 @@
 namespace {
 
 struct fasp_env {
-    int   mode      = 0;
-    int   nq        = 8;
-    int   splits    = 0;
-    int   nsm       = 0;
-    int   fault     = 0;
-    float min_ratio = 1.5f;
+    fasp_rule rule;
+    int       splits = 0;
+    int       nsm    = 0;
+    int       fault  = 0;
 };
 
 static int fasp_env_int(const char * name, const int def) {
@@ -22,16 +21,25 @@ static int fasp_env_int(const char * name, const int def) {
     return env ? atoi(env) : def;
 }
 
+static float fasp_env_float(const char * name, const float def) {
+    const char * env = getenv(name);
+    return env ? (float) atof(env) : def;
+}
+
 static const fasp_env & fasp_get_env() {
     static const fasp_env env = [] {
         fasp_env e;
-        e.mode   = fasp_env_int("GGML_CUDA_FATTN_SPARSE_PASCAL",        0);
-        e.nq     = fasp_env_int("GGML_CUDA_FATTN_SPARSE_PASCAL_NQ",     8);
-        e.splits = fasp_env_int("GGML_CUDA_FATTN_SPARSE_PASCAL_SPLITS", 0);
-        e.nsm    = fasp_env_int("GGML_CUDA_FATTN_SPARSE_PASCAL_NSM",    0);
-        e.fault  = fasp_env_int("GGML_CUDA_FATTN_SPARSE_PASCAL_FAULT",  0);
-        const char * r = getenv("GGML_CUDA_FATTN_SPARSE_PASCAL_MIN_RATIO");
-        e.min_ratio = r ? (float) atof(r) : 1.5f;
+        e.rule.mode             = fasp_env_int  ("GGML_CUDA_FATTN_SPARSE_PASCAL",                  0);
+        e.rule.nq               = fasp_env_int  ("GGML_CUDA_FATTN_SPARSE_PASCAL_NQ",               8);
+        e.rule.min_ratio        = fasp_env_float("GGML_CUDA_FATTN_SPARSE_PASCAL_MIN_RATIO",        1.5f);
+        e.rule.prompt           = fasp_env_int  ("GGML_CUDA_FATTN_SPARSE_PASCAL_PROMPT",           0);
+        e.rule.prompt_nq        = fasp_env_int  ("GGML_CUDA_FATTN_SPARSE_PASCAL_PROMPT_NQ",        128);
+        e.rule.prompt_min_ratio = fasp_env_float("GGML_CUDA_FATTN_SPARSE_PASCAL_PROMPT_MIN_RATIO", 1.0f);
+        e.rule.uni              = fasp_env_int  ("GGML_CUDA_FATTN_SPARSE_PASCAL_UNION",            0);
+        e.rule.union_min_ratio  = fasp_env_float("GGML_CUDA_FATTN_SPARSE_PASCAL_UNION_MIN_RATIO",  1.5f);
+        e.splits                = fasp_env_int  ("GGML_CUDA_FATTN_SPARSE_PASCAL_SPLITS",           0);
+        e.nsm                   = fasp_env_int  ("GGML_CUDA_FATTN_SPARSE_PASCAL_NSM",              0);
+        e.fault                 = fasp_env_int  ("GGML_CUDA_FATTN_SPARSE_PASCAL_FAULT",            0);
         return e;
     }();
     return env;
@@ -52,11 +60,11 @@ static bool fasp_kv_ok(const ggml_tensor * t, const int D) {
 
 bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const fasp_env & env = fasp_get_env();
-    if (env.mode == 0) {
+    if (env.rule.mode == 0) {
         return false;
     }
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || (env.mode == 1 && turing_mma_available(cc))) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || (env.rule.mode == 1 && turing_mma_available(cc))) {
         return false;
     }
 
@@ -96,7 +104,7 @@ bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggm
         return false;
     }
     const int G = (int) (n_head/n_head_kv);
-    if (G % FASP_HPW != 0 || G > 4*FASP_HPW || n_q > env.nq || n_head_kv*n_q*ne3 > FASP_MAX_COLS) {
+    if (G % FASP_HPW != 0 || G > 4*FASP_HPW || n_head_kv*n_q*ne3 > FASP_MAX_COLS) {
         return false;
     }
     if (mask->type != GGML_TYPE_F16 || mask->ne[0] != n_kv || mask->ne[1] < n_q || mask->ne[2] != 1 ||
@@ -104,8 +112,11 @@ bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggm
             mask->nb[3] % sizeof(half) != 0) {
         return false;
     }
-    // every query token reads its own list; the dense kernels read the cache once for all of them
-    if (env.mode == 1 && (double) n_kv < env.min_ratio*n_kv_max*n_q) {
+    // with _UNION a block takes tpb query tokens and reads the union of their lists (one token: the per-token kernel)
+    const int tpb = env.rule.uni != 0 ? fasp_union_tokens(G, n_q) : 1;
+    // decode and verify by _MIN_RATIO per query token (_UNION_MIN_RATIO per union list), prompt micro-batches (more than
+    // _NQ tokens) only with _PROMPT
+    if (!fasp_rule_takes(env.rule, n_q, n_kv, n_kv_max, tpb)) {
         return false;
     }
     if (sinks && (sinks->type != GGML_TYPE_F32 || ggml_nelements(sinks) != n_head)) {
@@ -125,15 +136,20 @@ bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggm
 
     cudaStream_t stream = ctx.stream();
 
-    // one list per query and mask sequence: its finite mask columns in cache order, then the count
-    const int64_t n_lists = n_q*mask->ne[3];
-    ggml_cuda_pool_alloc<int32_t> lists(ctx.pool(), (size_t) n_lists*n_kv_max + n_lists);
-    ggml_cuda_flash_attn_ext_compact_mask(mask, lists.ptr, lists.ptr + (size_t) n_lists*n_kv_max, (int32_t) n_q, 1,
-                                          n_kv_max, stream);
+    // one list per query (union: per tpb queries) and mask sequence: its finite mask columns in cache order, then the
+    // count; a union list holds up to tpb x n_kv_max cells
+    const int64_t n_lists_seq = (n_q + tpb - 1)/tpb;
+    const int64_t n_lists     = n_lists_seq*mask->ne[3];
+    const int32_t list_cap    = tpb > 1 ? (int32_t) std::min<int64_t>(n_kv, (int64_t) tpb*n_kv_max) : n_kv_max;
+    ggml_cuda_pool_alloc<int32_t> lists(ctx.pool(), (size_t) n_lists*list_cap + n_lists);
+    ggml_cuda_flash_attn_ext_compact_mask(mask, lists.ptr, lists.ptr + (size_t) n_lists*list_cap, (int32_t) n_q, tpb,
+                                          list_cap, stream);
 
     const int n_cols = (int) (n_head_kv*n_q*ne3);
     const int nsm    = env.nsm > 0 ? env.nsm : ggml_cuda_info().devices[ctx.device].nsm;
-    const int S      = env.splits > 0 ? env.splits : fasp_pick_splits(n_kv_max, n_cols, nsm);
+    // the union kernel: one block of tpb tokens per list column (list, KV head)
+    const int S      = env.splits > 0 ? env.splits :
+        tpb > 1 ? fasp_pick_splits(list_cap, (int) (n_head_kv*n_lists_seq*ne3), nsm) : fasp_pick_splits(n_kv_max, n_cols, nsm);
 
     ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) S*n_cols*G*fasp_part_floats(D));
 
@@ -156,8 +172,8 @@ bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggm
     a.m_nb3      = mask->nb[3]/sizeof(half);
     a.m_ne3      = (int) mask->ne[3];
     a.idx        = lists.ptr;
-    a.counts     = lists.ptr + (size_t) n_lists*n_kv_max;
-    a.n_kv_max   = n_kv_max;
+    a.counts     = lists.ptr + (size_t) n_lists*list_cap;
+    a.n_kv_max   = list_cap;
     a.sinks      = sinks ? (const float *) sinks->data : nullptr;
     a.dst        = (float *) dst->data;
     a.part       = part.get();
@@ -169,7 +185,21 @@ bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggm
     a.fault      = env.fault;
 
     const int n_z = (int) (n_q*ne3);
-    if (D == 256) {
+    if (tpb > 1) {
+        if (D == 256) {
+            if (K->type == GGML_TYPE_F16) {
+                fasp_launch_union<256, FASP_F16>(a, tpb, S, (int) n_head_kv, (int) ne3, stream);
+            } else {
+                fasp_launch_union<256, FASP_Q8_0>(a, tpb, S, (int) n_head_kv, (int) ne3, stream);
+            }
+        } else {
+            if (K->type == GGML_TYPE_F16) {
+                fasp_launch_union<128, FASP_F16>(a, tpb, S, (int) n_head_kv, (int) ne3, stream);
+            } else {
+                fasp_launch_union<128, FASP_Q8_0>(a, tpb, S, (int) n_head_kv, (int) ne3, stream);
+            }
+        }
+    } else if (D == 256) {
         if (K->type == GGML_TYPE_F16) {
             fasp_launch<256, FASP_F16>(a, S, (int) n_head_kv, n_z, stream);
         } else {

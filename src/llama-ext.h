@@ -7,6 +7,7 @@
 #include "llama.h"
 #include "llama-arch.h"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -123,16 +124,6 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
 // Useful for testing purposes.
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 
-// Set whether the context outputs nextn embeddings or not
-// If masked == true,  output the embeddings only for the tokens with batch.logits != 0
-// If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
-LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
-
-// Select which appended NextN block the DECODER_MTP graph runs (offset past
-// the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
-// chain multiple trained NextN heads. Default 0 (first head).
-LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
-
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0
@@ -150,34 +141,8 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 
-// mirrors:
-// LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
-LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
-
-// LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
-LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
-
-// Set whether the context outputs the input embeddings of a specific layer
-LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
-
-// mirrors:
-// LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
-LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
-
-// Write the enabled layer inputs to a device buffer [n_layer_inp*n_embd, n_batch] instead of host memory.
-// Row r holds the token at batch index r, layers in ascending layer id order.
-LLAMA_API void llama_set_embeddings_layer_inp_dev(struct llama_context * ctx, bool value);
-
-// Whether decode accepts entries added with llama_batch_ext_add_embd_row()
-// (needs a DFlash/DSpark decoder context whose ctx_other has a layer input device buffer).
-LLAMA_API bool llama_supports_embd_row(const struct llama_context * ctx);
-
-// Add an entry whose embedding is row `row` of the layer input device buffer of ctx_other.
-// All entries of the batch must be of this kind. Positions are set with llama_batch_ext_set_pos(), n_pos_per_embd of them.
-// Returns the batch index (>= 0), or the llama_batch_ext_add() error codes.
-LLAMA_API int32_t llama_batch_ext_add_embd_row(struct llama_batch_ext * batch, llama_seq_id seq_id, int32_t row);
-
-LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+// The NextN / speculative API that upstream keeps in llama.h (llama_set_embeddings_nextn_dev, llama_set_ctx_state_src,
+// llama_get_ctx_other, ...) is declared there; the fork's additions follow.
 
 // A shortlist for a draft context's output head (Q592): while it is on, a decode with one output computes the logits
 // of the token ids below k_low and of up to m_cap further ids only, and gives every other token -INFINITY. The
@@ -205,6 +170,74 @@ LLAMA_API bool llama_embd_cache_stats(const struct llama_context * ctx, uint64_t
 // hidden row over the bus. Supported by the qwen4exp MTP draft; false without an MTP layer.
 LLAMA_API bool llama_nextn_carry_init(struct llama_context * ctx);
 LLAMA_API void llama_set_nextn_carry (struct llama_context * ctx, bool in, bool out);
+
+// C742: the caller reads none of the next decode's h_nextn rows (a draft's last pass), so that decode copies none to the
+// host: llama_get_embeddings_nextn_ith then returns an earlier decode's rows. The graph and its outputs are the same, and
+// the decode after it copies again. The stats: since the context was created, the micro-batches that copied their h_nextn
+// rows to the host and those that left them out for the mark.
+LLAMA_API void llama_skip_embeddings_nextn_next (struct llama_context * ctx);
+LLAMA_API void llama_embeddings_nextn_host_stats(const struct llama_context * ctx, uint64_t * n_copied, uint64_t * n_skipped);
+
+// The QSA k-pool tables kept on the devices (LLAMA_QSA_KPOOL_DEV, C100): since the context was created, the ubatches
+// that updated them, those that rewrote every row the graph reads, the rows uploaded, and the ubatches that
+// LLAMA_QSA_KPOOL_DEV_CHECK compared with the tables built without the switch; false while the switch is off.
+LLAMA_API bool llama_kpool_dev_stats(const struct llama_context * ctx, uint64_t * n_ubatch, uint64_t * n_full, uint64_t * n_rows,
+                                     uint64_t * n_checked);
+
+// The QSA pool mask built on the devices (LLAMA_QSA_POOL_MASK_DEV, C719): since the context was created, the ubatches
+// that sent each token's range instead of the mask, those whose masks LLAMA_QSA_POOL_MASK_DEV_CHECK read back and
+// compared with the host mask, and the masks it compared (one per device); false while the switch is off.
+LLAMA_API bool llama_pool_mask_dev_stats(const struct llama_context * ctx, uint64_t * n_ubatch, uint64_t * n_checked,
+                                         uint64_t * n_masks);
+
+// For tests (C740): the host state of a memory as raw bytes, so that two memories in the same state give the same
+// bytes: every KV cache's heads, cells, per-sequence (pos, cell) indexes and cell bits, and the cells changed for the
+// device copies of the cells; a QSA memory's pool staleness, pool layout and k-pool tables. Empty for a memory whose
+// kind it does not cover (DeepSeek V4's); a recurrent memory's own cells are left out (the state write holds them).
+LLAMA_API std::string llama_memory_debug_state(const llama_memory_t mem);
+
+// LLAMA_KV_SEQ_RM_BOUND (C740), summed over the memory's KV caches since they were created: out[0] seq_rm calls for one
+// sequence, out[1] of them that sorted their cells, out[2] of them that scanned the used range, out[3] calls for every
+// sequence, out[4] cells visited. All zero while the switch is off
+LLAMA_API void llama_memory_seq_rm_stats(const llama_memory_t mem, uint64_t out[5]);
+// The n-gram table's row prefetch (LLAMA_NGRAM_PREFETCH, C761): since the context was created, whether the helper is on,
+// the cap and page size in bytes, the calls it planned, the rows it issued, the rows the n-gram input issued itself, the
+// rows whose helper copy differed, and the most bytes the helper had issued ahead; with LLAMA_NGRAM_PREFETCH_STATS=1 (or
+// LLAMA_UBATCH_TRACE) also each decode call's rows, distinct pages and row digest, the switch off too (the last 4096
+// calls, oldest first: n_tokens, n_ubatch, planned, rows, rows_helper, rows_inline, rows_mismatch, pages, madv_bytes,
+// digest, window_max). False when the context has neither the switch nor the counts.
+LLAMA_API bool llama_ngram_prefetch_stats(const struct llama_context * ctx, bool * on, uint64_t * cap, uint64_t * page,
+                                          uint64_t * calls_planned, uint64_t * rows_helper, uint64_t * rows_inline,
+                                          uint64_t * rows_mismatch, uint64_t * window_max,
+                                          std::vector<std::array<uint64_t, 11>> * calls);
+
+// Host timestamps along the server's steps (C405), with LLAMA_STEP_TRACE=<file> set: the marks of a step (a name and
+// the steady clock's time) are kept until llama_step_trace_end writes them as one JSON line, if a context marked a stage
+// since llama_step_trace_begin. The file's header gives the steady clock's time of its 0 ms, as GGML_CUDA_PROFILE_HOST's
+// log line does for its own, so the step lines go beside that profile's per-card times. A context marks its decode's
+// stages and its waits itself as "<role>.<stage>": 'v' for a main context, 'd' for an MTP context, or what
+// llama_step_trace_role sets. With the variable unset every call returns at once and a context checks one flag.
+// Names must outlive the step (string literals). One thread marks at a time.
+LLAMA_API bool llama_step_trace_on   (void);
+LLAMA_API void llama_step_trace_begin(const char * name);                // drops what is kept, then marks name
+LLAMA_API void llama_step_trace_mark (const char * name);
+LLAMA_API void llama_step_trace_count(const char * name, int64_t value); // added up per name on the step's line
+LLAMA_API void llama_step_trace_end  (void);
+LLAMA_API void llama_step_trace_role (struct llama_context * ctx, char role);
+
+// C738 (LLAMA_VERIFY_PREPARE): the host part of the next decode done before the ids of some of its tokens are known,
+// e.g. a speculative verify pass prepared while the last drafting pass runs. llama_decode_prepare splits the batch,
+// applies the memory's slots, chooses the graph and sets every input that reads no token id (with
+// LLAMA_VERIFY_PREPARE=2 it also uploads the first device split's graph inputs); the next llama_decode or llama_process
+// on the context submits it and must bring the same batch with any token ids (anything else aborts). The result is the
+// one the plain call gives. Returns 0 if prepared, 1 if not (a batch with embeddings or state rows, a call in flight, a
+// batch of more than one ubatch, a memory that cannot take token ids later, ...: nothing was done that the next decode
+// would not do the same way first), < 0 on an error. Its marks in the step trace have the role 'p'
+LLAMA_API int32_t llama_decode_prepare(struct llama_context * ctx, struct llama_batch_ext * batch);
+LLAMA_API bool    llama_decode_prepared(const struct llama_context * ctx);
+// a prepared decode that will not be submitted (error paths only): the sequences it holds lose every cell, since the
+// memory cannot give back what it took before the graph ran exactly; false if one was dropped
+LLAMA_API bool    llama_decode_prepare_drop(struct llama_context * ctx);
 
 // The main model's head over the context's shortlist (llama_head_shortlist_init) with an exact bound on every other
 // logit (Q619): while it is on, a decode with one output computes the shortlist's logits and gives every other token
@@ -252,16 +285,28 @@ LLAMA_API void     llama_set_moe_route_once   (struct llama_context * ctx, uint3
 LLAMA_API uint64_t llama_moe_route_once_counts(const struct llama_context * ctx, uint64_t * read, uint64_t * indep,
         int32_t n_counts, uint64_t * n_outside);
 
+// The cells the recurrent memory's slot finder has moved to another row so far (Q1158): a moved sequence keeps its
+// final state but not its rollback snapshots. 0 for a context without a recurrent memory. For tests and diagnostics.
+LLAMA_API uint64_t llama_memory_recurrent_n_swaps(const struct llama_context * ctx);
+
+// C703 (LLAMA_MTP_CATCHUP_OVERLAP): n = 2 gives the h_nextn device buffer of llama_set_embeddings_nextn_dev() (llama.h) two
+// halves of n_batch + n_seq_max rows each, rows [h*(n_batch + n_seq_max), (h + 1)*(n_batch + n_seq_max)) for half h with
+// that buffer's layout; a decode writes the half of the
+// last one, unless llama_hold_embeddings_nextn() was called after it: then the other half, so that a reader can read the
+// held rows while the next decode runs. n = 1: one half (the default). Returns false if the buffer cannot be used.
+LLAMA_API bool    llama_set_embeddings_nextn_dev_halves(struct llama_context * ctx, int32_t n);
+LLAMA_API bool    llama_hold_embeddings_nextn          (struct llama_context * ctx);
+// the first row of the half the last decode wrote (0 with one half)
+LLAMA_API int64_t llama_get_embeddings_nextn_row0      (const struct llama_context * ctx);
+// C813: the halves the h_nextn device buffer holds now, 0 without the buffer. With LLAMA_MTP_HROW_LAZY=1 (read when the
+// context is made) n = 2 above keeps one half until the first llama_hold_embeddings_nextn(), which makes the second (the
+// rows of the first copied over) and returns false if the device has no room for it: then the buffer keeps one half and
+// every later hold returns false. LLAMA_MTP_HROW_LAZY=2 never makes the second half (a check of that path).
+LLAMA_API int32_t llama_get_embeddings_nextn_dev_halves(const struct llama_context * ctx);
+
 //
 // model/context data extraction
 //
-
-LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
-
-// returns pointer to the target-model layer indices
-LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
-// returns the number of extracted layers from target model
-LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
 
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
@@ -275,3 +320,24 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
 
 // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
 LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
+
+// each sequence is paired with an unconditional one at n_seq_max / 2 + seq_id, in a unified KV cache
+LLAMA_API bool llama_model_classifier_free_guidance(const struct llama_model * model);
+
+//
+// LLAMA_DRAFT_PREFETCH (C615): a drafted token's n-gram rows read ahead
+//
+
+// Issue now the reads of the rows that a later decode of ctx will take from its model's mapped n-gram table for tokens
+// it has not seen (madvise(MADV_WILLNEED) through llama_prefetch_rows), e.g. each token a drafter samples, so that the
+// reads from the disk run while the drafter works instead of when the verify pass's n-gram input sets its rows.
+// tokens[0, n_tokens) are the tokens the decode will put at positions pos0, pos0 + 1, ... of seq_id; the rows of
+// tokens[i_first, n_tokens) are issued, the earlier ones only serve as predecessors; the predecessors before pos0 are
+// the context's cells, as the n-gram input reads them. Rows issued since the context's last evaluation of the table's
+// rows are not issued again, and at most LLAMA_DRAFT_PREFETCH_KB (default 1024) KiB of pages are issued between two
+// such evaluations. The rows read stay the same bytes: only when the reads are issued changes. Supported by qwen4exp
+// with its n-gram table mapped (lazy); llama_draft_prefetch_enabled is false otherwise or while LLAMA_DRAFT_PREFETCH is
+// unset, and llama_draft_prefetch then does nothing. Returns the rows issued.
+LLAMA_API bool    llama_draft_prefetch_enabled(const struct llama_context * ctx);
+LLAMA_API int32_t llama_draft_prefetch(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos0,
+                                       const llama_token * tokens, int32_t n_tokens, int32_t i_first);

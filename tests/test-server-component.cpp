@@ -1,12 +1,19 @@
 #include "testing.h"
 
+#include "../tools/server/server-chat.h"
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-decision.h"
+#include "../tools/server/server-queue.h"
 #include "../tools/server/server-schema.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <regex>
 #include <string>
 #include <thread>
@@ -377,6 +384,134 @@ static void test_server_pipe(testing & t) {
 }
 
 //
+// server_queue: the yields to the task queue, with a wake every yield (upstream) and with the lazy wake
+// (LLAMA_SERVER_YIELD=2, C741): the counts of yields and wakes, and that every task is still taken where it was
+//
+
+static void test_server_queue_yield(testing & t) {
+    for (const bool lazy : { false, true }) {
+        t.test(lazy ? "lazy wake" : "a wake every yield", [lazy](testing & t) {
+            server_queue q;
+            q.set_lazy_wake(lazy);
+            // as llama-server: a yield takes reads only
+            q.on_yield_takes([](server_task_type type) { return type == SERVER_TASK_TYPE_METRICS; });
+
+            std::mutex m;
+            std::condition_variable cv;
+            std::vector<std::pair<int, bool>> taken; // task id, taken while yielding
+
+            q.on_new_task([&](server_task && task, bool is_yielding) {
+                // as process_single_task: only reads of the server state while yielding
+                if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS) {
+                    return false;
+                }
+                std::lock_guard<std::mutex> lock(m);
+                taken.emplace_back(task.id, is_yielding);
+                cv.notify_all();
+                return true;
+            });
+
+            auto post = [&](server_task_type type) {
+                server_task task(type);
+                task.id = q.get_new_id();
+                const int id = task.id;
+                q.post(std::move(task));
+                return id;
+            };
+            // whether task id was taken (and while yielding or not), waiting up to wait_ms for it
+            auto find = [&](int id, int wait_ms, bool & yielding) {
+                std::unique_lock<std::mutex> lock(m);
+                return cv.wait_for(lock, std::chrono::milliseconds(wait_ms), [&]() {
+                    for (const auto & p : taken) {
+                        if (p.first == id) {
+                            yielding = p.second;
+                            return true;
+                        }
+                    }
+                    return false;
+                });
+            };
+
+            // the order in which the tasks were taken
+            auto order = [&](int id) {
+                std::lock_guard<std::mutex> lock(m);
+                for (size_t i = 0; i < taken.size(); i++) {
+                    if (taken[i].first == id) {
+                        return (int) i;
+                    }
+                }
+                return -1;
+            };
+
+            uint64_t y[5] = {};
+            uint64_t w[5] = {};
+            bool during_ok = false, during_y = false;
+            bool before_ok = false, before_y = false;
+            bool cmpl_in_step = true, cmpl_y = true;
+            bool next_in_step = true, next_y = true;
+            int id_cmpl = -1;
+            int id_next = -1;
+            int n_steps = 0;
+
+            q.on_update_slots([&]() {
+                n_steps++;
+                if (n_steps == 1) {
+                    // as update_slots at a busy step's start: the loop's own task, which a yield declines
+                    id_next = post(SERVER_TASK_TYPE_NEXT_RESPONSE);
+                    q.yield_counts(y[0], w[0]);
+                    // 1. only a task the yield declines meets it
+                    q.yield_to_queue([]() {});
+                    q.yield_counts(y[1], w[1]);
+                    // 2. a read comes during the yield: answered before the yield ends
+                    q.yield_to_queue([&]() {
+                        const int id = post(SERVER_TASK_TYPE_METRICS);
+                        during_ok = find(id, 10000, during_y);
+                    });
+                    q.yield_counts(y[2], w[2]);
+                    // 3. a read waits when the yield starts: answered in it
+                    const int id_before = post(SERVER_TASK_TYPE_METRICS);
+                    q.yield_to_queue([&]() {
+                        before_ok = find(id_before, 10000, before_y);
+                    });
+                    q.yield_counts(y[3], w[3]);
+                    // 4. a completion comes during the yield: declined, then taken by the loop after this step
+                    q.yield_to_queue([&]() {
+                        id_cmpl = post(SERVER_TASK_TYPE_COMPLETION);
+                    });
+                    q.yield_counts(y[4], w[4]);
+                    bool unused = false;
+                    cmpl_in_step = find(id_cmpl, 0, unused);
+                    next_in_step = find(id_next, 0, unused);
+                } else {
+                    bool yc = true, yn = true;
+                    if (id_cmpl >= 0 && find(id_cmpl, 0, yc) && find(id_next, 0, yn)) {
+                        cmpl_y = yc;
+                        next_y = yn;
+                        q.terminate();
+                    }
+                }
+            });
+
+            post(SERVER_TASK_TYPE_COMPLETION); // starts the first step
+            std::thread loop([&]() { q.start_loop(); });
+            loop.join();
+
+            t.assert_equal("yields", (uint64_t) 4, y[4] - y[0]);
+            t.assert_equal("wakes, only the loop's task waits", (uint64_t) (lazy ? 0 : 1), w[1] - w[0]);
+            t.assert_equal("wakes, a read during the yield", (uint64_t) 1, w[2] - w[1]);
+            t.assert_equal("wakes, a read before the yield", (uint64_t) 1, w[3] - w[2]);
+            t.assert_equal("wakes, a completion during the yield", (uint64_t) (lazy ? 0 : 1), w[4] - w[3]);
+            t.assert_true("a read that comes during the yield is answered in it", during_ok && during_y);
+            t.assert_true("a read waiting at the yield's start is answered in it", before_ok && before_y);
+            t.assert_true("neither the loop's task nor the completion is taken during the step", !cmpl_in_step && !next_in_step);
+            t.assert_true("both are taken by the loop before the next step", !cmpl_y && !next_y);
+            t.assert_true("in the order they were posted", order(id_next) >= 0 && order(id_next) < order(id_cmpl));
+            t.assert_equal("steps", 2, n_steps);
+        });
+    }
+}
+
+//
 // server_decision_escape_special_tokens
 //
 
@@ -665,6 +800,79 @@ static void test_glob_match(testing & t) {
     });
 }
 
+//
+// OpenAI speech API
+//
+
+static void test_speech_convert(testing & t) {
+    const json base = {{"model", "tts"}, {"input", "Hello"}, {"voice", "alba"}};
+
+    auto with = [&](const char * key, const json & value) {
+        json body = base;
+        body[key] = value;
+        return body;
+    };
+    auto rejected = [&](const char * key, const json & value) {
+        try {
+            convert_speech_to_tts(with(key, value));
+        } catch (const std::invalid_argument &) {
+            return true;
+        }
+        return false;
+    };
+
+    // defaults
+    json out = convert_speech_to_tts(base);
+    t.assert_equal("input kept",        std::string("Hello"), out.at("input").get<std::string>());
+    t.assert_equal("voice kept",        std::string("alba"),  out.at("voice").get<std::string>());
+    t.assert_equal("default format",    std::string("wav"),   out.at("response_format").get<std::string>());
+    t.assert_true ("no stream",         !out.contains("stream"));
+
+    // response_format
+    out = convert_speech_to_tts(with("response_format", "wav"));
+    t.assert_equal("wav",               std::string("wav"),   out.at("response_format").get<std::string>());
+    out = convert_speech_to_tts(with("response_format", "pcm"));
+    t.assert_equal("pcm is 16-bit",     std::string("pcm16"), out.at("response_format").get<std::string>());
+    for (const char * format : {"mp3", "opus", "aac", "flac", "pcm16"}) {
+        t.assert_true(std::string("rejects ") + format, rejected("response_format", format));
+    }
+
+    // custom voice
+    out = convert_speech_to_tts(with("voice", json{{"id", "voice_1234"}}));
+    t.assert_equal("voice object",      std::string("voice_1234"), out.at("voice").get<std::string>());
+
+    // stream_format
+    out = convert_speech_to_tts(with("stream_format", "audio"));
+    t.assert_true ("audio streams",     out.at("stream").get<bool>());
+    t.assert_true ("rejects sse",       rejected("stream_format", "sse"));
+
+    // speed
+    t.assert_true ("speed 1.0",         !rejected("speed", 1.0));
+    t.assert_true ("rejects speed 1.5", rejected("speed", 1.5));
+
+    // instructions are ignored
+    t.assert_true ("instructions",      !rejected("instructions", "whisper"));
+}
+
+static void test_pcm_f32_to_s16(testing & t) {
+    auto sample = [](const std::string & bytes, size_t i) {
+        int16_t v;
+        memcpy(&v, bytes.data() + i * sizeof(v), sizeof(v));
+        return (int) v;
+    };
+
+    const std::vector<float> samples = {0.0f, 1.0f, -1.0f, 0.5f, 2.0f, -2.0f};
+    const std::string bytes = pcm_f32_to_s16(samples.data(), samples.size());
+    t.assert_equal("size",           (size_t) 12, bytes.size());
+    t.assert_equal("zero",           0,      sample(bytes, 0));
+    t.assert_equal("max",            32767,  sample(bytes, 1));
+    t.assert_equal("min",            -32767, sample(bytes, 2));
+    t.assert_equal("rounds",         16384,  sample(bytes, 3));
+    t.assert_equal("clamps above",   32767,  sample(bytes, 4));
+    t.assert_equal("clamps below",   -32767, sample(bytes, 5));
+    t.assert_true ("empty",          pcm_f32_to_s16(nullptr, 0).empty());
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -683,6 +891,7 @@ int main(int argc, char ** argv) {
     t.test("json_helpers",  test_json_helpers);
     t.test("lora_helpers",  test_lora_helpers);
     t.test("server_pipe",   test_server_pipe);
+    t.test("server_queue_yield", test_server_queue_yield);
     t.test("decision_escape", test_decision_escape);
     t.test("rerank_template", test_rerank_template);
     t.test("decision_class_scores", test_decision_class_scores);
@@ -690,6 +899,8 @@ int main(int argc, char ** argv) {
     t.test("decision_depth",  test_decision_depth);
     t.test("glob_match",      test_glob_match);
     t.test("dry_sequence_breakers", test_dry_sequence_breakers);
+    t.test("speech_convert",  test_speech_convert);
+    t.test("pcm_f32_to_s16",  test_pcm_f32_to_s16);
 
     return t.summary();
 }
