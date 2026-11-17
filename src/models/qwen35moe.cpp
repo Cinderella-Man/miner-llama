@@ -686,7 +686,7 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
 
     ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
             ? layer.nextn.shared_head_norm
-            : model.output_norm;
+            : model.output_norm_nextn ? model.output_norm_nextn : model.output_norm; // _nextn: --mtp-device
     GGML_ASSERT(head_norm_w && "QWEN35MOE MTP: missing both nextn.shared_head_norm and output_norm");
     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
 
@@ -696,14 +696,16 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     cb(cur, "mtp_shared_head_norm", -1);
 
-    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head :
+                           model.output_nextn ? model.output_nextn : model.output; // output_nextn: --mtp-device
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
     // the draft head over a shortlist (LLAMA_DRAFT_SHORTLIST, llama_set_head_shortlist), as qwen4exp has it
     if (cparams.head_short_on && cparams.head_short && n_outputs == 1 && cur->ne[1] == 1 && head_s == nullptr &&
             (!loras || loras->empty())) {
+        cur = llama_head_shortlist_logits(ctx0, *cparams.head_short, head_w, cur);
     } else {
+        cur = build_lora_mm(head_w, cur, head_s);
     }
     cb(cur, "result_output", -1);
 

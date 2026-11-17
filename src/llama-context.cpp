@@ -2423,7 +2423,8 @@ void llama_context::set_ubatch_taper_next(int32_t head, int32_t tail) {
 }
 
 bool llama_context::head_shortlist_init(uint32_t k_low, uint32_t m_cap) {
-    const ggml_tensor * output = model.output;
+    // --mtp-device: an MTP context's head is the copy on the MTP layer's device
+    const ggml_tensor * output = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.output_nextn ? model.output_nextn : model.output;
     if (output == nullptr || output->buffer == nullptr) {
         LLAMA_LOG_ERROR("%s: the model has no output head in a buffer\n", __func__);
         return false;

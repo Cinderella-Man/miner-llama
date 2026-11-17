@@ -1718,6 +1718,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PIPE_GUESS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--mtp-device"}, "N",
+        string_format("put the MTP (nextn) layers, their KV and a copy of the output head on GPU N (default: %d, with "
+            "the last layers); 0 suits --pipe-guess mtp under a layer split", params.mtp_device),
+        [](common_params & params, int value) {
+            params.mtp_device = value;
+        }
+    ).set_env("LLAMA_ARG_MTP_DEVICE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--pipe-copy-min"}, "N",
         string_format("shortest copy match that makes a guess for --pipe-depth (default: %d)", params.pipe_copy_min),
         [](common_params & params, int value) {

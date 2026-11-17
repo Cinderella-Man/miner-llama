@@ -839,6 +839,10 @@ struct llama_model {
     // screened output head: a cheaper copy of the output tensor that picks the candidates (optional)
     struct ggml_tensor * output_screen = nullptr;
 
+    // --mtp-device (llama_model_params.nextn_device): a copy of the output head on the MTP layer's device, for the MTP graph
+    struct ggml_tensor * output_nextn = nullptr;
+    struct ggml_tensor * output_norm_nextn = nullptr;
+
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
