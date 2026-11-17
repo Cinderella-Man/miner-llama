@@ -1719,6 +1719,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PIPE_GUESS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--pipe-mtp-walk"}, "N",
+        string_format("--pipe-guess mtp: on a right guess keep extending the MTP head's chain of guesses, up to N tokens "
+            "past the token it started from, instead of restarting it from the target's hidden state "
+            "(default: %d, restart every token)", params.pipe_mtp_walk),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("pipe-mtp-walk must be non-negative");
+            }
+            params.pipe_mtp_walk = value;
+        }
+    ).set_env("LLAMA_ARG_PIPE_MTP_WALK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--mtp-device"}, "N",
         string_format("put the MTP (nextn) layers, their KV and a copy of the output head on GPU N (default: %d, with "
             "the last layers); 0 suits --pipe-guess mtp under a layer split", params.mtp_device),

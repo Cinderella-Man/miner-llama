@@ -709,6 +709,7 @@ struct common_params {
     std::string pipe_draft_stair;        // depths of the tokens in flight, newest first (empty: from the layer split)
     std::string pipe_draft_kind;         // stair or pre (empty: by whether the drafter's GPU holds layers)
     std::string pipe_store;              // continuation store for cont (common_pipe_store), empty = none
+    int32_t     pipe_mtp_walk  = 0;      // --pipe-guess mtp: keep the MTP chain on a hit up to N rows past its anchor (0: re-anchor every token)
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t checkpoint_vram     = 0;     // newest context checkpoints of a slot kept in device memory; 0 = all on the host

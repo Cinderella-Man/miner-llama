@@ -5885,7 +5885,15 @@ private:
         const bool guessed = !slot.pipe_win.empty();
         const bool hit     = guessed && slot.pipe_win.front().tok == id;
         if (pipe_mtp()) {
-            pm_anchor(slot, id, cur.pos + 1, llama_pipe_get_h_nextn(ctx_tgt, cur.pslot));
+            // --pipe-mtp-walk N keeps the walk on a hit while it is at most N rows past its anchor (0: re-anchor on
+            // every token)
+            const int32_t pm_walk_max = params_base.pipe_mtp_walk;
+            pm_settle(slot);
+            const bool keep = hit && pm_walk_max > 0 && slot.pm_pos >= 0 && slot.pm_walk >= cur.pos + 1 &&
+                              cur.pos + 1 - slot.pm_pos <= pm_walk_max;
+            if (!keep) {
+                pm_anchor(slot, id, cur.pos + 1, llama_pipe_get_h_nextn(ctx_tgt, cur.pslot));
+            }
         }
         if (guessed && slot.pipe_win.front().drafted) {
             slot.pipe_n_draft++;
