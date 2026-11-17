@@ -170,6 +170,10 @@ const common_sampler_stats & common_sampler_get_stats(const struct common_sample
 // it has seen its trigger
 bool common_sampler_grammar_active(const struct common_sampler * gsmpl);
 
+// LLAMA_PIPE_GRAMMAR: a token the pipe drew on the device while the grammar is active, checked against
+// the grammar on the host and counted in the stats as a device draw (rejections too). Does not accept it.
+bool common_sampler_pipe_check(struct common_sampler * gsmpl, llama_token id);
+
 // get the last accepted token
 llama_token common_sampler_last(const struct common_sampler * gsmpl);
 

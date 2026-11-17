@@ -121,6 +121,14 @@ static common_speculative_output_limits server_output_limits(const common_params
 //                              block verification always does (Q808): without it the step after a replay (a draft
 //                              longer than a recurrent target's rollback snapshots, or a target that cannot remove a
 //                              partial sequence) draws the uniforms of the step it replays, conditioned on its outcome
+// LLAMA_PIPE_GRAMMAR=1: the pipe keeps running while a grammar is active (a tool
+// call): each token the device draws is checked against the grammar on the host, and a rejected one leaves the pipe
+// as a wrong guess does, so batched decoding samples that position again with the grammar
+static bool pipe_grammar_on() {
+    static const bool on = getenv("LLAMA_PIPE_GRAMMAR") != nullptr;
+    return on;
+}
+
 struct server_spec_verify {
     bool    block       = false;
     bool    force       = false;
@@ -706,6 +714,8 @@ struct server_slot {
     int32_t pipe_n_draft     = 0; // of them, the staircase drafter's guesses and right ones
     int32_t pipe_n_draft_hit = 0;
     llama_pos pipe_draft_pending = -1; // the position the drafter's pending launch guesses
+    llama_pos pipe_gram_hold = -1; // after a grammar rejection: batched until the token at this position is decoded
+    int32_t   pipe_n_gram_rej = 0; // this request's device tokens the grammar rejected inside the pipe
 
     // --pipe-guess mtp: the model's MTP head guesses. Its anchor is the newest committed token (pm_tok at pm_pos) with
     // the target's final hidden state of the token before it (pm_h); a guess walks MTP rows from the anchor through the
@@ -909,6 +919,8 @@ struct server_slot {
         pipe_n_draft     = 0;
         pipe_n_draft_hit = 0;
         pipe_draft_pending = -1;
+        pipe_gram_hold  = -1;
+        pipe_n_gram_rej = 0;
         pipe_guesser.n_store = 0;
         pm_pos    = -1;
         pm_walk   = -1;
@@ -1271,8 +1283,10 @@ struct server_slot {
 
         if (pipe_n_guess > 0 || pipe_draws) {
             SLT_INF(*this,
-                    "       pipelined = %10d guesses, %d right, %d wrong, %d from the store; drafter %d guesses, %d right\n",
-                    pipe_n_guess, pipe_n_hit, pipe_n_miss, pipe_guesser.n_store, pipe_n_draft, pipe_n_draft_hit);
+                    "       pipelined = %10d guesses, %d right, %d wrong, %d from the store; drafter %d guesses, %d right; "
+                    "%d grammar rejections\n",
+                    pipe_n_guess, pipe_n_hit, pipe_n_miss, pipe_guesser.n_store, pipe_n_draft, pipe_n_draft_hit,
+                    pipe_n_gram_rej);
         }
         if (pm_n_rows > 0) {
             SLT_INF(*this, "       pipe mtp  = %10d rows, %.3f ms per row (process %.3f, sync %.3f)\n", pm_n_rows,
@@ -5697,7 +5711,13 @@ private:
         // a grammar may not reject a token in flight: pipelined only while it cannot (a lazy grammar before its
         // trigger, or inside the reasoning), with the device's token checked on the host afterwards (Q67)
         if (!sp.grammar.empty() && common_sampler_grammar_active(slot.smpl.get())) {
-            return false;
+            if (!pipe_grammar_on() || pipe_drafts(slot)) {
+                return false;
+            }
+            // a rejection left the pipe: back in only once batched decoding has decoded the rejected token's position
+            if (slot.pipe_gram_hold >= 0 && slot.prompt.n_tokens() <= slot.pipe_gram_hold) {
+                return false;
+            }
         }
         // a reasoning budget may force a token, which only common_sampler_sample applies
         if (sp.reasoning_budget_tokens >= 0 || sp.reasoning_control) {
@@ -5881,6 +5901,17 @@ private:
             scoped_timer timer(t_sampl, n_sampl);
             id = llama_pipe_get_sampled(ctx_tgt, cur.pslot);
         }
+        // a grammar active (LLAMA_PIPE_GRAMMAR): the device drew without it. A rejected token leaves the pipe with cur
+        // still in the window, so pipe_leave drops cur and everything behind it and batched decoding decodes cur's token
+        // again (slot.sampled), sampling the next one with the grammar
+        if (pipe_grammar_on() && !slot.task->params.sampling.grammar.empty() &&
+            common_sampler_grammar_active(slot.smpl.get()) && !common_sampler_pipe_check(slot.smpl.get(), id)) {
+            slot.pipe_n_gram_rej++;
+            slot.pipe_win.push_front(cur);
+            pipe_leave(slot);
+            slot.pipe_gram_hold = cur.pos;
+            return;
+        }
         // the sampled token is the MTP anchor now, with cur's final hidden state (read before cur's pipe slot is reused)
         const bool guessed = !slot.pipe_win.empty();
         const bool hit     = guessed && slot.pipe_win.front().tok == id;
@@ -5939,7 +5970,7 @@ private:
 
         // the token switched the grammar on (a tool call starts): batched decoding takes over from it, with every
         // token checked against the grammar; the token itself is decoded there (slot.sampled)
-        if (!slot.task->params.sampling.grammar.empty() && common_sampler_grammar_active(slot.smpl.get())) {
+        if (!pipe_grammar_on() && !slot.task->params.sampling.grammar.empty() && common_sampler_grammar_active(slot.smpl.get())) {
             llama_memory_seq_rm(mem, slot.id, cur.pos + 1, -1);
             llama_pipe_drain(ctx_tgt);
             pm_handoff(slot);
