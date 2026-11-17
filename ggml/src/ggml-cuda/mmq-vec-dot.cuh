@@ -867,7 +867,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #endif // AMD_MFMA_AVAILABLE || AMD_WMMA_AVAILABLE
 }
 
-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q3_K_q8_1_dp4a(
+// fp32_scale: GGML_CUDA_MMQ_KQ_FP32SCALE (C861), the scale multiply in FP32 (vecdotq.cuh); false is the unchanged code.
+template <ggml_type type, int J, bool fallback, bool fp32_scale = false> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q3_K_q8_1_dp4a(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
@@ -894,7 +895,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
                 const int8_t * scales = ((const int8_t *) (x_sc + i*(MMQ_TILE_NE_K/8) + i/8)) + k0/4;
 
-                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q3_K_q8_1_impl_mmq(
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q3_K_q8_1_impl_mmq<fp32_scale>(
                     &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01], scales,
                     x_df[i], y_df[j*MMQ_TILE_Y_K + k01/QI8_1]);
             }
@@ -902,7 +903,6 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-// fp32_scale: GGML_CUDA_MMQ_KQ_FP32SCALE (C861), the scale multiply in FP32 (vecdotq.cuh); false is the unchanged code.
 template <ggml_type type, int J, bool fallback, bool fp32_scale = false> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_K_q8_1_dp4a(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();

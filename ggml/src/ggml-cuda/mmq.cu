@@ -118,21 +118,63 @@ static bool ggml_cuda_mmq_moe_legacy(const int64_t ne12) {
     return mode == 2 ? ne12 <= MMVQ_MAX_BATCH_SIZE : mode != 0;
 }
 
-// GGML_CUDA_MMQ_KQ_FP32SCALE (C861, Q1549; the idea from ik_llama.cpp #2876, MIT): the Q4_K, Q5_K and Q6_K prompt
-// products (MMQ, dp4a layout) multiply each sub-block scale by its integer dot product in FP32 instead of a 32-bit
-// integer multiply, which compute 6.1 runs as three XMAD instructions. Exact, so the results are the same floats.
+// GGML_CUDA_MMQ_KQ_FP32SCALE (C861, Q1549; the idea from ik_llama.cpp #2876, MIT): K-quant prompt products (MMQ, dp4a
+// layout) multiply each sub-block scale by its integer dot product in FP32 instead of a 32-bit integer multiply, which
+// compute 6.1 runs as three XMAD instructions. Exact, so the results are the same floats.
 // 0 (default) off; 1 compute capability 6.1 only; 2 any NVIDIA GPU (testing; the MMA layout is unchanged).
-bool ggml_cuda_mmq_kq_fp32scale(const int cc) {
-    static const int mode = [] {
+// GGML_CUDA_MMQ_KQ_FP32SCALE_TYPES: the types it applies to, comma-separated type names, default "q4_K,q5_K,q6_K"
+// (the three #2876 measured); "q3_K" adds Q3_K (one integer multiply per two sub-blocks), "all" is the four.
+bool ggml_cuda_mmq_kq_fp32scale(const int cc, const ggml_type type) {
+    struct kq_fp32scale_cfg {
+        int  mode;
+        bool on[GGML_TYPE_COUNT];
+    };
+    static const kq_fp32scale_cfg cfg = [] {
+        kq_fp32scale_cfg c = {};
         const char * env = getenv("GGML_CUDA_MMQ_KQ_FP32SCALE");
-        const int m = env != nullptr ? atoi(env) : 0;
-        if (m != 0) {
-            GGML_LOG_INFO("%s: GGML_CUDA_MMQ_KQ_FP32SCALE=%d: Q4_K, Q5_K and Q6_K prompt products scale in FP32 (%s)\n",
-                          __func__, m, m == 2 ? "any NVIDIA GPU" : "compute 6.1 only");
+        c.mode = env != nullptr ? atoi(env) : 0;
+        const char * env_t = getenv("GGML_CUDA_MMQ_KQ_FP32SCALE_TYPES");
+        std::string types = env_t != nullptr ? env_t : "q4_K,q5_K,q6_K";
+        for (char & ch : types) {
+            ch = std::tolower(ch);
         }
-        return m;
+        if (types == "all") {
+            types = "q3_k,q4_k,q5_k,q6_k";
+        }
+        std::string names;
+        size_t pos = 0;
+        while (pos <= types.size()) {
+            const size_t end = std::min(types.find(',', pos), types.size());
+            const std::string name = types.substr(pos, end - pos);
+            pos = end + 1;
+            if (name.empty()) {
+                continue;
+            }
+            bool found = false;
+            for (const ggml_type t : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+                std::string tn = ggml_type_name(t);
+                for (char & ch : tn) {
+                    ch = std::tolower(ch);
+                }
+                if (name == tn) {
+                    c.on[t] = true;
+                    found = true;
+                    names += (names.empty() ? "" : ",") + std::string(ggml_type_name(t));
+                }
+            }
+            if (!found) {
+                GGML_LOG_WARN("%s: GGML_CUDA_MMQ_KQ_FP32SCALE_TYPES: unknown type '%s' (q3_K, q4_K, q5_K, q6_K, all)\n",
+                              __func__, name.c_str());
+            }
+        }
+        if (c.mode != 0) {
+            GGML_LOG_INFO("%s: GGML_CUDA_MMQ_KQ_FP32SCALE=%d: %s prompt products scale in FP32 (%s)\n",
+                          __func__, c.mode, names.empty() ? "no" : names.c_str(),
+                          c.mode == 2 ? "any NVIDIA GPU" : "compute 6.1 only");
+        }
+        return c;
     }();
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && (mode == 2 || (mode == 1 && cc == GGML_CUDA_CC_DP4A));
+    return cfg.on[type] && GGML_CUDA_CC_IS_NVIDIA(cc) && (cfg.mode == 2 || (cfg.mode == 1 && cc == GGML_CUDA_CC_DP4A));
 }
 
 // overrides the src1 precision requested by the graph, "auto" keeps the requested one

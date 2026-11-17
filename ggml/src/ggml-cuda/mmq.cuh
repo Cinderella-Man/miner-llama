@@ -957,17 +957,19 @@ static constexpr __device__ ggml_cuda_mmq_load_tiles_t ggml_cuda_mmq_get_load_ti
     return ggml_cuda_mmq_get_util_funcs<type, J, fallback, prec_src1, has_fusion>().load_tiles;
 }
 
-// kq_fp32: GGML_CUDA_MMQ_KQ_FP32SCALE (C861). The dp4a layout's Q4_K, Q5_K and Q6_K dot products with the scale
-// multiply in FP32; every other type and the MMA layout keep their dot product. Without kq_fp32 nothing changes.
+// kq_fp32: GGML_CUDA_MMQ_KQ_FP32SCALE (C861). The dp4a layout's Q3_K, Q4_K, Q5_K and Q6_K dot products with the
+// scale multiply in FP32; every other type and the MMA layout keep their dot product. Without kq_fp32 nothing changes.
 static constexpr __host__ __device__ bool ggml_cuda_mmq_kq_fp32scale_type(const ggml_type type) {
-    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+    return type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
 }
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool kq_fp32 = false>
 static constexpr __device__ ggml_cuda_mmq_vec_dot_t ggml_cuda_mmq_get_vec_dot() {
     if constexpr (kq_fp32 && ggml_cuda_mmq_kq_fp32scale_type(type)) {
         if (!ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).use_mma_data_layout()) {
-            if constexpr (type == GGML_TYPE_Q4_K) {
+            if constexpr (type == GGML_TYPE_Q3_K) {
+                return ggml_cuda_mmq_vec_dot_q3_K_q8_1_dp4a<type, J, fallback, true>;
+            } else if constexpr (type == GGML_TYPE_Q4_K) {
                 return ggml_cuda_mmq_vec_dot_q4_K_q8_1_dp4a<type, J, fallback, true>;
             } else if constexpr (type == GGML_TYPE_Q5_K) {
                 return ggml_cuda_mmq_vec_dot_q5_K_q8_1_dp4a<type, J, fallback, true>;
@@ -1673,14 +1675,14 @@ static void mul_mat_q_switch_fusion(ggml_backend_cuda_context & ctx, const mmq_a
     mul_mat_q_switch_J<type, fallback, prec_src1, false, kq_fp32>(ctx, args, stream);
 }
 
-// GGML_CUDA_MMQ_KQ_FP32SCALE (C861; mmq.cu): true if Q4_K, Q5_K and Q6_K prompt products on a card of this compute
-// capability take the dot product with the scale multiply in FP32 (ggml_cuda_mmq_get_vec_dot).
-bool ggml_cuda_mmq_kq_fp32scale(int cc);
+// GGML_CUDA_MMQ_KQ_FP32SCALE (C861; mmq.cu): true if prompt products of this type on a card of this compute capability
+// take the dot product with the scale multiply in FP32 (ggml_cuda_mmq_get_vec_dot).
+bool ggml_cuda_mmq_kq_fp32scale(int cc, ggml_type type);
 
 template <ggml_type type, ggml_prec prec_src1>
 void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     if constexpr (ggml_cuda_mmq_kq_fp32scale_type(type) && prec_src1 == GGML_PREC_Q8) {
-        if (ggml_cuda_mmq_kq_fp32scale(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        if (ggml_cuda_mmq_kq_fp32scale(ggml_cuda_info().devices[ggml_cuda_get_device()].cc, type)) {
             constexpr bool kq_fp32 = true;
             if (ggml_cuda_mmq_needs_fallback(args.nrows_x)) {
                 mul_mat_q_switch_fusion<type, /*fallback =*/ true, prec_src1, kq_fp32>(ctx, args, stream);
