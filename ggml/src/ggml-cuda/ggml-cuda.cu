@@ -7727,22 +7727,112 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// GGML_CUDA_KEEPALIVE_EAGER=3 (C866): the ops with sizes along the cache's length (its cells, or the QSA indexer's pools
+// and picked pools, which follow from it), which the key leaves out; it keeps every other op whole, as at 1. These ops'
+// kernels are picked by their types, head sizes and token counts, never by that length (the top-k mask, the indexer,
+// the range and KQ masks, the fill: one kernel per type and head shape), or what the length picks is mixed in instead
+// (the attention: ggml_cuda_flash_attn_ext_length_choice; the top-k: ggml_cuda_top_k_path_of)
+static bool ggml_cuda_keepalive_depth_op(const ggml_op op) {
+    switch (op) {
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_TOP_K:
+        case GGML_OP_TOP_K_MASK:
+        case GGML_OP_LIGHTNING_INDEXER:
+        case GGML_OP_RANGE_MASK:
+        case GGML_OP_KQ_MASK:
+        case GGML_OP_FILL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// which of those sizes run along the cache's length, a bit per dimension, of the node (slot 0) or of its source j (slot
+// j + 1). By position, not by value: at the warm-up's 256 cells the length equals a 256-wide head, and its 64 pools the
+// indexer's 64 heads
+static uint32_t ggml_cuda_keepalive_depth_dims(const ggml_tensor * node, const int slot) {
+    switch (node->op) {
+        // K and V [D, n_kv, heads, seqs], mask [n_kv, tokens, 1, seqs], kv_rows [n_kv]
+        case GGML_OP_FLASH_ATTN_EXT:
+            return slot == 2 || slot == 3 ? 1u << 1 : slot == 4 || slot == 6 ? 1u << 0 : 0u;
+        // the scores [pools, tokens] to the picked [k, tokens]; k is the pools, up to a cap
+        case GGML_OP_TOP_K:
+            return slot <= 1 ? 1u << 0 : 0u;
+        // [n_kv, tokens]: keep [n_kv], top-k [k, tokens], score [pools, tokens], blocks [kpool, pools]
+        case GGML_OP_TOP_K_MASK:
+            return slot <= 3 ? 1u << 0 : slot == 4 ? 1u << 1 : 0u;
+        // [pools, tokens]: k [dim, 1, n_kv] without rows, mask [pools, tokens], rows [pools]
+        case GGML_OP_LIGHTNING_INDEXER:
+            return slot == 0 || slot == 4 || slot == 5 ? 1u << 0 : slot == 2 && node->src[4] == nullptr ? 1u << 2 : 0u;
+        // [n, tokens]
+        case GGML_OP_RANGE_MASK:
+            return slot == 0 ? 1u << 0 : 0u;
+        // [n_kv, tokens, 1, streams]: cells [2, n_kv, streams]
+        case GGML_OP_KQ_MASK:
+            return slot == 0 ? 1u << 0 : slot == 1 ? 1u << 1 : 0u;
+        // one kernel whatever its size
+        case GGML_OP_FILL:
+            return 0xfu;
+        default:
+            return 0u;
+    }
+}
+
 // GGML_CUDA_KEEPALIVE_EAGER (C811): the shapes of an evaluation that runs kernel by kernel, as one number. The kernels
 // it launches follow from its nodes' ops, types, shapes, strides and parameters (a kernel picked by a pointer's
-// alignment alone is not covered: level 2 acts on every such evaluation)
-static uint64_t ggml_cuda_keepalive_shapes(const ggml_cgraph * cgraph) {
+// alignment alone is not covered: level 2 acts on every such evaluation).
+// no_depth (GGML_CUDA_KEEPALIVE_EAGER=3, C866): in the ops of ggml_cuda_keepalive_depth_op each size along the cache's
+// length is one mark, each packed stride another, the attention's n_kv_max (the cells a QSA layer keeps, which grows
+// with the cache up to its cap) only whether it is set; then what the length picks on this device is mixed in. So a
+// pass that differs from one the card ran only in its depth has the same key and keeps the card's block, while a pass
+// at a depth where the attention or the top-k takes other kernels has a new one. The MTP draft's first one-token pass
+// past the sparse attention's threshold (n_kv >= _MIN_RATIO x n_kv_max) is such a pass: the sparse kernels take it
+// (R191: its first launch waited about 1 s on card 8 with no stop), while the draft's earlier one-token passes, at the
+// warm-up's 256 cells, ran the dense ones. Every other op's sizes, and every token count, stay in the key as at 1.
+static uint64_t ggml_cuda_keepalive_shapes(const ggml_cgraph * cgraph, const int device = -1, const bool no_depth = false) {
     uint64_t h = 0x9e3779b97f4a7c15ull ^ (uint64_t) cgraph->n_nodes;
     auto mix = [&h](uint64_t v) {
         h ^= v;
         h *= 0xbf58476d1ce4e5b9ull;
         h ^= h >> 31;
     };
+    // a tensor of such an op: its sizes with those along the cache's length marked, its strides as packed or as they are
+    auto mix_depth = [&mix](const ggml_tensor * t, const uint32_t dims) {
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            mix((dims >> d) & 1 ? 0xd3b7d3b7d3b7d3b7ull : (uint64_t) t->ne[d]);
+        }
+        for (int d = 1; d < GGML_MAX_DIMS; d++) {
+            mix(t->nb[d] == t->nb[d - 1]*(size_t) t->ne[d - 1] ? 0x9ac4ed9ac4ed9ac4ull : (uint64_t) t->nb[d]);
+        }
+    };
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
         }
         mix((uint64_t) node->op | ((uint64_t) node->type << 16));
+        if (no_depth && ggml_cuda_keepalive_depth_op(node->op)) {
+            mix_depth(node, ggml_cuda_keepalive_depth_dims(node, 0));
+            for (int w = 0; w < (int) (GGML_MAX_OP_PARAMS / sizeof(int32_t)); w++) {
+                const int32_t v = ggml_get_op_params_i32(node, w);
+                mix(node->op == GGML_OP_FLASH_ATTN_EXT && w == 4 ? (uint64_t) (v > 0) : (uint64_t) (uint32_t) v);
+            }
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                const ggml_tensor * s = node->src[j];
+                if (s == nullptr) {
+                    continue;
+                }
+                mix((uint64_t) (j + 1) | ((uint64_t) s->type << 16));
+                mix_depth(s, ggml_cuda_keepalive_depth_dims(node, j + 1));
+            }
+            if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+                mix(0xfa00000000000000ull ^ ggml_cuda_flash_attn_ext_length_choice(device, node));
+            } else if (node->op == GGML_OP_TOP_K) {
+                mix(0x7c00000000000000ull ^ (uint64_t) ggml_cuda_top_k_path_of(device, node));
+            }
+            continue;
+        }
         for (int d = 0; d < GGML_MAX_DIMS; d++) {
             mix((uint64_t) node->ne[d]);
         }
@@ -7892,7 +7982,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             uint64_t shapes = 0;
             if (ka_level >= 1) {
                 // a graph reused as it was (the same uid, unique to each graph built) has the shapes it had: a small
-                // cache per thread, by backend and graph; a slot two graphs share only costs a recount
+                // cache per thread, by backend and graph; a slot two graphs share only costs a recount. At 3 (C866) the
+                // key leaves the cache's length out
                 struct ka_slot {
                     uint64_t uid    = 0;
                     uint64_t shapes = 0;
@@ -7904,7 +7995,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (cgraph->uid != 0 && cgraph->uid == slot.uid) {
                     shapes = slot.shapes;
                 } else {
-                    shapes      = ggml_cuda_keepalive_shapes(cgraph);
+                    shapes      = ka_level == 3 ? ggml_cuda_keepalive_shapes(cgraph, cuda_ctx->device, true) :
+                                                      ggml_cuda_keepalive_shapes(cgraph);
                     slot.uid    = cgraph->uid;
                     slot.shapes = shapes;
                 }

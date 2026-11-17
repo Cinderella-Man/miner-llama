@@ -56,14 +56,23 @@ static bool fasp_kv_ok(const ggml_tensor * t, const int D) {
         fasp_aligned(t->data, al);
 }
 
-} // namespace
+// a call the kernels take: its sizes, as the checks found them
+struct fasp_call {
+    int     D;
+    int64_t n_kv, n_q, n_head, ne3, n_head_kv;
+    int     G;
+    int     tpb;
+    int32_t n_kv_max;
+    float   scale;
+};
 
-bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const fasp_env & env = fasp_get_env();
+// whether the switch sends the node to these kernels, and its sizes; launches and allocates nothing, so
+// GGML_CUDA_KEEPALIVE_EAGER=3's key (C866) asks it before the evaluation (ggml_cuda_flash_attn_ext_sparse_pascal_takes)
+static bool fasp_check(const fasp_env & env, const int device, const ggml_tensor * dst, fasp_call & c) {
     if (env.rule.mode == 0) {
         return false;
     }
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const int cc = ggml_cuda_info().devices[device].cc;
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || (env.rule.mode == 1 && turing_mma_available(cc))) {
         return false;
     }
@@ -127,6 +136,50 @@ bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggm
             !fasp_aligned(Q->data, 16) || !fasp_aligned(dst->data, 16) || !fasp_kv_ok(K, D) || !fasp_kv_ok(V, D)) {
         return false;
     }
+
+    c.D         = D;
+    c.n_kv      = n_kv;
+    c.n_q       = n_q;
+    c.n_head    = n_head;
+    c.ne3       = ne3;
+    c.n_head_kv = n_head_kv;
+    c.G         = G;
+    c.tpb       = tpb;
+    c.n_kv_max  = n_kv_max;
+    c.scale     = scale;
+    return true;
+}
+
+} // namespace
+
+bool ggml_cuda_flash_attn_ext_sparse_pascal_takes(const int device, const ggml_tensor * dst) {
+    fasp_call c;
+    return fasp_check(fasp_get_env(), device, dst, c);
+}
+
+bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const fasp_env & env = fasp_get_env();
+    fasp_call c;
+    if (!fasp_check(env, ctx.device, dst, c)) {
+        return false;
+    }
+
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    const int     D         = c.D;
+    const int64_t n_kv      = c.n_kv;
+    const int64_t n_q       = c.n_q;
+    const int64_t n_head    = c.n_head;
+    const int64_t ne3       = c.ne3;
+    const int64_t n_head_kv = c.n_head_kv;
+    const int     G         = c.G;
+    const int     tpb       = c.tpb;
+    const int32_t n_kv_max  = c.n_kv_max;
+    const float   scale     = c.scale;
 
     if (ctx.fattn_sparse_pascal.counters == nullptr) {
         ggml_cuda_set_device(ctx.device);
@@ -217,6 +270,11 @@ bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggm
 }
 
 #else
+
+bool ggml_cuda_flash_attn_ext_sparse_pascal_takes(const int device, const ggml_tensor * dst) {
+    GGML_UNUSED_VARS(device, dst);
+    return false;
+}
 
 bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED_VARS(ctx, dst);

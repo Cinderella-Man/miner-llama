@@ -43,3 +43,7 @@
 
 // Runs the node and returns true if the path takes it; returns false (and does nothing) otherwise.
 bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// Whether ggml_cuda_flash_attn_ext_sparse_pascal takes the node on the device; runs, allocates and launches nothing.
+// GGML_CUDA_KEEPALIVE_EAGER=3 (C866) mixes it into the key of an evaluation that runs kernel by kernel.
+bool ggml_cuda_flash_attn_ext_sparse_pascal_takes(int device, const ggml_tensor * dst);

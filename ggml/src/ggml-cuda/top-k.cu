@@ -327,6 +327,45 @@ static void top_k_argsort_cuda(
     }
 }
 
+// which of ggml_cuda_op_top_k's kernels a call of nrows rows of ncols columns runs on the device. One function for the op
+// and for GGML_CUDA_KEEPALIVE_EAGER=3's key (C866), which leaves the row length out and asks this instead
+static ggml_cuda_top_k_path top_k_pick(const int device, const int64_t ncols, const int64_t nrows) {
+#ifdef CUB_TOP_K_AVAILABLE
+    // a single row always uses DeviceTopK if available
+    const bool bitonic_short    = nrows > 1 && ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC;
+#else
+    const bool bitonic_short    = ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC;
+#endif // CUB_TOP_K_AVAILABLE
+    const bool bitonic_few_rows = nrows > GGML_CUDA_TOP_K_NROWS_THRESHOLD &&
+                                  ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC_FEW_ROWS &&
+                                  nrows <= ggml_cuda_info().devices[device].nsm;
+
+    if (bitonic_short || bitonic_few_rows) {
+        // the padded row must fit in shared memory
+        const int ncols_pad = next_power_of_2(ncols);
+        if (ncols_pad * sizeof(int) <= ggml_cuda_info().devices[device].smpb) {
+            return GGML_CUDA_TOP_K_PATH_BITONIC;
+        }
+    }
+
+    if (nrows > GGML_CUDA_TOP_K_NROWS_THRESHOLD) {
+        return GGML_CUDA_TOP_K_PATH_RADIX;
+    }
+
+#ifdef CUB_TOP_K_AVAILABLE
+    return GGML_CUDA_TOP_K_PATH_CUB_TOP_K;
+#elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+    return ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_ARGSORT ? GGML_CUDA_TOP_K_PATH_CUB_ARGSORT : GGML_CUDA_TOP_K_PATH_RADIX;
+#else                             // GGML_CUDA_USE_CUB
+    return GGML_CUDA_TOP_K_PATH_RADIX;
+#endif                            // CUB_TOP_K_AVAILABLE
+}
+
+ggml_cuda_top_k_path ggml_cuda_top_k_path_of(int device, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    return top_k_pick(device, src0->ne[0], ggml_nrows(src0));
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -345,42 +384,26 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int device = ggml_cuda_get_device();
 
-#ifdef CUB_TOP_K_AVAILABLE
-    // a single row always uses DeviceTopK if available
-    const bool bitonic_short    = nrows > 1 && ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC;
-#else
-    const bool bitonic_short    = ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC;
-#endif // CUB_TOP_K_AVAILABLE
-    const bool bitonic_few_rows = nrows > GGML_CUDA_TOP_K_NROWS_THRESHOLD &&
-                                  ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC_FEW_ROWS &&
-                                  nrows <= ggml_cuda_info().devices[device].nsm;
-
-    if (bitonic_short || bitonic_few_rows) {
-        // the padded row must fit in shared memory
-        const int ncols_pad = next_power_of_2(ncols);
-        if (ncols_pad * sizeof(int) <= ggml_cuda_info().devices[device].smpb) {
+    switch (top_k_pick(device, ncols, nrows)) {
+        case GGML_CUDA_TOP_K_PATH_BITONIC:
             top_k_argsort_cuda(pool, src0_d, dst_d, ncols, nrows, k, false, stream);
             return;
-        }
-    }
-
-    if (nrows > GGML_CUDA_TOP_K_NROWS_THRESHOLD) {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
-        return;
-    }
-
+        case GGML_CUDA_TOP_K_PATH_RADIX:
+            top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+            return;
+        case GGML_CUDA_TOP_K_PATH_CUB_TOP_K:
 #ifdef CUB_TOP_K_AVAILABLE
-    // TODO: Assess perf of `DeviceBatchedTopK` for multi-row TopK & CCCL >= 3.5.0, re-running perf sweep of https://github.com/ggml-org/llama.cpp/pull/28713
-    for (int64_t i = 0; i < nrows; i++) {
-        top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
+            // TODO: Assess perf of `DeviceBatchedTopK` for multi-row TopK & CCCL >= 3.5.0, re-running perf sweep of https://github.com/ggml-org/llama.cpp/pull/28713
+            for (int64_t i = 0; i < nrows; i++) {
+                top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
+            }
+            return;
+#else
+            break;
+#endif // CUB_TOP_K_AVAILABLE
+        case GGML_CUDA_TOP_K_PATH_CUB_ARGSORT:
+            top_k_argsort_cuda(pool, src0_d, dst_d, ncols, nrows, k, true, stream);
+            return;
     }
-#elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
-    if (ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_ARGSORT) {
-        top_k_argsort_cuda(pool, src0_d, dst_d, ncols, nrows, k, true, stream);
-    } else {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
-    }
-#else                             // GGML_CUDA_USE_CUB
-    top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
-#endif                            // CUB_TOP_K_AVAILABLE
+    GGML_ABORT("fatal error");
 }

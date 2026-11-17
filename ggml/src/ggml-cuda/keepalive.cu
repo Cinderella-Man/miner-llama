@@ -187,6 +187,9 @@ static ggml_cuda_keepalive_ctl_t & ggml_cuda_keepalive() {
         c->cfg.eager = ggml_cuda_keepalive_parse_eager(getenv("GGML_CUDA_KEEPALIVE_EAGER"));
         if (cfg.mode != GGML_CUDA_KEEPALIVE_OFF && c->cfg.eager >= 0) {
             GGML_LOG_INFO("%s: GGML_CUDA_KEEPALIVE_EAGER=%d: %s\n", __func__, c->cfg.eager,
+                          c->cfg.eager == 3 ? "a card's block is ended before an evaluation that runs kernel by kernel at shapes "
+                                              "new to the card, the cache's length left out but the kernels it picks kept, and "
+                                              "before work outside a graph at a size new to the card" :
                           c->cfg.eager >= 2 ? "a card's block is ended before every evaluation that runs kernel by kernel, and "
                                               "before work outside a graph at a size new to the card" :
                           c->cfg.eager == 1 ? "a card's block is ended before an evaluation that runs kernel by kernel at shapes "

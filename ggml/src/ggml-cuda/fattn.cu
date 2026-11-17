@@ -860,3 +860,26 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
+
+// GGML_CUDA_KEEPALIVE_EAGER=3 (C866): what the cache's length picks for this call in ggml_cuda_flash_attn_ext, as one
+// number. The key leaves the length out (K and V's ne[1], the mask's ne[0], n_kv_max), so a change in any of these must
+// show here. On compute 6.1 the length picks: whether the sparse kernels take the call (fasp_rule_takes: from
+// _MIN_RATIO x n_kv_max cells per query token, which is how the MTP draft's first one-token pass at a new depth finds a
+// key of its own), the dense kernel (vector, tile, MMA; the vector kernel and the one-token Pascal kernel need the
+// length to be a multiple of FATTN_KQ_STRIDE), and whether the compute-6.1 tile kernel takes a tile call. Not here: how
+// launch_fattn splits the cache over blocks (parallel_blocks, stream-k), which picks whether the combine or fixup
+// kernel runs; it needs the kernel's occupancy. Est. it changes only while the cache is a few tiles long (the split
+// grows with the length and stays above one), and R191 saw no main-model pass wait at 4,096 cells with no stop at all.
+uint64_t ggml_cuda_flash_attn_ext_length_choice(int device, const ggml_tensor * dst) {
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
+
+    uint64_t c = (uint64_t) kernel << 8;
+    c |= (uint64_t) ggml_cuda_flash_attn_ext_sparse_pascal_takes(device, dst);
+    c |= (uint64_t) (kernel == BEST_FATTN_KERNEL_TILE && ggml_cuda_fattn_tile_pascal_supported(device, dst)) << 1;
+    c |= (uint64_t) (K->ne[1] % FATTN_KQ_STRIDE == 0) << 2;
+    c |= (uint64_t) (mask != nullptr && mask->ne[0] >= K->ne[1]) << 3;
+    return c;
+}
