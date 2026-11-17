@@ -202,6 +202,36 @@ static bool ggml_cuda_glu_alias_fuse_enabled() {
     return enabled;
 }
 
+// GGML_CUDA_MMID_GLU_UNFUSE (C865, Q350's first arm) acts on Pascal cards above compute 6.0 (6.0 never fuses these):
+//   unset or 0: the fusions as before;
+//   1: a routed experts' gate and up product (MUL_MAT_ID) is not fused with its GLU: two mul_mat_vec_q launches, then
+//      the GLU. The shared-expert match (the routed and the shared triple in one launch) needs that fusion, so it is
+//      not made either: graph_optimize leaves the shared expert where the model builds it, and it is fused there on
+//      its own like a dense FFN's;
+//   2: upstream #32239: no fused mul_mat_vec_q at all (cc < GGML_CUDA_CC_VOLTA in ggml_cuda_should_fuse_mul_mat_vec_q).
+static int ggml_cuda_mmid_glu_unfuse_mode() {
+    static const int mode = [] {
+        const int m = ggml_cuda_env_int("GGML_CUDA_MMID_GLU_UNFUSE", 0);
+        if (m == 1 || m == 2) {
+            GGML_LOG_INFO("%s: GGML_CUDA_MMID_GLU_UNFUSE=%d: on compute 6.1 and 6.2, %s\n", __func__, m,
+                          m == 1 ? "a routed gate/up/GLU (MUL_MAT_ID) runs unfused; no shared-expert match"
+                                 : "no fused mul_mat_vec_q (upstream #32239)");
+            return m;
+        }
+        if (m != 0) {
+            GGML_LOG_WARN("%s: GGML_CUDA_MMID_GLU_UNFUSE=%d is not 0, 1 or 2; ignored\n", __func__, m);
+        }
+        return 0;
+    }();
+    return mode;
+}
+
+// GGML_CUDA_MMID_GLU_UNFUSE=1 on the current device: no routed gate/up/GLU fusion
+static bool ggml_cuda_mmid_glu_unfused_here() {
+    return ggml_cuda_mmid_glu_unfuse_mode() == 1 &&
+           ggml_cuda_info().devices[ggml_cuda_get_device()].cc < GGML_CUDA_CC_VOLTA;
+}
+
 // GGML_CUDA_CPY_HOP_TYPES=0: CPY IQ4_NL -> F32, F32 -> Q6_K and Q6_K -> F32 (the card hops' casts) are not claimed, so the
 // scheduler runs them on the CPU, as upstream
 static bool ggml_cuda_cpy_hop_types_enabled() {
@@ -2574,6 +2604,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
+    // GGML_CUDA_MMID_GLU_UNFUSE=2: upstream #32239's guard, every Pascal card
+    if (cc < GGML_CUDA_CC_VOLTA && ggml_cuda_mmid_glu_unfuse_mode() == 2) {
+        return false;
+    }
     //we only support fusion for ncols_dst = 1
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
         return false;
@@ -2586,8 +2620,21 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// a gate/up/GLU triple as one mul_mat_vec_q launch; GGML_CUDA_MMID_GLU_UNFUSE=1 refuses a routed one (MUL_MAT_ID)
+static bool ggml_cuda_should_fuse_glu_mul_mat_vec_q(const ggml_tensor * up) {
+    if (up->op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmid_glu_unfused_here()) {
+        return false;
+    }
+    return ggml_cuda_should_fuse_mul_mat_vec_q(up);
+}
+
 static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
     if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
+        return false;
+    }
+    // one launch for the routed and the shared triple fuses the routed one, which GGML_CUDA_MMID_GLU_UNFUSE=1 refuses;
+    // checked here so that graph_optimize does not move the shared expert either
+    if (ggml_cuda_mmid_glu_unfused_here()) {
         return false;
     }
     const int nodes[] = { routed_idx, routed_idx + 1, routed_idx + 2, shared_idx, shared_idx + 1, shared_idx + 2 };
@@ -6165,7 +6212,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     break;
                 }
 
-                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                if (ggml_cuda_should_fuse_glu_mul_mat_vec_q(up_n)) {
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -6236,7 +6283,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+            if (ggml_cuda_should_fuse_glu_mul_mat_vec_q(up_n)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
                 fusion_data.x_bias    = up_bias_tensor;
@@ -6277,7 +6324,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_should_fuse_glu_mul_mat_vec_q(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
