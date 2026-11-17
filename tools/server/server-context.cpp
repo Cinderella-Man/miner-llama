@@ -6247,7 +6247,12 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    // --spec-ckpt-vram: the per-step checkpoint stays in a device store of its own (no host copy of
+                    // the recurrent state over the bus each step); the host copy if the store cannot be allocated
+                    constexpr int32_t spec_store_id = 1 << 20; // apart from the --ctx-checkpoints-vram stores 0..n
+                    if (!params_base.spec_checkpoint_vram || !ckpt.update_tgt_store(ctx_tgt, slot.id, spec_store_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                        ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    }
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
