@@ -268,6 +268,7 @@ public:
 
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
     // the mask built on the device (ggml_kq_mask) reads the cells' positions and sequences from a copy that each device
     // holding layers of this cache keeps: F32 [2, kv_size*n_stream + 1], per cell its position and, as bit s, whether
@@ -580,6 +581,7 @@ public:
 
     uint32_t       get_n_swa()    const;
     llama_swa_type get_swa_type() const;
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
