@@ -118,6 +118,23 @@ static bool ggml_cuda_mmq_moe_legacy(const int64_t ne12) {
     return mode == 2 ? ne12 <= MMVQ_MAX_BATCH_SIZE : mode != 0;
 }
 
+// GGML_CUDA_MMQ_KQ_FP32SCALE (C861, Q1549; the idea from ik_llama.cpp #2876, MIT): the Q4_K, Q5_K and Q6_K prompt
+// products (MMQ, dp4a layout) multiply each sub-block scale by its integer dot product in FP32 instead of a 32-bit
+// integer multiply, which compute 6.1 runs as three XMAD instructions. Exact, so the results are the same floats.
+// 0 (default) off; 1 compute capability 6.1 only; 2 any NVIDIA GPU (testing; the MMA layout is unchanged).
+bool ggml_cuda_mmq_kq_fp32scale(const int cc) {
+    static const int mode = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_KQ_FP32SCALE");
+        const int m = env != nullptr ? atoi(env) : 0;
+        if (m != 0) {
+            GGML_LOG_INFO("%s: GGML_CUDA_MMQ_KQ_FP32SCALE=%d: Q4_K, Q5_K and Q6_K prompt products scale in FP32 (%s)\n",
+                          __func__, m, m == 2 ? "any NVIDIA GPU" : "compute 6.1 only");
+        }
+        return m;
+    }();
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && (mode == 2 || (mode == 1 && cc == GGML_CUDA_CC_DP4A));
+}
+
 // overrides the src1 precision requested by the graph, "auto" keeps the requested one
 static ggml_prec ggml_cuda_mmq_get_prec_env() {
     const char * env_c = getenv("GGML_CUDA_MMQ_PREC");
