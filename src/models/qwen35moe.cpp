@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-head-shortlist.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
@@ -699,6 +700,11 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
     cur = build_lora_mm(head_w, cur, head_s);
+    // the draft head over a shortlist (LLAMA_DRAFT_SHORTLIST, llama_set_head_shortlist), as qwen4exp has it
+    if (cparams.head_short_on && cparams.head_short && n_outputs == 1 && cur->ne[1] == 1 && head_s == nullptr &&
+            (!loras || loras->empty())) {
+    } else {
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
