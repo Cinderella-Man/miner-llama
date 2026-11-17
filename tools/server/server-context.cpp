@@ -7596,7 +7596,14 @@ private:
                     accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
-                } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
+                } else if (slot.spec_is_replay) {
+                    // a replay re-decodes tokens already accepted before the checkpoint restore: accept them as they
+                    // are, greedy too. Verifying them again (common_sampler_sample_and_accept_n) livelocked under a
+                    // grammar at temperature 0: the replayed token was a host resample after the grammar
+                    // rejected the device's draw; re-verifying drew and rejected the same device token, resampled the
+                    // same token, and the last_resampled_device break left it one row short, a rollback of 1 - so the
+                    // same checkpoint restore and the same one-token replay, forever ("accepted 0/1 (restore
+                    // checkpoint)" 483 times in 50 s, 2026-11-16)
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 } else if (use_rejection && server_spec_verify::get().block && !slot.task->params.sampling.backend_sampling) {
                     // LLAMA_SPEC_BLOCK_VERIFY (server_spec_verify): the drafted block verified jointly
