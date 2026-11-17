@@ -32,8 +32,15 @@
 //                                  set, get or memset the backend runs on the card outside a graph at a size new to the
 //                                  card; the block's next start is ordered on the card after the next evaluation's work
 //                                2: as 1, and before every evaluation that runs kernel by kernel, new shapes or not
+//                                3: (C866) as 1, with the cache's length left out of an evaluation's shapes: a decode
+//                                  or verify pass at a new depth keeps the card's block, as its repeat does (R192: at
+//                                  1 every new depth stopped all nine cards' blocks before three passes, and those ran
+//                                  about twice as long). The key mixes in what the length picks instead: which kernels
+//                                  the attention and the indexer's top-k take (ggml_cuda_keepalive_shapes in
+//                                  ggml-cuda.cu), so that the MTP draft's first one-token pass at a depth where the
+//                                  sparse attention takes it is still new (R191: it waited about 1 s without a stop)
 //                                0 (or any other value): no stop, only the counts
-//                                At 1 and 2 a stop on a card whose block has not begun yet (its start held behind an
+//                                At 1, 2 and 3 a stop on a card whose block has not begun yet (its start held behind an
 //                                  evaluation the card is still running) does not wait for it (C817): the word the stop
 //                                  writes ends the block at its first poll, once the evaluation is done, and the host goes
 //                                  on at once. Otherwise the copy to the next card at a new size, right after a card's
@@ -66,10 +73,11 @@ struct ggml_cuda_keepalive_config {
     ggml_cuda_keepalive_mode mode    = GGML_CUDA_KEEPALIVE_OFF;
     uint32_t                 idle_ms = 1000;
     uint32_t                 poll_us = 50;
-    int                      eager   = -1; // GGML_CUDA_KEEPALIVE_EAGER: -1 unset, 0 counts only, 1 new shapes, 2 every
+    int                      eager   = -1; // GGML_CUDA_KEEPALIVE_EAGER: -1 unset, 0 counts only, 1 new shapes, 2 every,
+                                           // 3 new shapes without the cache's length (C866)
 };
 
-// GGML_CUDA_KEEPALIVE_EAGER's value (nullptr: unset): -1 unset or empty, 1 and 2 as written, any other value 0
+// GGML_CUDA_KEEPALIVE_EAGER's value (nullptr: unset): -1 unset or empty, 1, 2 and 3 as written, any other value 0
 static inline int ggml_cuda_keepalive_parse_eager(const char * v) {
     if (v == nullptr || v[0] == '\0') {
         return -1;
@@ -79,6 +87,9 @@ static inline int ggml_cuda_keepalive_parse_eager(const char * v) {
     }
     if (strcmp(v, "2") == 0) {
         return 2;
+    }
+    if (strcmp(v, "3") == 0) {
+        return 3;
     }
     return 0;
 }
@@ -259,7 +270,7 @@ struct ggml_cuda_keepalive_counts {
 //   void     wait(int dev)                          until the block has ended
 //   bool     pending(int dev)                       the card's newest block has not begun: the work of the stream a
 //                                                   start was held for last is not done, and the block waits behind it
-//                                                   (does not wait; asked only at GGML_CUDA_KEEPALIVE_EAGER 1 and 2)
+//                                                   (does not wait; asked only at GGML_CUDA_KEEPALIVE_EAGER 1, 2 and 3)
 //   const ggml_cuda_keepalive_report & report(int dev)
 // Every method takes the controller's lock, so a free on one thread and a graph on another are safe.
 template <typename Ops, int MAX_DEVICES>
@@ -315,9 +326,9 @@ struct ggml_cuda_keepalive_ctl {
     }
 
     // GGML_CUDA_KEEPALIVE_EAGER: before an evaluation that runs kernel by kernel on the card, shape: its shapes as one
-    // number. When the switch acts on it (a shape new to the card at 1, every one at 2), the card's block is ended and
-    // its next start held until this evaluation's work is done (graph_end's stream), so that no kernel launched by the
-    // evaluation finds the block running. Returns whether the switch acted.
+    // number. When the switch acts on it (a shape new to the card at 1 and 3, every one at 2), the card's block is ended
+    // and its next start held until this evaluation's work is done (graph_end's stream), so that no kernel launched by
+    // the evaluation finds the block running. Returns whether the switch acted.
     bool eager_begin(int dev, uint64_t shape) {
         if (!on() || cfg.eager < 0 || dev < 0 || dev >= MAX_DEVICES) {
             return false;
@@ -329,7 +340,7 @@ struct ggml_cuda_keepalive_ctl {
             return false;
         }
         const bool fresh = d.shapes.insert(shape).second;
-        if (!fresh && cfg.eager < 2) {
+        if (!fresh && cfg.eager != 2) {
             return false;
         }
         d.counts.eager_new++;
@@ -341,7 +352,7 @@ struct ggml_cuda_keepalive_ctl {
         return true;
     }
 
-    // GGML_CUDA_KEEPALIVE_EAGER at 1 or 2: before a set, get, memset or copy the backend runs on the card outside a
+    // GGML_CUDA_KEEPALIVE_EAGER at 1, 2 or 3: before a set, get, memset or copy the backend runs on the card outside a
     // graph, key: its kind and size (ggml_cuda_keepalive_outside_key). At a key new to the card, the card's block is
     // ended and its next start held until the card's next evaluation. Returns whether the switch acted.
     bool outside(int dev, uint64_t key) {
@@ -448,7 +459,7 @@ struct ggml_cuda_keepalive_ctl {
         }
     }
 
-    // GGML_CUDA_KEEPALIVE_EAGER at 1 or 2 (C817), after a stop's word is written: a block that has not begun is left
+    // GGML_CUDA_KEEPALIVE_EAGER at 1, 2 or 3 (C817), after a stop's word is written: a block that has not begun is left
     // to end by itself. It waits behind an evaluation the card is still running; when that is done, it reads a word
     // without its generation (this stop's 0, or a later run's) and ends at its first poll, without running. Waiting
     // for it would wait for that evaluation. The word is written first, so a block found not begun is sure to read it.

@@ -453,7 +453,8 @@ static void test_eager_parse() {
     CHECK(ggml_cuda_keepalive_parse_eager("0") == 0);
     CHECK(ggml_cuda_keepalive_parse_eager("1") == 1);
     CHECK(ggml_cuda_keepalive_parse_eager("2") == 2);
-    CHECK(ggml_cuda_keepalive_parse_eager("3") == 0);
+    CHECK(ggml_cuda_keepalive_parse_eager("3") == 3);
+    CHECK(ggml_cuda_keepalive_parse_eager("4") == 0);
     CHECK(ggml_cuda_keepalive_parse_eager("on") == 0);
     CHECK(ggml_cuda_keepalive_parse(nullptr, nullptr, nullptr).eager == -1); // the plain settings leave it unset
     CHECK(ggml_cuda_keepalive_outside_key(GGML_CUDA_KEEPALIVE_OUT_SET, 4096) !=
@@ -534,6 +535,32 @@ static void test_eager_new_shapes() {
     ka.quiesce();
     const ggml_cuda_keepalive_counts e = ka.counts();
     CHECK(e.starts == 6 && e.stopped == 6 && e.timeouts == 0 && e.lost == 0 && e.running == 0);
+    CHECK(ops.bad_launches == 0);
+}
+
+// level 3 (C866): the controller acts as at 1, on shapes new to the card only (the key it is given leaves the cache's
+// length out, ggml_cuda_keepalive_shapes in ggml-cuda.cu); work outside a graph as at 1
+static void test_eager_no_depth() {
+    mock_ops ops;
+    mock_stream s;
+    ctl_t ka(cfg_eager("decode", "3"), ops);
+    ka.graph_end(0, &s);
+    CHECK(ka.eager_begin(0, 100) && !ka.running(0));
+    ka.graph_end(0, &s);
+    CHECK(ka.running(0));
+    for (int i = 0; i < 3; ++i) {
+        CHECK(!ka.eager_begin(0, 100));
+        CHECK(ka.running(0) && !ops.cards[0].ended);
+        ka.graph_end(0, &s);
+    }
+    CHECK(ka.eager_begin(0, 200) && !ka.running(0));
+    ka.graph_end(0, &s);
+    CHECK(ops.cards[0].launches == 3 && ops.cards[0].launches_after == 2);
+    const ggml_cuda_keepalive_counts c = ka.counts();
+    CHECK(c.eager == 5 && c.eager_new == 2 && c.eager_stops == 2);
+    CHECK(ka.outside(0, ggml_cuda_keepalive_outside_key(GGML_CUDA_KEEPALIVE_OUT_SET, 8)));
+    CHECK(!ka.outside(0, ggml_cuda_keepalive_outside_key(GGML_CUDA_KEEPALIVE_OUT_SET, 8)));
+    ka.quiesce();
     CHECK(ops.bad_launches == 0);
 }
 
@@ -1068,6 +1095,7 @@ int main(int argc, char ** argv) {
     test_eager_unset();
     test_eager_new_shapes();
     test_eager_every();
+    test_eager_no_depth();
     test_outside();
     test_eager_request_kick();
     test_eager_counts_timeout();
