@@ -797,8 +797,8 @@ struct server_slot {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::vector<common_adapter_lora_info> & lora_new) {
+        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -2214,6 +2214,9 @@ private:
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
 
+    // n_swa for server_prompt::get_reuse(): 0 with a recurrent state, which holds one position only
+    int32_t n_swa_reuse;
+
     // slots / clients
     std::vector<server_slot> slots;
 
@@ -2620,6 +2623,9 @@ private:
         }
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+
+        // the min position of a hybrid memory is the position of its recurrent state, not the start of the SWA window
+        n_swa_reuse = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt) ? 0 : n_swa;
 
         // Necessary similarity of prompt for slot selection
         slot_sched.slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -3183,7 +3189,7 @@ private:
 
         slot.prompt_save(*prompt_cache);
 
-        if (!slot.prompt_load(*prompt_cache, task.tokens)) {
+        if (!slot.prompt_load(*prompt_cache, task.tokens, get_task_lora(task))) {
             slot.prompt_clear();
         }
 
@@ -3237,19 +3243,25 @@ private:
         return output;
     }
 
+    // per-request lora if given, otherwise the global config
+    std::vector<common_adapter_lora_info> get_task_lora(const server_task & task) const {
+        return task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
-        // per-request lora if given, otherwise the global config
-        auto task_loras = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
-        if (!are_lora_equal(task_loras, slot.lora)) {
+        auto task_loras = get_task_lora(task);
+
+        // the state can come from the prompt cache, so it is compared with its own lora config, not with the one of the last task
+        if (!are_lora_equal(task_loras, slot.prompt.lora)) {
             // if lora has changed, check to see if the cache should be cleared
-            if (lora_should_clear_cache(slot.lora, task_loras)) {
-                SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task_loras.size());
+            if (lora_should_clear_cache(slot.prompt.lora, task_loras)) {
+                SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.prompt.lora.size(), task_loras.size());
                 slot.prompt.clear();
             } else {
                 SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
             }
-            slot.lora = task_loras;
         }
+        slot.lora = task_loras;
 
         // if using alora, make sure it's only a single one requested and active
         size_t alora_invocation_start = task.tokens.size();
@@ -3298,6 +3310,8 @@ private:
                 slot.alora_invocation_start = alora_invocation_start;
             }
         }
+
+        slot.prompt.lora = slot.lora;
 
         if (!task.tokens.validate(ctx_tgt)) {
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
@@ -4891,7 +4905,7 @@ private:
 
                     const int id_task = task.id;
 
-                    const auto plan = slot_sched.select(get_slot_infos(), task);
+                    const auto plan = slot_sched.select(get_slot_infos(), task, get_task_lora(task));
 
                     server_slot * slot = plan.id_slot == -1 ? nullptr : get_slot_by_id(plan.id_slot);
 
@@ -6551,7 +6565,7 @@ private:
 
                                 // ring_past and resume_next: the sliding-window trim's two rules (LLAMA_SERVER_CKPT_RING_PAST,
                                 // LLAMA_SERVER_CKPT_RESUME_NEXT), off without ckpt_trim: then upstream's rule
-                                auto reuse = slot.prompt.get_reuse(n_past, has_new_tokens, n_swa, pos_min,
+                                auto reuse = slot.prompt.get_reuse(n_past, has_new_tokens, n_swa_reuse, pos_min,
                                         ckpt_trim && ckpt_ring_past, ckpt_trim && ckpt_resume_next);
 
                                 const llama_pos pos_min_thold = reuse.pos_min_thold;
