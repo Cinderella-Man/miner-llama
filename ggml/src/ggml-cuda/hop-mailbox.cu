@@ -41,8 +41,22 @@ struct ggml_cuda_hop_mailbox {
 
     int64_t n_hops = 0, n_bytes = 0, n_chunk_count = 0, n_on_copy_stream = 0, n_guarded = 0;
 
+    // GGML_CUDA_HOP_MAILBOX_GATE_KB: hops above gate_bytes go through gate buffers ordered by events, no polling
+    size_t gate_bytes = 0;
+    size_t gate_size  = 0;                  // bytes per gate buffer
+    char * gate_host  = nullptr;            // HOP_MB_GATE_BUFS * gate_size bytes, pinned, mapped, portable
+    char * gate_src   = nullptr;            // the same memory as each card addresses it
+    char * gate_dst   = nullptr;
+    int    gate_next  = 0;
+    cudaEvent_t gate_written[4] = {};       // on dev_src: the writer into the buffer is done
+    cudaEvent_t gate_read[4]    = {};       // on dev_dst: the reader out of the buffer is done
+    bool        gate_used[4]    = {};
+    int64_t n_gated = 0, n_gate_too_big = 0;
+
     unsigned * timeout_line() const { return words + (size_t) 2*n_slots*HOP_MB_LINE; }
 };
+
+#define HOP_MB_GATE_BUFS 4
 
 struct hop_mb_args {
     char       * ring;
@@ -202,6 +216,14 @@ static __global__ void __launch_bounds__(1024) k_hop_mb_recv(const hop_mb_args a
     }
 }
 
+// GGML_CUDA_HOP_MAILBOX_GATE_KB: a plain copy of n16 16-byte units, device <-> mapped host memory. Nothing waits in it:
+// events order it after the data it reads is complete (volatile loads so that a reader sees the host memory)
+static __global__ void k_hop_mb_gate_copy(const uint4 * from, uint4 * to, const size_t n16) {
+    for (size_t i = (size_t) blockIdx.x*blockDim.x + threadIdx.x; i < n16; i += (size_t) gridDim.x*blockDim.x) {
+        to[i] = __ldcv(from + i);
+    }
+}
+
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 static int hop_mb_env(const char * name, int def, int lo, int hi) {
@@ -233,6 +255,8 @@ static ggml_cuda_hop_mailbox * hop_mb_get(ggml_backend_cuda_context * ctx_src, g
     mb->n_slots     = hop_mb_env("GGML_CUDA_HOP_MAILBOX_SLOTS",  16,   2,   256);
     mb->slot_size   = (size_t) hop_mb_env("GGML_CUDA_HOP_MAILBOX_SLOT_KB", 32, 1, 4096) * 1024;
     mb->max_bytes   = (size_t) hop_mb_env("GGML_CUDA_HOP_MAILBOX_MAX_KB",   0, 0, 1 << 22) * 1024;
+    mb->gate_bytes  = (size_t) hop_mb_env("GGML_CUDA_HOP_MAILBOX_GATE_KB",  0, 0, 1 << 22) * 1024;
+    mb->gate_size   = (size_t) hop_mb_env("GGML_CUDA_HOP_MAILBOX_GATE_BUF_KB", 4096, 64, 1 << 20) * 1024;
     mb->stream_mode = hop_mb_env("GGML_CUDA_HOP_MAILBOX_STREAM",  1,   0,     2);
     mb->threads     = hop_mb_env("GGML_CUDA_HOP_MAILBOX_THREADS", 256, 64, 1024) / WARP_SIZE * WARP_SIZE;
     const int poll_us    = hop_mb_env("GGML_CUDA_HOP_MAILBOX_POLL_US",    4, 0, 1000);
@@ -265,6 +289,79 @@ static ggml_cuda_hop_mailbox * hop_mb_get(ggml_backend_cuda_context * ctx_src, g
     return mb;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// GGML_CUDA_HOP_MAILBOX_GATE_KB (2026-11-16): a large hop (a prompt micro-batch) without polling. A polling reader is
+// enqueued long before its source card gets there (the scheduler runs up to its copies ahead), so its wait grows with
+// the context and at ~50k+ it passed the 1 s timeout and trapped. Here each card's kernel only runs once its
+// data is complete: the source card copies into one of HOP_MB_GATE_BUFS pinned mapped buffers (after that buffer's
+// previous reader is done, by event), records an event; this card's copy stream waits on it (and on the scheduler's
+// guard) and copies out; this card's compute stream waits on that. Nothing waits inside a kernel, so no timeout exists.
+// Returns false (nothing enqueued) for a hop above the buffer size.
+static bool hop_mb_gated_copy(ggml_cuda_hop_mailbox * mb, ggml_backend_cuda_context * ctx_src,
+        ggml_backend_cuda_context * ctx_dst, char * dst, const char * src, const size_t nbytes) {
+    if (nbytes > mb->gate_size) {
+        mb->n_gate_too_big++;
+        return false;
+    }
+    if (mb->gate_host == nullptr) {
+        ggml_cuda_set_device(mb->dev_dst);
+        ggml_cuda_keepalive_quiesce();
+        CUDA_CHECK(cudaHostAlloc((void **) &mb->gate_host, HOP_MB_GATE_BUFS * mb->gate_size,
+                cudaHostAllocPortable | cudaHostAllocMapped));
+        CUDA_CHECK(cudaHostGetDevicePointer((void **) &mb->gate_dst, mb->gate_host, 0));
+        for (int b = 0; b < HOP_MB_GATE_BUFS; ++b) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&mb->gate_read[b], cudaEventDisableTiming));
+        }
+        if (mb->copy_stream == nullptr) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&mb->copy_stream, cudaStreamNonBlocking));
+        }
+        ggml_cuda_set_device(mb->dev_src);
+        CUDA_CHECK(cudaHostGetDevicePointer((void **) &mb->gate_src, mb->gate_host, 0));
+        for (int b = 0; b < HOP_MB_GATE_BUFS; ++b) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&mb->gate_written[b], cudaEventDisableTiming));
+        }
+        GGML_LOG_WARN("%s: card hop CUDA%d -> %s: hops above %zu KiB through %d gate buffers of %zu KiB, ordered by events\n",
+                __func__, mb->dev_src, ctx_dst->name.c_str(), mb->gate_bytes / 1024, HOP_MB_GATE_BUFS, mb->gate_size / 1024);
+    }
+    const int b = mb->gate_next;
+    mb->gate_next = (b + 1) % HOP_MB_GATE_BUFS;
+    const size_t n16     = nbytes / 16;
+    const int    threads = 256;
+    const int    blocks  = (int) std::min<size_t>((n16 + threads - 1) / threads, 64);
+
+    // the source card, after the work that wrote src and after the buffer's previous reader
+    ggml_cuda_set_device(mb->dev_src);
+    if (mb->gate_used[b]) {
+        CUDA_CHECK(cudaStreamWaitEvent(ctx_src->stream(), mb->gate_read[b], 0));
+    }
+    k_hop_mb_gate_copy<<<blocks, threads, 0, ctx_src->stream()>>>((const uint4 *) src,
+            (uint4 *) (mb->gate_src + (size_t) b * mb->gate_size), n16);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(mb->gate_written[b], ctx_src->stream()));
+
+    // this card's copy stream, after the scheduler's guard for the input copy it writes and after the writer
+    ggml_cuda_set_device(mb->dev_dst);
+    cudaStream_t s = mb->copy_stream;
+    if (ctx_dst->hop_guard != nullptr) {
+        CUDA_CHECK(cudaStreamWaitEvent(s, ctx_dst->hop_guard, 0));
+        mb->n_guarded++;
+    }
+    ctx_dst->hop_guard = nullptr;
+    CUDA_CHECK(cudaStreamWaitEvent(s, mb->gate_written[b], 0));
+    k_hop_mb_gate_copy<<<blocks, threads, 0, s>>>((const uint4 *) (mb->gate_dst + (size_t) b * mb->gate_size),
+            (uint4 *) dst, n16);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(mb->gate_read[b], s));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), mb->gate_read[b], 0));
+    mb->gate_used[b] = true;
+
+    mb->n_hops++;
+    mb->n_gated++;
+    mb->n_bytes += nbytes;
+    return true;
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 bool ggml_cuda_hop_mailbox_copy(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst, char * dst,
         const char * src, const size_t nbytes) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
@@ -275,6 +372,9 @@ bool ggml_cuda_hop_mailbox_copy(ggml_backend_cuda_context * ctx_src, ggml_backen
         return false;
     }
     ggml_cuda_hop_mailbox * mb = hop_mb_get(ctx_src, ctx_dst);
+    if (mb->gate_bytes != 0 && nbytes > mb->gate_bytes) {
+        return hop_mb_gated_copy(mb, ctx_src, ctx_dst, dst, src, nbytes);
+    }
     if (mb->max_bytes != 0 && nbytes > mb->max_bytes) {
         return false;
     }
@@ -368,6 +468,19 @@ void ggml_cuda_hop_mailbox_free(ggml_cuda_hop_mailbox * mb, ggml_backend_cuda_co
         CUDA_CHECK(cudaStreamDestroy(mb->copy_stream));
     }
     CUDA_CHECK(cudaEventDestroy(mb->copy_done));
+    if (mb->gate_host != nullptr) {
+        GGML_LOG_WARN("%s: card hop CUDA%d -> %s: %" PRId64 " hops through the gate buffers, %" PRId64 " too big for them\n",
+                __func__, mb->dev_src, ctx_dst->name.c_str(), mb->n_gated, mb->n_gate_too_big);
+        for (int b = 0; b < HOP_MB_GATE_BUFS; ++b) {
+            CUDA_CHECK(cudaEventDestroy(mb->gate_read[b]));
+        }
+        ggml_cuda_set_device(mb->dev_src);
+        CUDA_CHECK(cudaDeviceSynchronize()); // the writers into the gate buffers
+        for (int b = 0; b < HOP_MB_GATE_BUFS; ++b) {
+            CUDA_CHECK(cudaEventDestroy(mb->gate_written[b]));
+        }
+        ggml_cuda_set_device(mb->dev_dst);
+    }
     const volatile unsigned * timeout_line = mb->timeout_line();
     if (timeout_line[0] != 0) {
         GGML_LOG_ERROR("%s: card hop CUDA%d -> %s by mailbox: the %s kernel timed out waiting for sequence number %u "
@@ -377,5 +490,8 @@ void ggml_cuda_hop_mailbox_free(ggml_cuda_hop_mailbox * mb, ggml_backend_cuda_co
     ggml_cuda_keepalive_quiesce();
     CUDA_CHECK(cudaFreeHost(mb->words));
     CUDA_CHECK(cudaFreeHost(mb->ring));
+    if (mb->gate_host != nullptr) {
+        CUDA_CHECK(cudaFreeHost(mb->gate_host));
+    }
     delete mb;
 }
