@@ -1708,10 +1708,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("guesses for --pipe-depth: none, copy (the token after the longest earlier match of the text's end), "
             "cont (copy, else the most frequent continuation of the last 1-8 tokens in the request) or staircase "
             "(copy, with --pipe-store also the request's continuations of 2-token or longer contexts and the store, else "
-            "the staircase drafter of --pipe-draft) (default: %s)",
+            "the staircase drafter of --pipe-draft) or mtp (the model's MTP head, with --spec-type draft-mtp; copy if "
+            "it has no guess) (default: %s)",
             params.pipe_guess.c_str()),
         [](common_params & params, const std::string & value) {
-            if (value != "none" && value != "copy" && value != "cont" && value != "staircase") {
+            if (value != "none" && value != "copy" && value != "cont" && value != "staircase" && value != "mtp") {
                 throw std::invalid_argument("invalid value");
             }
             params.pipe_guess = value;

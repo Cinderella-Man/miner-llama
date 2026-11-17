@@ -438,6 +438,7 @@ public:
     int32_t pipe_submit_fed(int32_t i_slot, int32_t i_slot_src, llama_pos pos, llama_seq_id seq_id);
     float * pipe_get_logits(int32_t i_slot);
     llama_token pipe_get_sampled(int32_t i_slot);
+    const float * pipe_get_h_nextn(int32_t i_slot);
     bool    pipe_ready(int32_t i_slot);
     void    pipe_drain();
 
@@ -728,6 +729,9 @@ private:
     // one in-flight single-token evaluation of pipelined decoding: its own scheduler (inputs, inter-device copies and
     // compute buffers), its own graph (and therefore its own CUDA graphs), and a pinned buffer for its logits.
     // slots share only the weights and the memory module; every device runs the queued evaluations in submission order
+    // floats into a pipe slot's output buffer where the final hidden state (MTP pipeline guesses) goes
+    static constexpr size_t PIPE_H_OFFSET = 64;
+
     struct pipe_slot {
         ggml_backend_sched_ptr  sched;
         llm_graph_result_ptr    res;
@@ -739,6 +743,7 @@ private:
         float *                 logits  = nullptr;
 
         bool                    busy    = false;   // submitted and not yet waited for
+        bool                    has_h   = false;   // the final hidden state follows at logits + PIPE_H_OFFSET
 
         int32_t                 n_tokens_max = 1;  // tokens per evaluation the compute buffers are reserved for
 

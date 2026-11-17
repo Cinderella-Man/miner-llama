@@ -2112,6 +2112,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    if (params.pipe_depth > 0 && params.pipe_guess == "mtp") {
+        cparams.n_rs_seq = 0; // the pipe slots refuse recurrent snapshots; the pipe rolls back itself, MTP outside it uses checkpoints
+    }
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;

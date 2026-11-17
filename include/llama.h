@@ -1184,6 +1184,10 @@ extern "C" {
     // With a backend sampler: waits for the token sampled after the token last submitted in this slot
     LLAMA_API llama_token llama_pipe_get_sampled(struct llama_context * ctx, int32_t slot);
 
+    // With a context that outputs nextn embeddings (an MTP draft is attached): waits for the evaluation last submitted
+    // in this slot and returns its final hidden state ([n_embd] floats, valid until the slot is reused), or NULL
+    LLAMA_API const float * llama_pipe_get_h_nextn(struct llama_context * ctx, int32_t slot);
+
     // True if the evaluation last submitted in this slot is complete, so that llama_pipe_get_logits and
     // llama_pipe_get_sampled return without waiting; false while it runs or if its device cannot tell without waiting.
     // Evaluations complete in submission order on one stream; with LLAMA_PIPE_CHUNK_STREAM=1 the chunk slots run on

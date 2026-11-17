@@ -707,6 +707,22 @@ struct server_slot {
     int32_t pipe_n_draft_hit = 0;
     llama_pos pipe_draft_pending = -1; // the position the drafter's pending launch guesses
 
+    // --pipe-guess mtp: the model's MTP head guesses. Its anchor is the newest committed token (pm_tok at pm_pos) with
+    // the target's final hidden state of the token before it (pm_h); a guess walks MTP rows from the anchor through the
+    // tokens in flight, each row reading the hidden state the previous row output (pm_hw). The anchor row is committed
+    // in the draft context's KV; the rows after it are dropped when the anchor moves on.
+    std::vector<float> pm_h;
+    std::vector<float> pm_hw;
+    llama_token pm_tok  = -1;
+    llama_pos   pm_pos  = -1;    // -1: no anchor
+    llama_pos   pm_walk = -1;    // the last row walked from the anchor (-1: none yet)
+    llama_token pm_next = -1;    // the MTP guess for pm_walk + 1
+    int64_t     pm_t_us = 0;     // this request's time in MTP rows, and their number
+    int64_t     pm_t_proc_us = 0, pm_t_sync_us = 0; // of which in llama_process, and waiting for the device after it
+    int32_t     pm_n_rows = 0;
+    llama_pos   pm_pend = -1;    // pm_ahead: the position of a row launched and not collected yet (-1: none)
+    int64_t     pm_t0   = 0;     // when the row launched last started
+
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -894,6 +910,13 @@ struct server_slot {
         pipe_n_draft_hit = 0;
         pipe_draft_pending = -1;
         pipe_guesser.n_store = 0;
+        pm_pos    = -1;
+        pm_walk   = -1;
+        pm_pend   = -1;
+        pm_t_us   = 0;
+        pm_t_proc_us = 0;
+        pm_t_sync_us = 0;
+        pm_n_rows = 0;
 
         n_predict_max = -1;
 
@@ -1250,6 +1273,10 @@ struct server_slot {
             SLT_INF(*this,
                     "       pipelined = %10d guesses, %d right, %d wrong, %d from the store; drafter %d guesses, %d right\n",
                     pipe_n_guess, pipe_n_hit, pipe_n_miss, pipe_guesser.n_store, pipe_n_draft, pipe_n_draft_hit);
+        }
+        if (pm_n_rows > 0) {
+            SLT_INF(*this, "       pipe mtp  = %10d rows, %.3f ms per row (process %.3f, sync %.3f)\n", pm_n_rows,
+                    pm_t_us / 1000.0 / pm_n_rows, pm_t_proc_us / 1000.0 / pm_n_rows, pm_t_sync_us / 1000.0 / pm_n_rows);
         }
 
         if (smpl && (common_sampler_get_stats(smpl.get()).n_head_short + common_sampler_get_stats(smpl.get()).n_head_full) > 0) {
@@ -2206,6 +2233,10 @@ private:
 
     common_speculative_ptr spec;
 
+    // --pipe-guess mtp: the batch of one MTP row, and the hidden state width
+    common_batch pm_batch;
+    int32_t      pm_n_embd = 0;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -2765,6 +2796,16 @@ private:
         }
 
         // pipelined speculation: pipe slots for the newest token and up to pipe_depth guesses, with room to refill
+        if (params_base.pipe_depth > 0 && params_base.pipe_guess == "mtp") {
+            if (ctx_dft == nullptr || !spec) {
+                SRV_WRN("%s", "--pipe-guess mtp needs an MTP draft (--spec-type draft-mtp): guessing with cont\n");
+                params_base.pipe_guess = "cont";
+            } else {
+                pm_batch  = common_batch(ctx_dft);
+                pm_n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
+                SRV_INF("pipelined speculation: the MTP head guesses (rows of %d)\n", pm_n_embd);
+            }
+        }
         if (params_base.pipe_depth > 0) {
             const int32_t n_pipe = 2*(params_base.pipe_depth + 1);
             if (params_base.sampling.backend_sampling && params_base.pipe_guess == "staircase") {
@@ -5449,6 +5490,195 @@ private:
 
     // whether the slot's next tokens may run pipelined (the caller checks that it generates alone): its sampling runs
     // entirely on the device and does not depend on the tokens before it, and its window fits in the context
+    // --pipe-guess mtp with its MTP draft context set up
+    bool pipe_mtp() const {
+        return pm_n_embd > 0 && params_base.pipe_guess == "mtp" && ctx_dft != nullptr && spec;
+    }
+
+    // one MTP row: tok at pos with the hidden state h of the token before; its most likely next token goes to guess and
+    // the row's output hidden state to h_out. False on error
+    bool pm_row(server_slot & slot, llama_token tok, llama_pos pos, const float * h, llama_token & guess,
+                std::vector<float> & h_out) {
+        return pm_launch(slot, tok, pos, h) && pm_collect(slot, guess, h_out);
+    }
+
+    // the first half of an MTP row: submitted, not waited for
+    bool pm_launch(server_slot & slot, llama_token tok, llama_pos pos, const float * h) {
+        slot.pm_t0 = ggml_time_us();
+        // the shortlisted head when LLAMA_DRAFT_SHORTLIST set one up
+        if (llama_head_shortlist_size(ctx_dft) > 0) {
+            llama_set_head_shortlist(ctx_dft, true);
+        }
+        pm_batch.clear();
+        const int32_t idx = pm_batch.add(tok, pos, slot.id, true);
+        pm_batch.set_embd_state(idx, { h, 1, (size_t) pm_n_embd });
+        if (llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, pm_batch.get()) != 0) {
+            SLT_WRN(slot, "MTP row at pos %d failed: no MTP guesses for this request\n", pos);
+            return false;
+        }
+        slot.pm_t_proc_us += ggml_time_us() - slot.pm_t0;
+        return true;
+    }
+
+    // the second half: waits for the row launched last and reads its guess and hidden state
+    bool pm_collect(server_slot & slot, llama_token & guess, std::vector<float> & h_out) {
+        const int64_t t0 = slot.pm_t0;
+        const int64_t t1 = ggml_time_us();
+        llama_synchronize(ctx_dft);
+        slot.pm_t_sync_us += ggml_time_us() - t1;
+        guess = -1;
+        const uint32_t n_cand = llama_get_sampled_logits_count_ith(ctx_dft, 0);
+        if (n_cand > 0) {
+            // a backend sampler on the draft context (--spec-draft-backend-sampling): its candidates
+            const float *       lg = llama_get_sampled_logits_ith(ctx_dft, 0);
+            const llama_token * id = llama_get_sampled_candidates_ith(ctx_dft, 0);
+            float best = -INFINITY;
+            for (uint32_t k = 0; k < n_cand && lg && id; k++) {
+                if (lg[k] > best) {
+                    best  = lg[k];
+                    guess = id[k];
+                }
+            }
+        } else {
+            const float * lg = llama_get_logits_ith(ctx_dft, 0);
+            const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+            float best = -INFINITY;
+            for (int32_t k = 0; k < n_vocab && lg; k++) {
+                if (lg[k] > best) {
+                    best  = lg[k];
+                    guess = k;
+                }
+            }
+        }
+        const float * ho = llama_get_embeddings_nextn_ith(ctx_dft, 0);
+        if (ho == nullptr) {
+            return false;
+        }
+        h_out.assign(ho, ho + pm_n_embd);
+        slot.pm_t_us += ggml_time_us() - t0;
+        slot.pm_n_rows++;
+        return true;
+    }
+
+    // collects the row launched ahead (pm_ahead), which extends the walk by its position
+    void pm_settle(server_slot & slot) {
+        if (slot.pm_pend < 0) {
+            return;
+        }
+        const llama_pos p = slot.pm_pend;
+        slot.pm_pend = -1;
+        std::vector<float> h_out;
+        if (!pm_collect(slot, slot.pm_next, h_out)) {
+            slot.pm_pos = -1;
+            return;
+        }
+        slot.pm_hw.swap(h_out);
+        slot.pm_walk = p;
+    }
+
+    // launches the row of the token just submitted at pos when it is the walk's next one; its
+    // guess is collected when the next guess is needed, after the device has worked on it alongside the pipe
+    void pm_ahead(server_slot & slot, llama_token tok, llama_pos pos) {
+        if (slot.pm_pos < 0 || slot.pm_pend >= 0 || pos + 2 >= slot.n_ctx) {
+            return;
+        }
+        if (pos != (slot.pm_walk < 0 ? slot.pm_pos : slot.pm_walk + 1)) {
+            return;
+        }
+        const float * h = pos == slot.pm_pos ? slot.pm_h.data() : slot.pm_hw.data();
+        if (pos == slot.pm_pos) {
+            tok = slot.pm_tok;
+        }
+        if (!pm_launch(slot, tok, pos, h)) {
+            slot.pm_pos = -1;
+            return;
+        }
+        slot.pm_pend = pos;
+    }
+
+    // the MTP guess for pos (the position after the slot's window): walks rows from the anchor through the tokens in
+    // flight up to pos - 1. -1 if there is none
+    llama_token pm_guess(server_slot & slot, llama_pos pos) {
+        pm_settle(slot);
+        while (slot.pm_pos >= 0) {
+            if (slot.pm_walk >= 0 && slot.pm_walk + 1 == pos) {
+                return slot.pm_next;
+            }
+            const llama_pos row = slot.pm_walk < 0 ? slot.pm_pos : slot.pm_walk + 1;
+            if (row >= pos) {
+                return -1;
+            }
+            llama_token   tok = -1;
+            const float * h   = nullptr;
+            if (row == slot.pm_pos) {
+                tok = slot.pm_tok;
+                h   = slot.pm_h.data();
+            } else {
+                for (const auto & e : slot.pipe_win) {
+                    if (e.pos == row) {
+                        tok = e.tok;
+                    }
+                }
+                h = slot.pm_hw.data();
+            }
+            if (tok < 0) {
+                return -1;
+            }
+            std::vector<float> h_out;
+            if (!pm_row(slot, tok, row, h, slot.pm_next, h_out)) {
+                slot.pm_pos = -1;
+                return -1;
+            }
+            slot.pm_hw.swap(h_out);
+            slot.pm_walk = row;
+        }
+        return -1;
+    }
+
+    // a committed token: tok at pos, h the target's final hidden state of the token before. The previous anchor's row
+    // is committed (decoded now if no guess walked it), the walked rows after it go, and tok becomes the anchor
+    void pm_anchor(server_slot & slot, llama_token tok, llama_pos pos, const float * h) {
+        if (!pipe_mtp()) {
+            return;
+        }
+        pm_settle(slot);
+        // a committed token joins the head's shortlist, as the context's tokens do in the MTP draft
+        if (tok >= 0 && llama_head_shortlist_size(ctx_dft) > 0 && !llama_head_shortlist_contains(ctx_dft, tok)) {
+            llama_head_shortlist_add(ctx_dft, &tok, 1);
+        }
+        if (slot.pm_pos >= 0 && slot.pm_walk < slot.pm_pos && slot.pm_pos < pos) {
+            llama_token g;
+            std::vector<float> h_out;
+            pm_row(slot, slot.pm_tok, slot.pm_pos, slot.pm_h.data(), g, h_out);
+        }
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, pos, -1);
+        if (h == nullptr) {
+            slot.pm_pos = -1;
+            return;
+        }
+        slot.pm_h.assign(h, h + pm_n_embd);
+        slot.pm_tok  = tok;
+        slot.pm_pos  = pos;
+        slot.pm_walk = -1;
+    }
+
+    // the slot leaves the pipe with its anchor token to be decoded again in a batch: the MTP draft takes over from
+    // there, its rows from the anchor on dropped and its pending hidden state the anchor's
+    void pm_handoff(server_slot & slot) {
+        if (!pipe_mtp()) {
+            return;
+        }
+        pm_settle(slot);
+        if (slot.pm_pos < 0) {
+            return;
+        }
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, slot.pm_pos, -1);
+        std::vector<uint8_t> data((const uint8_t *) slot.pm_h.data(), (const uint8_t *) (slot.pm_h.data() + pm_n_embd));
+        common_speculative_set_state(spec.get(), slot.id, data);
+        slot.pm_pos  = -1;
+        slot.pm_walk = -1;
+    }
+
     bool pipe_eligible(const server_slot & slot) const {
         if (params_base.pipe_depth <= 0 || slot.state != SLOT_STATE_GENERATING || !slot.task || !slot.smpl) {
             return false;
@@ -5456,7 +5686,8 @@ private:
         if (slot.task->type == SERVER_TASK_TYPE_TTS || !slot.task->need_sampling()) {
             return false;
         }
-        if (slot.can_speculate() || slot.audio_stream || !slot.inp_embd.empty() || slot.mctx) {
+        // with MTP guesses the MTP draft serves the pipe, and batched speculation only the stretches it cannot run
+        if ((slot.can_speculate() && !pipe_mtp()) || slot.audio_stream || !slot.inp_embd.empty() || slot.mctx) {
             return false;
         }
         const auto & sp = slot.task->params.sampling;
@@ -5495,6 +5726,7 @@ private:
         }
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, slot.pipe_win.front().pos, -1);
         llama_pipe_drain(ctx_tgt);
+        pm_handoff(slot);
         slot.pipe_win.clear();
         slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - 1);
         slot.pipe_draft_pending = -1;
@@ -5578,7 +5810,10 @@ private:
                 break;
             }
             const size_t n_inflight = slot.pipe_win.size() - 1;
-            llama_token g = pipe_copy_guess(slot);
+            llama_token g = pipe_mtp() ? pm_guess(slot, pos) : -1;
+            if (g < 0) {
+                g = pipe_copy_guess(slot);
+            }
             bool drafted = false;
             if (g < 0 && pipe_drafts(slot)) {
                 // the drafter's guess, drawn with the uniform the device sampler takes at the position before
@@ -5599,6 +5834,11 @@ private:
             slot.pipe_win.back().drafted = drafted;
             slot.pipe_n_guess++;
             pipe_draft_ahead(slot);
+            // after the submission, launch the MTP row of the token just submitted (the next guess), so the MTP device
+            // works on it alongside the pipe (+~4 t/s on 4x GTX 1070, even when its guess is thrown away)
+            if (pipe_mtp()) {
+                pm_ahead(slot, g, pos);
+            }
         }
     }
 
@@ -5610,6 +5850,14 @@ private:
             // start: the token sampled last goes in first; the guesses read the prompt and what came out so far
             const llama_tokens text = slot.prompt.tokens.get_text_tokens();
             slot.pipe_guesser.reset(text.data(), text.size());
+            if (pipe_mtp()) {
+                // the MTP anchor: the token sampled last, with the hidden state the MTP draft kept for it
+                std::vector<uint8_t> st;
+                slot.pm_pos = -1;
+                if (common_speculative_get_state(spec.get(), slot.id, st) && st.size() == (size_t) pm_n_embd*sizeof(float)) {
+                    pm_anchor(slot, slot.sampled, slot.prompt.tokens.pos_next(), (const float *) st.data());
+                }
+            }
             if (!pipe_submit(slot, slot.sampled, slot.prompt.tokens.pos_next())) {
                 abort_all_slots("pipelined decoding failed");
                 return;
@@ -5633,8 +5881,12 @@ private:
             scoped_timer timer(t_sampl, n_sampl);
             id = llama_pipe_get_sampled(ctx_tgt, cur.pslot);
         }
+        // the sampled token is the MTP anchor now, with cur's final hidden state (read before cur's pipe slot is reused)
         const bool guessed = !slot.pipe_win.empty();
         const bool hit     = guessed && slot.pipe_win.front().tok == id;
+        if (pipe_mtp()) {
+            pm_anchor(slot, id, cur.pos + 1, llama_pipe_get_h_nextn(ctx_tgt, cur.pslot));
+        }
         if (guessed && slot.pipe_win.front().drafted) {
             slot.pipe_n_draft++;
             slot.pipe_n_draft_hit += hit;
@@ -5666,6 +5918,7 @@ private:
             // nothing after the token just sampled belongs to the output
             llama_memory_seq_rm(mem, slot.id, cur.pos + 1, -1);
             llama_pipe_drain(ctx_tgt);
+            pm_handoff(slot);
             slot.pipe_win.clear();
 
             slot.print_timings();
@@ -5681,6 +5934,7 @@ private:
         if (!slot.task->params.sampling.grammar.empty() && common_sampler_grammar_active(slot.smpl.get())) {
             llama_memory_seq_rm(mem, slot.id, cur.pos + 1, -1);
             llama_pipe_drain(ctx_tgt);
+            pm_handoff(slot);
             slot.pipe_win.clear();
             return;
         }
