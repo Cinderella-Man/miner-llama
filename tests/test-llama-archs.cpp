@@ -185,6 +185,7 @@ static void usage(char ** argv) {
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
     LOG("  --ngram-prefetch         Check that LLAMA_NGRAM_PREFETCH changes only when the n-gram rows are read (CPU only)\n");
     LOG("  --mtp-kv-only            Check that LLAMA_MTP_KV_ONLY leaves the MTP draft's caches and drafts as they are (CPU only)\n");
+    LOG("  --mtp-plain-attn         Check that an MTP block marked plain attention (compress ratio 0) drafts with no indexer cache or QSA op, and a QSA block keeps them (C898, CPU only)\n");
     LOG("  --mtp-catchup-overlap    Check that LLAMA_MTP_CATCHUP_OVERLAP leaves the MTP draft's caches and drafts as they are (CPU only)\n");
     LOG("  --mtp-hrow-lazy          Check that LLAMA_MTP_HROW_LAZY makes the h_nextn buffer's second half only at the first held call\n");
     LOG("                           and leaves the MTP draft's caches and drafts as they are, with and without room (CPU only)\n");
@@ -2143,8 +2144,9 @@ static bool mtp_kv_only_arch(const llm_arch arch) {
     return arch == LLM_ARCH_QWEN4EXP;
 }
 
-// the model fixture with one nextn (MTP) block after the trunk layers
-static gguf_context_ptr get_gguf_ctx_mtp(const llm_arch arch, const bool moe) {
+// the model fixture with one nextn (MTP) block after the trunk layers; mtp_ratio is the MTP block's compress ratio
+// (qwen4exp), the trunk's stay 4
+static gguf_context_ptr get_gguf_ctx_mtp(const llm_arch arch, const bool moe, const uint32_t mtp_ratio = 4) {
     gguf_context_ptr ret = get_gguf_ctx(arch, moe);
     const std::string key_block_count = llama_arch_kv_name(arch, LLM_KV_BLOCK_COUNT);
     const int64_t kid = gguf_find_key(ret.get(), key_block_count.c_str());
@@ -2153,8 +2155,10 @@ static gguf_context_ptr get_gguf_ctx_mtp(const llm_arch arch, const bool moe) {
     gguf_set_val_u32(ret.get(), key_block_count.c_str(), n_layer_all);
     gguf_set_val_u32(ret.get(), llama_arch_kv_name(arch, LLM_KV_NEXTN_PREDICT_LAYERS).c_str(), 1);
     if (arch == LLM_ARCH_QWEN4EXP) {
-        // the MTP block is a QSA layer too, so that its pass writes indexer keys and pooled keys
-        const std::vector<uint32_t> ratios(n_layer_all, 4);
+        // the MTP block is a QSA layer too, so that its pass writes indexer keys and pooled keys; with mtp_ratio 0 it is
+        // marked plain attention, as Flash-Next's published distilled draft head (C898)
+        std::vector<uint32_t> ratios(n_layer_all, 4);
+        ratios.back() = mtp_ratio;
         gguf_set_arr_data(ret.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_COMPRESS_RATIOS).c_str(), GGUF_TYPE_UINT32,
                 ratios.data(), ratios.size());
     }
@@ -2185,11 +2189,20 @@ struct mtp_kv_only_run {
     size_t   catchup_ubatch  = 0;
     size_t   catchup_copies  = 0;
     size_t   catchup_bytes   = 0;
+
+    // C898, every pass: the ops that read a k-pool host input ("kpool_*"), and the QSA ops by their names ("indexer_*",
+    // "kpool_*", "kq_mask_qsa")
+    size_t   n_kpool_in      = 0;
+    size_t   n_qsa_ops       = 0;
 };
 
 struct mtp_node_count {
     bool   on = false;
     size_t n  = 0;
+
+    // C898: counted in every pass, see mtp_kv_only_run
+    size_t n_kpool_in = 0;
+    size_t n_qsa_ops  = 0;
 
     // with LLAMA_QSA_KPOOL_DEV: the k-pool host inputs ("kpool_*") read by an op, by the ubatch the memory counts
     const llama_context * ctx = nullptr;
@@ -2239,6 +2252,23 @@ static mtp_kv_only_run mtp_kv_only_sequence(
     ctx_params.n_outputs_max_per_seq = 4;
     ctx_params.cb_eval = [](struct ggml_tensor * t, bool ask, void * user_data) {
         mtp_node_count * c = (mtp_node_count *) user_data;
+        if (ask && !mtp_view_op(t->op)) {
+            if (strncmp(t->name, "indexer", 7) == 0 || strncmp(t->name, "kpool", 5) == 0 ||
+                    strncmp(t->name, "kq_mask_qsa", 11) == 0) {
+                c->n_qsa_ops++;
+            }
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                const ggml_tensor * s = t->src[i];
+                if (s == nullptr) {
+                    continue;
+                }
+                s = s->view_src != nullptr ? s->view_src : s;
+                if ((s->flags & GGML_TENSOR_FLAG_INPUT) && strncmp(s->name, "kpool_", 6) == 0) {
+                    c->n_kpool_in++;
+                    break;
+                }
+            }
+        }
         if (ask && c->on) {
             c->n++;
             // the memory counts a ubatch in apply(), before its graph runs
@@ -2359,6 +2389,8 @@ static mtp_kv_only_run mtp_kv_only_sequence(
     run.state_end = state();
 
     run.n_nodes_catchup = count.n;
+    run.n_kpool_in      = count.n_kpool_in;
+    run.n_qsa_ops       = count.n_qsa_ops;
 
     run.kpool_dev = llama_kpool_dev_stats(ctx, nullptr, &run.kpool_full, &run.kpool_rows, &run.kpool_checked);
     run.catchup_ubatch = count.ubatches.size();
@@ -2512,6 +2544,184 @@ static int test_mtp_kv_only(const std::string & arch_filter, const size_t seed, 
                 status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
             }
             LOG("%s\n", status.c_str());
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
+static void test_setenv(const char * name, const char * value);
+
+// C898: an MTP block its file marks plain attention (compress ratio 0) beside QSA trunk layers, as Flash-Next's
+// published distilled draft head. Its draft context makes no indexer cache, none of its passes runs a QSA op or reads a
+// k-pool input, and its passes run: without C898 the first one stopped on GGML_ASSERT(buffer) in the k-pool input's
+// set_input. LLAMA_MTP_KV_ONLY's passes leave its caches and drafts as the full passes do, and its drafts are finite.
+// The same fixture with a QSA block (ratio 4, as the preset's head) keeps its indexer cache, its QSA ops and its k-pool
+// reads. Each block runs without switches and with the QSA switches of Flash-Next's preset, which the memory reads when
+// it is made (CPU only).
+static int test_mtp_plain_attn(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+        int n_idx_cache = 0; // llama_memory_hybrid_idx's "creating indexer KV cache" lines
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        user_data_t * ud = (user_data_t *) user_data;
+        if (text != nullptr && strstr(text, "creating indexer KV cache") != nullptr) {
+            ud->n_idx_cache++;
+        }
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    // Flash-Next's preset sets these three
+    const char * const qsa_switches[] = { "LLAMA_QSA_KPOOL_DEV", "LLAMA_QSA_KPOOL_STAGE", "LLAMA_QSA_POOL_MASK_DEV" };
+
+    struct plain_config {
+        const char *       name;
+        uint32_t           mtp_ratio; // the MTP block's compress ratio
+        bool               switches;  // the three QSA switches
+        mtp_kv_only_config kv;
+    };
+    const plain_config configs[] = {
+        { "qsa fa",      4, false, { "f16 fa", GGML_TYPE_F16, true,  0 } },
+        { "qsa fa sw",   4, true,  { "f16 fa", GGML_TYPE_F16, true,  0 } },
+        { "plain fa",    0, false, { "f16 fa", GGML_TYPE_F16, true,  0 } },
+        { "plain",       0, false, { "f16",    GGML_TYPE_F16, false, 0 } },
+        { "plain fa sw", 0, true,  { "f16 fa", GGML_TYPE_F16, true,  0 } },
+    };
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    common_log_flush(common_log_main());
+    LOG("|%10s|%12s|%10s|%12s|%12s|%12s|%10s|%13s|%11s|%s\n", "Model arch.", "Config", "Idx off/on", "KV, prompt",
+            "Drafts", "KV, end", "Dev off/on", "K-pool in", "QSA ops", "Status");
+
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !mtp_kv_only_arch(arch)) {
+            continue;
+        }
+        const bool moe = moe_mandatory(arch) || moe_implemented(arch);
+
+        for (const uint32_t mtp_ratio : { 4u, 0u }) {
+            gguf_context_ptr gguf_ctx = get_gguf_ctx_mtp(arch, moe, mtp_ratio);
+
+            llama_model_ptr model;
+            try {
+                model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, nullptr, /*load_mtp*/ true);
+            } catch (const std::exception & err) {
+                LOG("|%10s|%12s|\033[1;31mERROR\033[0m (model load: %s)\n", llama_arch_name(arch),
+                        mtp_ratio > 0 ? "qsa" : "plain", err.what());
+                n_tests++;
+                n_failed++;
+                continue;
+            }
+
+            // 100 prompt tokens, then the 4 positions of the draft step, as --mtp-kv-only
+            const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+            const std::vector<llama_token> tokens = get_tokens(104, n_vocab, seed);
+            std::vector<float> h(llama_model_n_embd_out(model.get())*tokens.size());
+            {
+                std::mt19937 gen(seed + 1);
+                std::normal_distribution<float> dis(0.0f, 1.0f);
+                for (float & v : h) {
+                    v = dis(gen);
+                }
+            }
+
+            for (const plain_config & cfg : configs) {
+                if (cfg.mtp_ratio != mtp_ratio) {
+                    continue;
+                }
+                n_tests++;
+                LOG("|%10s|%12s|", llama_arch_name(arch), cfg.name);
+                std::string status;
+                try {
+                    for (const char * name : qsa_switches) {
+                        test_setenv(name, cfg.switches ? "1" : nullptr);
+                    }
+                    ud.n_idx_cache = 0;
+                    const mtp_kv_only_run off = mtp_kv_only_sequence(model.get(), tokens, h, cfg.kv, false, seed);
+                    const int idx_off = ud.n_idx_cache;
+                    ud.n_idx_cache = 0;
+                    const mtp_kv_only_run on  = mtp_kv_only_sequence(model.get(), tokens, h, cfg.kv, true,  seed);
+                    const int idx_on = ud.n_idx_cache;
+
+                    const bool same_prompt = off.state_prompt == on.state_prompt;
+                    const bool same_drafts = off.out.size() == on.out.size() && !off.out.empty() &&
+                        memcmp(off.out.data(), on.out.data(), off.out.size()*sizeof(float)) == 0;
+                    const bool same_end    = off.state_end == on.state_end;
+                    bool finite = !off.out.empty();
+                    for (const float v : off.out) {
+                        finite = finite && std::isfinite(v);
+                    }
+
+                    // the QSA block keeps its indexer cache, its QSA ops and its k-pool reads in both runs, and its
+                    // tables on the devices with the switches; the plain block has none of them
+                    const bool qsa      = mtp_ratio > 0;
+                    const bool idx_ok   = qsa ? idx_off > 0 && idx_on > 0 : idx_off == 0 && idx_on == 0;
+                    const bool ops_ok   = qsa ? off.n_qsa_ops > 0 && on.n_qsa_ops > 0 : off.n_qsa_ops == 0 && on.n_qsa_ops == 0;
+                    const bool reads_ok = qsa ? off.n_kpool_in > 0 && on.n_kpool_in > 0 : off.n_kpool_in == 0 && on.n_kpool_in == 0;
+                    const bool dev_ok   = qsa ? off.kpool_dev == cfg.switches && on.kpool_dev == cfg.switches
+                                              : !off.kpool_dev && !on.kpool_dev;
+
+                    char idx_str[32];
+                    char dev_str[32];
+                    char in_str[32];
+                    char ops_str[32];
+                    snprintf(idx_str, sizeof(idx_str), "%d/%d",   idx_off, idx_on);
+                    snprintf(dev_str, sizeof(dev_str), "%d/%d",   (int) off.kpool_dev, (int) on.kpool_dev);
+                    snprintf(in_str,  sizeof(in_str),  "%zu/%zu", off.n_kpool_in, on.n_kpool_in);
+                    snprintf(ops_str, sizeof(ops_str), "%zu/%zu", off.n_qsa_ops,  on.n_qsa_ops);
+                    LOG("%10s|%12s|%12s|%12s|%10s|%13s|%11s|", idx_str, same_prompt ? "identical" : "DIFFERENT",
+                            same_drafts ? (finite ? "identical" : "NOT FINITE") : "DIFFERENT",
+                            same_end ? "identical" : "DIFFERENT", dev_str, in_str, ops_str);
+
+                    if (same_prompt && same_drafts && same_end && finite && idx_ok && ops_ok && reads_ok && dev_ok) {
+                        status = "\033[1;32mOK\033[0m";
+                    } else {
+                        n_failed++;
+                        status = "\033[1;31mFAIL\033[0m";
+                        if (!idx_ok) {
+                            status += qsa ? " (the QSA block has no indexer cache)" : " (the plain block has an indexer cache)";
+                        }
+                        if (!ops_ok || !reads_ok) {
+                            status += qsa ? " (the QSA block's passes lost their QSA ops)" : " (the plain block's passes run QSA ops)";
+                        }
+                        if (!dev_ok) {
+                            status += " (the k-pool tables on the devices are not as the switches say)";
+                        }
+                    }
+                } catch (const std::exception & err) {
+                    n_failed++;
+                    status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
+                }
+                for (const char * name : qsa_switches) {
+                    test_setenv(name, nullptr);
+                }
+                LOG("%s\n", status.c_str());
+            }
         }
     }
 
@@ -5809,6 +6019,7 @@ int main(int argc, char ** argv) {
     const char * target_backend = nullptr;
     bool kv_shift = false;
     bool mtp_kv_only = false;
+    bool mtp_plain_attn = false;
     bool mtp_catchup_overlap = false;
     bool mtp_hrow_lazy = false;
     bool kv_seq_rm = false;
@@ -5896,6 +6107,8 @@ int main(int argc, char ** argv) {
             kv_seq_rm_time = true;
         } else if (strcmp(argv[i], "--mtp-kv-only") == 0) {
             mtp_kv_only = true;
+        } else if (strcmp(argv[i], "--mtp-plain-attn") == 0) {
+            mtp_plain_attn = true;
         } else if (strcmp(argv[i], "--mtp-graph-keep") == 0) {
             mtp_graph_keep = true;
         } else if (strcmp(argv[i], "--mtp-replan") == 0) {
@@ -5940,6 +6153,9 @@ int main(int argc, char ** argv) {
         }
         if (mtp_kv_only) {
             return test_mtp_kv_only(arch_filter, seed, stdev, verbosity);
+        }
+        if (mtp_plain_attn) {
+            return test_mtp_plain_attn(arch_filter, seed, stdev, verbosity);
         }
         if (mtp_catchup_overlap) {
             return test_mtp_catchup_overlap(arch_filter, seed, stdev, verbosity);
