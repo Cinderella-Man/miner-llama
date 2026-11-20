@@ -24,7 +24,9 @@
 // memory per block where the registers allow a third block). In mode 1 a dispatch table (Q824, mmvq-pascal-kcol.cu)
 // leaves the products of 2 to 8 columns that the other kernels run faster on a P106 to them, by type, row width and
 // column count; GGML_CUDA_MMVQ_PASCAL_KCOL_TABLE=0 turns it off. GGML_CUDA_MMVQ_PASCAL=0 turns these kernels off with the
-// other Pascal kernels, =2 runs them on any NVIDIA GPU (testing).
+// other Pascal kernels, =2 runs them on any NVIDIA GPU (testing). With GGML_CUDA_MMVQ_PASCAL_MT=2 (C899), in mode 1 and
+// with the table on or off, they also leave to mmvq-pascal.cu's read-once kernel the plain Q5_0 and Q8_0 products of 2
+// to 4 columns that a P106 ran faster there (mmvq-pascal-pick.h), except those _KCOL_EXACT keeps.
 // GGML_CUDA_MMVQ_PASCAL_KCOL_EXACT=1 (C805; 0 by default): the products of 2 to 8 columns of Q3_K, IQ4_NL, Q2_0 and Q8_0 in
 // rows of chunks not a multiple of 4 (the types whose one-token sums are these kernels') are never left to the other
 // kernels, whose sums differ: not by the table, and not where the columns' activations pass the shared-memory budget,

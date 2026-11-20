@@ -31,6 +31,10 @@ bool ggml_cuda_mmvq_pascal_active(int cc);
 // Whether GGML_CUDA_MMVQ_PASCAL_SKIP leaves the weight type to mul_mat_vec_q.
 bool ggml_cuda_mmvq_pascal_skips(ggml_type type);
 
+// GGML_CUDA_MMVQ_PASCAL_MT's mode, read once (mmvq-pascal-pick.h: 0 off, 1 every product of 2 to 4 tokens of the
+// read-once types, 2 C899's measured rule; always 0 on HIP and MUSA).
+int ggml_cuda_mmvq_pascal_mt_mode();
+
 // One token: the three products of an attention block (Q, K, V) with the same Q8_1 activations vy, in one launch. Each
 // matrix is contiguous with ncols columns; K and V share a type. Every row comes out exactly as ggml_cuda_mmvq_pascal
 // computes it. Returns false (nothing launched) unless the kernels are active on this device, the types are a supported
