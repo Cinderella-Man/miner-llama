@@ -123,9 +123,13 @@ static common_speculative_output_limits server_output_limits(const common_params
 //                              partial sequence) draws the uniforms of the step it replays, conditioned on its outcome
 // LLAMA_PIPE_GRAMMAR=1: the pipe keeps running while a grammar is active (a tool
 // call): each token the device draws is checked against the grammar on the host, and a rejected one leaves the pipe
-// as a wrong guess does, so batched decoding samples that position again with the grammar
+// as a wrong guess does, so batched decoding samples that position again with the grammar. Unset, empty or 0 is off,
+// as for the fork's other switches
 static bool pipe_grammar_on() {
-    static const bool on = getenv("LLAMA_PIPE_GRAMMAR") != nullptr;
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_PIPE_GRAMMAR");
+        return e != nullptr && atoi(e) != 0;
+    }();
     return on;
 }
 
