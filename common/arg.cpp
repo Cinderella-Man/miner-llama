@@ -1826,6 +1826,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_INCALL").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--spec-ckpt-vram"},
+        "keep the checkpoint that speculative decoding saves at every draft step (recurrent models: grammar and "
+        "tool-call stretches) in device memory instead of copying the recurrent state to the host each step; "
+        "falls back to the host copy if it does not fit (default: off)",
+        [](common_params & params) {
+            params.spec_checkpoint_vram = true;
+        }
+    ).set_env("LLAMA_ARG_SPEC_CKPT_VRAM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--ctx-checkpoints-spread"}, "N",
         string_format("context checkpoints at most N tokens apart inside a prompt: at the first message start N/2 or "
             "more tokens after the previous checkpoint, or N tokens after it if no message starts, and a full list "
