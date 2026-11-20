@@ -2423,7 +2423,8 @@ void llama_context::set_ubatch_taper_next(int32_t head, int32_t tail) {
 }
 
 bool llama_context::head_shortlist_init(uint32_t k_low, uint32_t m_cap) {
-    const ggml_tensor * output = model.output;
+    // --mtp-device: an MTP context's head is the copy on the MTP layer's device
+    const ggml_tensor * output = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.output_nextn ? model.output_nextn : model.output;
     if (output == nullptr || output->buffer == nullptr) {
         LLAMA_LOG_ERROR("%s: the model has no output head in a buffer\n", __func__);
         return false;
@@ -4189,6 +4190,28 @@ int32_t llama_context::pipe_submit_impl(int32_t i_slot, const llama_token * toke
 
     ggml_backend_tensor_get_async(backend_res, t_out, slot.logits, 0, n_out);
 
+    // MTP pipeline guesses (llama_pipe_get_h_nextn): the token's final hidden state, behind the sampled id in the
+    // same pinned buffer and before the same event; only when it is on the output device, which the event covers
+    slot.has_h = false;
+    if (cparams.embeddings_nextn && !samplers.empty()) {
+        ggml_tensor * t_h = slot.res->get_h_nextn();
+        if (t_h != nullptr) {
+            ggml_backend_t be_h = ggml_backend_sched_get_tensor_backend(slot.sched.get(), t_h);
+            const size_t row = (size_t) t_h->ne[0]*sizeof(float);
+            if (be_h == backend_res && t_h->type == GGML_TYPE_F32 &&
+                    PIPE_H_OFFSET*sizeof(float) + row <= (size_t) model.vocab.n_tokens()*sizeof(float)) {
+                ggml_backend_tensor_get_async(be_h, t_h, slot.logits + PIPE_H_OFFSET, ggml_nbytes(t_h) - row, row);
+                slot.has_h = true;
+            } else {
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    LLAMA_LOG_WARN("%s: the final hidden state is not on the output device: no MTP pipeline guesses\n", __func__);
+                }
+            }
+        }
+    }
+
     ggml_backend_dev_t dev_res = ggml_backend_get_device(backend_res);
     if (slot.ev_out == nullptr || slot.ev_dev != dev_res) {
         if (slot.ev_out) {
@@ -4309,6 +4332,18 @@ float * llama_context::pipe_get_logits(int32_t i_slot) {
     slot.live = false;
 
     return slot.logits;
+}
+
+const float * llama_context::pipe_get_h_nextn(int32_t i_slot) {
+    if (i_slot < 0 || i_slot >= (int32_t) pipe_slots.size()) {
+        return nullptr;
+    }
+    auto & slot = pipe_slots[i_slot];
+    if (slot.busy) {
+        ggml_backend_event_synchronize(slot.ev_out);
+        slot.busy = false;
+    }
+    return slot.has_h ? slot.logits + PIPE_H_OFFSET : nullptr;
 }
 
 llama_token llama_context::pipe_get_sampled(int32_t i_slot) {
@@ -8992,6 +9027,10 @@ float * llama_pipe_get_logits(llama_context * ctx, int32_t slot) {
 
 llama_token llama_pipe_get_sampled(llama_context * ctx, int32_t slot) {
     return ctx->pipe_get_sampled(slot);
+}
+
+const float * llama_pipe_get_h_nextn(llama_context * ctx, int32_t slot) {
+    return ctx->pipe_get_h_nextn(slot);
 }
 
 bool llama_pipe_ready(llama_context * ctx, int32_t slot) {

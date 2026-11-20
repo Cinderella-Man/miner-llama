@@ -668,6 +668,18 @@ static bool common_sampler_test_reject(struct common_sampler * gsmpl) {
     return every > 0 && ++gsmpl->n_checked % every == 0;
 }
 
+bool common_sampler_pipe_check(struct common_sampler * gsmpl, llama_token id) {
+    gsmpl->stats.n_sampled++;
+    gsmpl->stats.n_device++;
+    gsmpl->stats.n_constrained++;
+    if (common_sampler_grammar_accepts(gsmpl, id) && !common_sampler_test_reject(gsmpl)) {
+        return true;
+    }
+    gsmpl->stats.n_rejected++;
+    gsmpl->stats.n_rejected_device++;
+    return false;
+}
+
 // a row of the shortlist head's logits (Q619): it stands only if its bound leaves out every token this sampling could
 // pick from cur_p as it is now (after the reasoning budget and, when it comes first, the grammar, both of which only
 // remove candidates); otherwise the full head's logits replace it. Returns whether they did: set cur_p again.

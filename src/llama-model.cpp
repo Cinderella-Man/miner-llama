@@ -1840,6 +1840,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
 
+    // nextn_device (--mtp-device) puts the MTP (nextn) layers and their KV on that GPU (the MTP pipeline guesser's
+    // rows then queue behind that device's work only; the first GPU's queue never waits on another device)
+    if (const int k = params.nextn_device; k >= 0 && hparams.n_layer_nextn > 0) {
+        if (k < (int) n_devices()) {
+            auto * dev = devices.at(k).dev;
+            for (int il = n_layer_all - (int) hparams.n_layer_nextn; il < n_layer_all; ++il) {
+                pimpl->dev_layer[il] = { dev, &pimpl->gpu_buft_list.at(dev) };
+                LLAMA_LOG_INFO("%s: nextn layer %d on %s (--mtp-device)\n", __func__, il, ggml_backend_dev_name(dev));
+            }
+        } else {
+            LLAMA_LOG_WARN("%s: --mtp-device %d: there are %d GPUs; the MTP layers stay put\n", __func__, k, (int) n_devices());
+        }
+    }
+
     // LLAMA_INPUT_ON_GPU=1: the input layer goes with the first layer instead, so that the embedding lookup runs on
     // that device: the token ids are then the only per-token input of the embeddings, and a token sampled on a device
     // can be fed to the next evaluation without the host (llama_pipe_submit_fed). Off unless set: on nine P106-090
@@ -2274,6 +2288,41 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+
+    // nextn_device: the MTP graph's output head, copied to the nextn layer's device
+    if (const int k = params.nextn_device; k >= 0 && hparams.n_layer_nextn > 0 && output != nullptr) {
+        ggml_backend_buffer_t ob = output->view_src ? output->view_src->buffer : output->buffer;
+        if (k >= 0 && k < (int) n_devices() && ob != nullptr && devices.at(k).dev != dev_output()) {
+            ggml_init_params ip = { ggml_tensor_overhead() * 4, nullptr, true };
+            ggml_context * cctx = ggml_init(ip);
+            ggml_tensor * t = ggml_dup_tensor(cctx, output);
+            ggml_set_name(t, "output_nextn");
+            ggml_tensor * tn_ = output_norm ? ggml_dup_tensor(cctx, output_norm) : nullptr;
+            if (tn_) {
+                ggml_set_name(tn_, "output_norm_nextn");
+            }
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(cctx,
+                    ggml_backend_dev_buffer_type(devices.at(k).dev));
+            if (buf == nullptr) {
+                LLAMA_LOG_ERROR("%s: no room for the MTP output head copy on %s\n", __func__, ggml_backend_dev_name(devices.at(k).dev));
+            } else {
+                std::vector<uint8_t> tmp(ggml_nbytes(output));
+                ggml_backend_tensor_get(output, tmp.data(), 0, tmp.size());
+                ggml_backend_tensor_set(t, tmp.data(), 0, tmp.size());
+                output_nextn = t;
+                if (tn_) {
+                    std::vector<uint8_t> tmp_n(ggml_nbytes(output_norm));
+                    ggml_backend_tensor_get(output_norm, tmp_n.data(), 0, tmp_n.size());
+                    ggml_backend_tensor_set(tn_, tmp_n.data(), 0, tmp_n.size());
+                    output_norm_nextn = tn_;
+                }
+                ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                LLAMA_LOG_INFO("%s: MTP output head copied to %s, %.1f MiB (--mtp-device)\n", __func__,
+                        ggml_backend_dev_name(devices.at(k).dev), tmp.size() / 1024.0 / 1024.0);
+                // kept for the model's lifetime (the buffer is never freed; the process exit releases it)
+            }
+        }
+    }
 
     return true;
 }
@@ -3673,6 +3722,7 @@ llama_model_params llama_model_default_params() {
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
+        /*.nextn_device                =*/ -1,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,

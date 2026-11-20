@@ -536,6 +536,7 @@ struct common_params {
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
+    int32_t mtp_device         = -1;    // the GPU for the MTP (nextn) layers and a copy of the output head; -1 = default
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
@@ -708,6 +709,7 @@ struct common_params {
     std::string pipe_draft_stair;        // depths of the tokens in flight, newest first (empty: from the layer split)
     std::string pipe_draft_kind;         // stair or pre (empty: by whether the drafter's GPU holds layers)
     std::string pipe_store;              // continuation store for cont (common_pipe_store), empty = none
+    int32_t     pipe_mtp_walk  = 0;      // --pipe-guess mtp: keep the MTP chain on a hit up to N rows past its anchor (0: re-anchor every token)
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t checkpoint_vram     = 0;     // newest context checkpoints of a slot kept in device memory; 0 = all on the host

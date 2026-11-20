@@ -345,6 +345,11 @@ extern "C" {
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
+        // the GPU for the MTP (nextn) layers, their KV and a copy of the output head for the MTP graph; -1 = with the
+        // last layers as usual. Under a layer split the first GPU suits MTP pipeline guesses: its queue never waits on
+        // another device's work
+        int32_t nextn_device;
+
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
@@ -1178,6 +1183,10 @@ extern "C" {
 
     // With a backend sampler: waits for the token sampled after the token last submitted in this slot
     LLAMA_API llama_token llama_pipe_get_sampled(struct llama_context * ctx, int32_t slot);
+
+    // With a context that outputs nextn embeddings (an MTP draft is attached): waits for the evaluation last submitted
+    // in this slot and returns its final hidden state ([n_embd] floats, valid until the slot is reused), or NULL
+    LLAMA_API const float * llama_pipe_get_h_nextn(struct llama_context * ctx, int32_t slot);
 
     // True if the evaluation last submitted in this slot is complete, so that llama_pipe_get_logits and
     // llama_pipe_get_sampled return without waiting; false while it runs or if its device cannot tell without waiting.
