@@ -5346,6 +5346,19 @@ static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, co
     const char * skip_env = getenv("LLAMA_ARCHS_SKIP");
     const std::regex skip_re(skip_env ? skip_env : "^$");
 
+    // LLAMA_ARCHS_SEQ_RM_TRACE=<file> (C881): after every edit a hash of each context's host state
+    // (llama_memory_debug_state, or the state write where that does not cover the memory), after every decode a hash of
+    // each context's logits, one line each, so that two builds can be compared line by line (the same seed)
+    const char * trace_path = getenv("LLAMA_ARCHS_SEQ_RM_TRACE");
+    FILE * trace = trace_path ? fopen(trace_path, "w") : nullptr;
+    auto fnv = [](const void * data, size_t n) {
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = 0; i < n; i++) {
+            h = (h ^ ((const uint8_t *) data)[i])*1099511628211ull;
+        }
+        return h;
+    };
+
     uint32_t i_arch = 0;
     for (const llm_arch & arch : llama_arch_all()) {
         i_arch++;
@@ -5477,6 +5490,10 @@ static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, co
                     const int32_t ra = kv_seq_rm_decode(off.get(), parts, la);
                     const int32_t rb = kv_seq_rm_decode(on.get(),  parts, lb);
                     n_decodes++;
+                    if (trace) {
+                        fprintf(trace, "%s\tdecode %d\t%d %d\t%016" PRIx64 "\t%016" PRIx64 "\n", test_name.c_str(), n_decodes, ra, rb,
+                            fnv(la.data(), la.size()*sizeof(float)), fnv(lb.data(), lb.size()*sizeof(float)));
+                    }
                     if (diff.empty()) {
                         if (ra != rb) {
                             diff = "decode returned " + std::to_string(ra) + " without the switch, " + std::to_string(rb) + " with it";
@@ -5599,6 +5616,20 @@ static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, co
                             } break;
                         }
                         n_edits++;
+                        if (trace) {
+                            uint64_t h[2];
+                            llama_context * cs[2] = { off.get(), on.get() };
+                            for (int c = 0; c < 2; c++) {
+                                if (covered) {
+                                    const std::string st = llama_memory_debug_state(llama_get_memory(cs[c]));
+                                    h[c] = fnv(st.data(), st.size());
+                                } else {
+                                    const std::vector<uint8_t> st = kv_seq_rm_state(cs[c]);
+                                    h[c] = fnv(st.data(), st.size());
+                                }
+                            }
+                            fprintf(trace, "%s\tedit %d %s\t%016" PRIx64 "\t%016" PRIx64 "\n", test_name.c_str(), op, op_names[kind], h[0], h[1]);
+                        }
                         if (!diff.empty()) {
                             diff = "edit " + std::to_string(op) + " (" + op_names[kind] + "): " + diff;
                             break;
@@ -5651,6 +5682,10 @@ static int test_kv_seq_rm(const std::string & arch_filter, const size_t seed, co
                     std::to_string(n_edits).c_str(), decodes, std::to_string(n_refused).c_str(), stats, status.c_str());
             }
         }
+    }
+
+    if (trace) {
+        fclose(trace);
     }
 
     LOG("seq_rm with the switch, all tests: %" PRIu64 " calls for one sequence (%" PRIu64 " sorted, %" PRIu64
