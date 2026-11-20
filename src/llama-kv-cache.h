@@ -188,16 +188,15 @@ public:
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
 
-    // LLAMA_KV_SEQ_RM_BOUND=1 (C740, off by default; read when the cache is created): seq_rm visits only the cells it
-    // can change instead of every cell of the stream. For one sequence, the cells of its (pos, cell) index in [p0, p1),
-    // in cell order (sorted when a removal and a refill left them out of order; past 64 such cells, the used range
-    // instead); for every sequence (seq_id < 0), the cells from the first used one to the last. Each is visited by the
-    // same steps in the same order as without the switch, so the cells, head, the cells changed for the device copies
-    // and every table built from them are the same
+    // LLAMA_KV_SEQ_RM_BOUND=1 (C740, off by default; read when the cache is created): seq_rm of every sequence
+    // (seq_id < 0) visits the cells from the first used one to the last instead of every cell of the stream, by the same
+    // steps in the same order, so the cells, head and the cells changed for the device copies are the same. seq_rm of one
+    // sequence walks its (pos, cell) index in [p0, p1) with or without the switch (upstream's llama_kv_cells::seq_rm,
+    // since C881); the switch only counts those calls
     bool get_seq_rm_bound() const { return seq_rm_bound; }
 
-    // with the switch on, since the cache was created: calls for one sequence, of them sorted, of them that scanned
-    // the used range, calls for every sequence, cells visited
+    // with the switch on, since the cache was created: calls for one sequence, of them whose changed cells were sorted
+    // into cell order, 0 (the calls that scanned the used range, before C881), calls for every sequence, cells visited
     void seq_rm_stats(uint64_t * out) const;
 
     // appends the host state of the cache to out as raw bytes (each stream's head and cells, the device copies' change
@@ -428,9 +427,9 @@ private:
 
     void kq_cells_mark(uint32_t strm, uint32_t idx);
 
-    // LLAMA_KV_SEQ_RM_BOUND (see get_seq_rm_bound): the switch, the cells of one call and the counts of seq_rm_stats
+    // LLAMA_KV_SEQ_RM_BOUND (see get_seq_rm_bound): the switch, the changed cells of one call and the counts of seq_rm_stats
     bool seq_rm_bound  = false;
-    bool seq_rm_nosort = false; // LLAMA_KV_SEQ_RM_BOUND=2, a test hook: the cells in position order, unsorted
+    bool seq_rm_nosort = false; // LLAMA_KV_SEQ_RM_BOUND=2, a test hook: one sequence's changed cells in position order, unsorted
     std::vector<uint32_t> seq_rm_idxs;
     uint64_t seq_rm_n_seq    = 0;
     uint64_t seq_rm_n_sorted = 0;

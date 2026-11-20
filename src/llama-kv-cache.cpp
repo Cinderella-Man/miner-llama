@@ -171,15 +171,15 @@ llama_kv_cache::llama_kv_cache(
         v_cells[s].resize(kv_size);
     }
 
-    // LLAMA_KV_SEQ_RM_BOUND=1 (C740): seq_rm bounded by the cells it can change, see get_seq_rm_bound; read per cache,
-    // so that a test can compare a cache with the switch and one without in the same process
+    // LLAMA_KV_SEQ_RM_BOUND=1 (C740): seq_rm of every sequence bounded by the used cells, see get_seq_rm_bound; read per
+    // cache, so that a test can compare a cache with the switch and one without in the same process
     {
         const char * env = getenv("LLAMA_KV_SEQ_RM_BOUND");
         seq_rm_bound  = env != nullptr && atoi(env) != 0;
         seq_rm_nosort = env != nullptr && atoi(env) == 2;
         if (seq_rm_bound) {
-            LLAMA_LOG_INFO("%s: LLAMA_KV_SEQ_RM_BOUND: %sseq_rm visits only the cells it can change%s\n", __func__, name_tag,
-                seq_rm_nosort ? " (test hook 2: in position order, not sorted)" : "");
+            LLAMA_LOG_INFO("%s: LLAMA_KV_SEQ_RM_BOUND: %sseq_rm of every sequence visits only the used cells%s\n", __func__, name_tag,
+                seq_rm_nosort ? " (test hook 2: changed cells listed in position order, not sorted)" : "");
         }
     }
 
@@ -511,87 +511,55 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     if (seq_id >= 0) {
-        auto & cells = v_cells[seq_to_stream[seq_id]];
-        auto & head  = v_heads[seq_to_stream[seq_id]];
+        const uint32_t strm = seq_to_stream[seq_id];
 
-        uint32_t new_head = cells.size();
-
-        // the freed cell that held the lowest position
-        uint32_t  pos_min_head = cells.size();
-        llama_pos pos_min      = std::numeric_limits<llama_pos>::max();
-
-        // the steps for cell i; the cells are visited in increasing order
-        auto rm_cell = [&](uint32_t i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                return;
-            }
-
-            if (!cells.seq_has(i, seq_id)) {
-                return;
-            }
-
-            const llama_pos pos_i = cells.pos_get(i);
-
-            kq_cells_mark(seq_to_stream[seq_id], i);
-
-            if (cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
-                if (pos_i < pos_min) {
-                    pos_min      = pos_i;
-                    pos_min_head = i;
-                }
-            }
-        };
-
-        if (!seq_rm_bound) {
-            for (uint32_t i = 0; i < cells.size(); ++i) {
-                rm_cell(i);
-            }
-        } else {
-            // LLAMA_KV_SEQ_RM_BOUND: the cells that hold seq_id at a position in [p0, p1) are exactly the entries of
-            // its (pos, cell) index in that range; every other cell fails the two checks of rm_cell. They are visited
-            // in cell order, so kq_cells_mark lists them in the same order and the first freed cell is the same
-            seq_rm_n_seq++;
-
-            const auto & sp = cells.seq_pos_get(seq_id);
-
-            seq_rm_idxs.clear();
-            for (auto it = sp.lower_bound({ p0, 0 }); it != sp.end() && it->first < p1; ++it) {
-                seq_rm_idxs.push_back(it->second);
-            }
-
-            bool scan = false;
-            if (!seq_rm_nosort && !std::is_sorted(seq_rm_idxs.begin(), seq_rm_idxs.end())) {
-                // a removal and a refill (or a wrap of the cache) put the cells out of position order
-                if (seq_rm_idxs.size() <= 64) {
-                    std::sort(seq_rm_idxs.begin(), seq_rm_idxs.end());
-                    seq_rm_n_sorted++;
-                } else {
-                    scan = true;
-                }
-            }
-
-            if (scan) {
-                // many cells out of order: the used range, where every cell the index names lies
-                seq_rm_n_scan++;
-                const uint32_t i0 = cells.used_min();
-                const uint32_t i1 = cells.used_max_p1();
-                for (uint32_t i = i0; i < i1; ++i) {
-                    rm_cell(i);
-                }
-                seq_rm_n_cells += i1 - i0;
-            } else {
-                for (const uint32_t i : seq_rm_idxs) {
-                    rm_cell(i);
-                }
-                seq_rm_n_cells += seq_rm_idxs.size();
-            }
-        }
+        auto & cells = v_cells[strm];
+        auto & head  = v_heads[strm];
 
         static const bool head_empty = llama_kv_rule_on("LLAMA_KV_HEAD_EMPTY");
         static const bool head_tail  = llama_kv_rule_on("LLAMA_KV_HEAD_TAIL");
+
+        // the fork (C881), before upstream's walk below removes them: seq_id's (pos, cell) entries in [p0, p1) name the
+        // cells the walk changes. They go to the device copies' changed-cell list in cell order (past
+        // kq_cells_n_changed_max of them the copies go stale, so a few more than that are enough); and of the cells the
+        // walk frees (seq_id their only sequence), the one of the lowest position is the first in position order
+        const bool tail = head_tail && p1 == std::numeric_limits<llama_pos>::max();
+        const bool mark = kq_cells_track && !kq_cells_stale;
+
+        uint32_t pos_min_head = cells.size();
+        seq_rm_idxs.clear();
+        if (tail || mark) {
+            const auto & sp = cells.seq_pos_get(seq_id);
+            for (auto it = sp.lower_bound({ p0, 0 }); it != sp.end() && it->first < p1; ++it) {
+                if (tail && pos_min_head == cells.size() && cells.seq_count(it->second) == 1) {
+                    pos_min_head = it->second;
+                }
+                if (mark && seq_rm_idxs.size() <= kq_cells_n_changed_max) {
+                    seq_rm_idxs.push_back(it->second);
+                }
+                if ((!tail || pos_min_head != cells.size()) && (!mark || seq_rm_idxs.size() > kq_cells_n_changed_max)) {
+                    break;
+                }
+            }
+        }
+
+        const size_t n_entries = seq_rm_bound ? cells.seq_pos_get(seq_id).size() : 0;
+
+        const uint32_t new_head = cells.seq_rm(seq_id, p0, p1);
+
+        if (!seq_rm_nosort && !std::is_sorted(seq_rm_idxs.begin(), seq_rm_idxs.end())) {
+            // a removal and a refill (or a wrap of the cache) put the cells out of position order
+            std::sort(seq_rm_idxs.begin(), seq_rm_idxs.end());
+            seq_rm_n_sorted += seq_rm_bound ? 1 : 0;
+        }
+        for (const uint32_t i : seq_rm_idxs) {
+            kq_cells_mark(strm, i);
+        }
+
+        if (seq_rm_bound) {
+            seq_rm_n_seq++;
+            seq_rm_n_cells += n_entries - cells.seq_pos_get(seq_id).size();
+        }
 
         if (head_empty && cells.get_used() == 0) {
             // the stream is empty: the next prompt fills it from cell 0, the cell layout of a fresh context, whatever
@@ -599,7 +567,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             // keys in cell order, so a prompt processed from scratch, or a saved state loaded here, then gives the
             // same values as on a server that has just started
             head = 0;
-        } else if (head_tail && p1 == std::numeric_limits<llama_pos>::max() && pos_min_head != cells.size()) {
+        } else if (tail && pos_min_head != cells.size()) {
             // the tail of the sequence was removed: the next token takes the cell of the first removed position, so
             // that re-decoding the tail gives the same cell layout as before, also when the tail wrapped around the
             // end of the cache (pipelined speculation relies on this for bit-identical attention)
