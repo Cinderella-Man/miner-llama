@@ -757,6 +757,19 @@ llama_context::llama_context(
         LLAMA_LOG_INFO("%s: graphs per batch size up to 8 tokens: %s, schedulers per size: %s\n", __func__,
                 graph_per_size ? "on" : "off (LLAMA_GRAPH_PER_SIZE=0)", sched_per_size ? "on (LLAMA_SCHED_PER_SIZE=1)" : "off");
 
+        // LLAMA_SCHED_PER_SIZE_PP (C903): the per-size schedulers made with pipeline parallelism when the context has it
+        // (1, the default with LLAMA_SCHED_PER_SIZE=1), never (0, as before C903) or always (2, a test on one device)
+        sched_small_pp = 0;
+        if (sched_per_size) {
+            const char * env_pp = getenv("LLAMA_SCHED_PER_SIZE_PP");
+            const int    v      = env_pp ? atoi(env_pp) : 1;
+            sched_small_pp = v <= 0 ? 0 : (v >= 2 ? 2 : 1);
+            LLAMA_LOG_INFO("%s: LLAMA_SCHED_PER_SIZE_PP=%d: per-size schedulers made %s\n", __func__, sched_small_pp,
+                    sched_small_pp == 1 ? "with pipeline parallelism when the context has it" :
+                    sched_small_pp == 2 ? "with the input copies of pipeline parallelism, also without it (a test)" :
+                                          "with one copy of their inputs (as before C903)");
+        }
+
         // LLAMA_MTP_GRAPH_KEEP=1 (C619): an MTP draft context keeps one graph on a scheduler of its own for each batch of
         // up to 8 tokens that differs in its tokens, its outputs, its head's shortlist or its hidden-row carry. A
         // speculative step's catch-up (the verify pass's tokens, no output) and its drafting passes (one token, one
@@ -3474,15 +3487,26 @@ llm_graph_result * llama_context::process_ubatch_graph(const llama_ubatch & ubat
             }
         }
         if (ss == nullptr) {
+            // C903 (LLAMA_SCHED_PER_SIZE_PP): with pipeline parallelism, made as the shared scheduler is (sched_new): its
+            // own copies of the inputs and an event per device and copy, so the host does not wait at each change of card
+            const bool pp = sched_small_pp == 2 || (sched_small_pp == 1 && cparams.pipeline_parallel);
             sched_small.push_back({ key, ggml_backend_sched_ptr(ggml_backend_sched_new(
-                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), graph_max_nodes(), false, cparams.op_offload)), nullptr, false,
+                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), graph_max_nodes(), pp, cparams.op_offload)), nullptr, false,
                     false, false });
             ss = &sched_small.back();
             ggml_backend_sched_set_copy_callback(ss->sched.get(), sched_copy_experts, this);
             ggml_backend_sched_set_realloc_callback(ss->sched.get(), sched_graph_realloc, this);
             ggml_backend_sched_set_input_upload(ss->sched.get(), plain_upload);
-            LLAMA_LOG_INFO("%s: scheduler for %u-token batches (%s outputs), %zu per-size schedulers\n", __func__,
-                    ubatch.n_tokens, n_outputs > 0 ? "with" : "without", sched_small.size());
+            // a warning under LLAMA_UBATCH_TRACE, so that a traced server log (default verbosity) shows each one
+            char msg[192];
+            snprintf(msg, sizeof(msg), "scheduler for %u-token batches (%s outputs), %zu per-size schedulers, %d input copies%s",
+                    ubatch.n_tokens, n_outputs > 0 ? "with" : "without", sched_small.size(),
+                    ggml_backend_sched_get_n_copies(ss->sched.get()), pp ? " (pipeline parallelism)" : "");
+            if (trace) {
+                LLAMA_LOG_WARN("%s: %s\n", __func__, msg);
+            } else {
+                LLAMA_LOG_INFO("%s: %s\n", __func__, msg);
+            }
         }
     }
     sched_active = ss ? ss->sched.get() : nullptr;
@@ -3529,12 +3553,18 @@ llm_graph_result * llama_context::process_ubatch_graph(const llama_ubatch & ubat
     // cleared once the graph is submitted (process_ubatch), so that the scheduler's other users keep the waits
     ggml_backend_sched_set_caller_sync(sched_res(), plain_upload > 0 && !gf_in_flight);
 
-    // a per-size scheduler has one copy of its inputs (it is created without pipeline parallelism): when an earlier
+    // a per-size scheduler made without pipeline parallelism has one copy of its inputs: when an earlier
     // ubatch of this decode call is still computing, it may be this scheduler's own graph, so wait before its inputs
     // are written again (only a decode call of several ubatches whose last one has at most 8 tokens gets here).
     // LLAMA_MTP_GRAPH_KEEP (C619) knows which schedulers have a graph in flight and waits only for this one's own, so
-    // that a drafting pass prepares its graph while the step's catch-up computes, as with the shared scheduler
-    if (ss && gf_in_flight && (!mtp_graph_keep || ss->in_flight)) {
+    // that a drafting pass prepares its graph while the step's catch-up computes, as with the shared scheduler.
+    // C903: in a context with pipeline parallelism, one made with it (several copies) needs no wait: a rebuilt graph
+    // takes its next copy, and its events order its own graphs on the devices, as the shared scheduler's do (a reused
+    // graph keeps its copy, and is reused with a graph in flight only with LLAMA_GRAPH_REUSE_WAIT=1, which waits below).
+    // The test LLAMA_SCHED_PER_SIZE_PP=2 in a context without it keeps the wait, since such a context reuses graphs
+    // with a graph in flight
+    const bool ss_pp = ss && cparams.pipeline_parallel && ggml_backend_sched_get_n_copies(ss->sched.get()) > 1;
+    if (ss && gf_in_flight && !ss_pp && (!mtp_graph_keep || ss->in_flight)) {
         ggml_backend_sched_synchronize(ss->sched.get());
         ss->in_flight = false;
     }

@@ -648,6 +648,17 @@ private:
     std::vector<sched_small_entry> sched_small;
     bool sched_per_size = false;
 
+    // env: LLAMA_SCHED_PER_SIZE_PP (C903), read with LLAMA_SCHED_PER_SIZE=1 only. 1 (the default): a per-size scheduler
+    // of a context with pipeline parallelism is made as the shared scheduler is (sched_reserve), with its own copies of
+    // the inputs and an event per device and copy, so that at each change of card the next card waits for the previous
+    // one on the devices and the host hands every card its work without waiting. 0: made with one copy and no events,
+    // as before C903; then the host waits for each card in turn (R216a: a one-token pass submitted in 23.9 ms against
+    // 2.9 ms on the shared scheduler), and the last micro-batch of a prompt waits for the whole prompt first. 2 (a test):
+    // made with the copies even without pipeline parallelism, so that one CPU device runs the path of the copies (a CPU
+    // has no events; the scheduler then waits for the device, which is never busy). Without LLAMA_SCHED_PER_SIZE=1 it is
+    // 0: the per-size schedulers of LLAMA_MTP_GRAPH_KEEP stay as they were
+    int sched_small_pp = 0;
+
     // env: LLAMA_SCHED_PER_SIZE_RESERVE=1 (C803), with per-size schedulers (LLAMA_MTP_GRAPH_KEEP=1 or
     // LLAMA_SCHED_PER_SIZE=1): a per-size scheduler is planned once, when it is made, from its batch's graph over the
     // whole memory (and the head shortlist's whole room), as the shared scheduler is at the context's start, so that no
