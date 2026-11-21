@@ -133,6 +133,17 @@ static bool pipe_grammar_on() {
     return on;
 }
 
+// LLAMA_PIPE_MEDIA: the pipe and in-call checkpoints with a projector loaded (--mmproj). Unset, empty or 0 keeps both
+// off whenever one is loaded, as before. 1 checks the media chunks instead (server_tokens::has_mtmd only says a projector
+// is loaded): text prompts get both
+static int pipe_media_mode() {
+    static const int mode = [] {
+        const char * e = getenv("LLAMA_PIPE_MEDIA");
+        return e != nullptr ? atoi(e) : 0;
+    }();
+    return mode;
+}
+
 struct server_spec_verify {
     bool    block       = false;
     bool    force       = false;
@@ -5697,6 +5708,22 @@ private:
         slot.pm_walk = -1;
     }
 
+    // the pipe with a projector loaded (LLAMA_PIPE_MEDIA)
+    static bool pipe_media_ok(const server_slot & slot) {
+        switch (pipe_media_mode()) {
+            case 0:  return slot.mctx == nullptr;
+            default: return !slot.prompt.tokens.has_media_from(0);
+        }
+    }
+
+    // in-call checkpoints for a prompt (LLAMA_PIPE_MEDIA)
+    static bool incall_media_ok(const server_tokens & input) {
+        switch (pipe_media_mode()) {
+            case 0:  return !input.has_mtmd;
+            default: return !input.has_media_from(0);
+        }
+    }
+
     bool pipe_eligible(const server_slot & slot) const {
         if (params_base.pipe_depth <= 0 || slot.state != SLOT_STATE_GENERATING || !slot.task || !slot.smpl) {
             return false;
@@ -5705,7 +5732,7 @@ private:
             return false;
         }
         // with MTP guesses the MTP draft serves the pipe, and batched speculation only the stretches it cannot run
-        if ((slot.can_speculate() && !pipe_mtp()) || slot.audio_stream || !slot.inp_embd.empty() || slot.mctx) {
+        if ((slot.can_speculate() && !pipe_mtp()) || slot.audio_stream || !slot.inp_embd.empty() || !pipe_media_ok(slot)) {
             return false;
         }
         const auto & sp = slot.task->params.sampling;
@@ -7115,7 +7142,7 @@ private:
                     // part is the call that would have followed without the switch, joined only where it fits whole, and
                     // the decode call cuts its micro-batches where those calls end, so every number stays the same
                     const bool do_checkpoint_all = do_checkpoint;
-                    const bool incall_slot = n_tokens_prev == 0 && do_checkpoint_all && !input_tokens.has_mtmd && !prefix_break &&
+                    const bool incall_slot = n_tokens_prev == 0 && do_checkpoint_all && incall_media_ok(input_tokens) && !prefix_break &&
                             !wait_shared && alora_scale <= 0.0f && slot.task->decision.order.empty() && !use_mixed_batch();
                     for (int part = 0; ; ++part) {
                         do_checkpoint = do_checkpoint_all;

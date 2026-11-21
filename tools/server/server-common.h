@@ -262,6 +262,9 @@ public:
 
     bool empty() const { return tokens.empty(); }
 
+    // a media chunk starts at idx or after it (has_mtmd only says a projector is loaded)
+    bool has_media_from(size_t idx) const { return map_idx_to_media.lower_bound(idx) != map_idx_to_media.end(); }
+
     void clear() {
         map_idx_to_media.clear();
         tokens.clear();
