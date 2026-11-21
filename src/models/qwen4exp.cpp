@@ -1937,11 +1937,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_gdn_conv_at(
             ggml_row_size(out->type, row_total * n_seqs),
             ggml_row_size(out->type, channels * n_seq_tokens * n_seqs));
 
+    // without rollback slots the tails go to the state group this ubatch writes: its pipe slot's, 0 for llama_decode
+    // (llama_memory_recurrent::n_grp), as build_conv_state_store does for the unfused arm. build_rs's getter reads each
+    // cell's newest group, so writing group 0 left a pipe slot reading a stale history of its own group (C932).
+    const size_t grp = cparams.n_rs_seq == 0 ? (size_t) mctx_cur->get_grp() : 0;
+
     ggml_tensor * dst = ggml_view_3d(ctx0, conv_states_all,
             row_total, n_seqs, n_slots,
             conv_states_all->nb[1],
             (size_t) mem_size * row_size,
-            (size_t) kv_head * row_size);
+            (grp * mem_size + kv_head) * row_size);
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, tails, dst));
 
