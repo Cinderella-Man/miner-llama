@@ -308,6 +308,8 @@ struct llama_context {
 
     // numbered device stores (llama_state_seq_get_data_store)
     size_t state_seq_get_data_store(llama_seq_id seq_id, int32_t store,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+    // C907: that fill queued behind the work on the devices, without waiting for it (llama_state_seq_get_data_store_nowait)
+    size_t state_seq_get_data_store_nowait(llama_seq_id seq_id, int32_t store, uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data_store(llama_seq_id seq_id, int32_t store, const uint8_t * src, size_t size, llama_state_seq_flags flags);
     size_t state_seq_store_get_size_host(llama_seq_id seq_id, int32_t store);
     size_t state_seq_store_get_data_host(llama_seq_id seq_id, int32_t store, const uint8_t * src, size_t src_size, uint8_t * dst, size_t dst_size);

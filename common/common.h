@@ -1469,12 +1469,15 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    // the target data into the device store of seq_id; false (and no target data) if the store cannot hold it
+    // the target data into the device store of seq_id; false (and no target data) if the store cannot hold it.
+    // nowait (C907): the copies queued behind the work on the devices, without waiting for it
+    // (llama_state_seq_get_data_store_nowait)
     bool update_tgt_store(
             llama_context * ctx,
             llama_seq_id seq_id,
             int32_t store,
-            llama_state_seq_flags flags);
+            llama_state_seq_flags flags,
+            bool nowait = false);
 
     // the target data from its device store to the host; false (and no target data) if it fails
     bool tgt_to_host(

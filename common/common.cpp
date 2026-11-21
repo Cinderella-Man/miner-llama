@@ -2845,7 +2845,8 @@ bool common_prompt_checkpoint::update_tgt_store(
         llama_context * ctx,
         llama_seq_id seq_id,
         int32_t store,
-        llama_state_seq_flags flags) {
+        llama_state_seq_flags flags,
+        bool nowait) {
     this->store    = -1;
     this->size_dev = 0;
 
@@ -2859,7 +2860,8 @@ bool common_prompt_checkpoint::update_tgt_store(
 
     data_tgt.resize(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_store(ctx, data_tgt.data(), ckpt_size, seq_id, store, flags);
+    const size_t n = nowait ? llama_state_seq_get_data_store_nowait(ctx, data_tgt.data(), ckpt_size, seq_id, store, flags)
+                            : llama_state_seq_get_data_store       (ctx, data_tgt.data(), ckpt_size, seq_id, store, flags);
     if (n != ckpt_size) {
         data_tgt.clear();
         return false;

@@ -960,6 +960,136 @@ private:
     bool partial;
 };
 
+// C907: a state filled into a device store between two decode calls without waiting for the first one
+// (llama_state_seq_get_data_store_nowait, the server's LLAMA_SERVER_CKPT_NOWAIT):
+// - behind a call whose work is still queued: the same blob as the waiting fill (llama_state_seq_get_data_store)
+//   gives, and the store keeps that call's end after a later call has changed the live state (its host copy is the
+//   host state taken at that end, byte for byte)
+// - its restore continues as the host state's restore, bit for bit
+// - with nothing queued (after the outputs were read) it fills as the waiting fill does
+struct case_store_nowait : ctx_test {
+    explicit case_store_nowait(bool partial_) : partial(partial_) {}
+
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return partial ? "store_nw_p" : "store_nw"; }
+
+    const char * description() const override {
+        return partial ? "partial states filled into device stores behind a queued call restore as from the host"
+                       : "whole states filled into device stores behind a queued call restore as from the host";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_pos n_prompt = 24;
+        constexpr llama_pos n_cont   = 6;
+
+        const llama_state_seq_flags flags = partial ? LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY : LLAMA_STATE_SEQ_FLAGS_NONE;
+
+        ctx_opts opts;
+        opts.n_ctx     = 256;
+        opts.n_seq_max = 1;
+
+        auto ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        llama_context * lctx = ctx.get();
+
+        using run_logits = std::vector<std::vector<float>>;
+
+        // decode [p0, p1) of seq 0 one token at a time, with the logits after each
+        const auto run_seq = [&](llama_pos p0, llama_pos p1, run_logits & out) {
+            out.clear();
+            for (llama_pos pos = p0; pos < p1; ++pos) {
+                std::vector<float> logits;
+                if (!decode_one(lctx, gen_token(n_vocab, 0, pos), pos, 0) || !get_current_logits(lctx, logits)) {
+                    return false;
+                }
+                out.push_back(std::move(logits));
+            }
+            return true;
+        };
+
+        const auto bitwise_equal = [](const run_logits & a, const run_logits & b) {
+            if (a.size() != b.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < a.size(); ++i) {
+                if (a[i].size() != b[i].size() || memcmp(a[i].data(), b[i].data(), a[i].size()*sizeof(float)) != 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        const auto trim = [&](llama_pos p) {
+            return llama_memory_seq_rm(llama_get_memory(lctx), 0, p, -1);
+        };
+
+        const auto store_save = [&](int32_t store, bool nowait, std::vector<uint8_t> & meta) {
+            meta.resize(llama_state_seq_get_size_ext(lctx, 0, flags | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
+            const size_t n = nowait ? llama_state_seq_get_data_store_nowait(lctx, meta.data(), meta.size(), 0, store, flags)
+                                    : llama_state_seq_get_data_store       (lctx, meta.data(), meta.size(), 0, store, flags);
+            return n == meta.size();
+        };
+
+        const auto store_load = [&](int32_t store, const std::vector<uint8_t> & meta) {
+            return llama_state_seq_set_data_store(lctx, meta.data(), meta.size(), 0, store, flags) == meta.size();
+        };
+
+        const auto store_copy = [&](int32_t store, const std::vector<uint8_t> & meta, std::vector<uint8_t> & out) {
+            out.resize(llama_state_seq_store_get_size_host(lctx, 0, store));
+            return !out.empty() &&
+                llama_state_seq_store_get_data_host(lctx, meta.data(), meta.size(), out.data(), out.size(), 0, store) == out.size();
+        };
+
+        // the prompt in one call whose outputs are not read, and the fill behind it
+        CTX_REQUIRE(decode_gen(lctx, n_vocab, 0, 0, n_prompt), "prompt decode failed");
+        std::vector<uint8_t> meta0;
+        CTX_REQUIRE(store_save(0, true, meta0), "the no-wait fill of store 0 failed");
+
+        // the same state on the host, and in store 1 by the waiting fill
+        std::vector<uint8_t> host0;
+        std::vector<uint8_t> meta1;
+        CTX_REQUIRE(get_seq_state(lctx, 0, flags, host0), "host save failed");
+        CTX_REQUIRE(store_save(1, false, meta1), "the waiting fill of store 1 failed");
+        CTX_REQUIRE(blobs_equal(meta0, meta1), "the no-wait fill returned another blob than the waiting fill");
+        TLOG_INF("%s: host state %zu bytes, store blob %zu bytes, store %zu bytes\n", __func__,
+                host0.size(), meta0.size(), llama_state_seq_store_get_size_host(lctx, 0, 0) - meta0.size());
+
+        // a later call, its outputs not read either: store 0 keeps the prompt's end
+        CTX_REQUIRE(decode_gen(lctx, n_vocab, 0, n_prompt, n_prompt + n_cont), "continuation decode failed");
+        std::vector<uint8_t> copy0;
+        CTX_REQUIRE(store_copy(0, meta0, copy0), "host copy of store 0 failed");
+        CTX_REQUIRE(blobs_equal(host0, copy0), "the host copy of store 0 differs from the host state at the prompt's end");
+
+        run_logits from_host;
+        run_logits from_store;
+        CTX_REQUIRE(set_seq_state(lctx, 0, flags, host0) && trim(n_prompt), "host restore failed");
+        CTX_REQUIRE(run_seq(n_prompt, n_prompt + n_cont, from_host), "decode after the host restore failed");
+        CTX_REQUIRE(store_load(0, meta0) && trim(n_prompt), "store 0 restore failed");
+        CTX_REQUIRE(run_seq(n_prompt, n_prompt + n_cont, from_store), "decode after the store restore failed");
+        CTX_REQUIRE(bitwise_equal(from_host, from_store), "the no-wait store continues with other logits than the host state");
+
+        // nothing queued now (the last outputs were read): the no-wait fill is the waiting one
+        std::vector<uint8_t> host2;
+        std::vector<uint8_t> meta2;
+        std::vector<uint8_t> copy2;
+        CTX_REQUIRE(get_seq_state(lctx, 0, flags, host2), "host save 2 failed");
+        CTX_REQUIRE(store_save(2, true, meta2), "the no-wait fill of store 2 failed");
+        CTX_REQUIRE(store_copy(2, meta2, copy2), "host copy of store 2 failed");
+        CTX_REQUIRE(blobs_equal(host2, copy2), "the host copy of store 2 differs from the host state");
+
+        return case_result::pass();
+    }
+
+private:
+    bool partial;
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -973,6 +1103,8 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_one_slot_no_swap>());
     cases.push_back(std::make_unique<case_store_at>(false));
     cases.push_back(std::make_unique<case_store_at>(true));
+    cases.push_back(std::make_unique<case_store_nowait>(false));
+    cases.push_back(std::make_unique<case_store_nowait>(true));
 
     return cases;
 }

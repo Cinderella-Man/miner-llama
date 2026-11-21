@@ -179,6 +179,9 @@ json server_slot_stats::to_json() const {
     if (n_ckpt_incall > 0) {
         base["ckpt_incall_n"] = n_ckpt_incall;
     }
+    if (n_ckpt_nowait > 0) {
+        base["ckpt_nowait_n"] = n_ckpt_nowait;
+    }
 
     return base;
 }

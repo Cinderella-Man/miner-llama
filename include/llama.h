@@ -981,6 +981,20 @@ extern "C" {
                          int32_t   store,
            llama_state_seq_flags   flags);
 
+    // C907: llama_state_seq_get_data_store without waiting for the devices. Where work is queued on them, the state is
+    // the one the host holds now (the queued work's result): its rows are copied on the stream of each backend that
+    // holds them, behind the queued work and ahead of the next decode's, with an event recorded after them, as a fill
+    // inside a decode (llama_state_seq_store_at) does; a host copy (llama_state_seq_store_get_data_host) and a restore
+    // wait for those events. With nothing queued it is llama_state_seq_get_data_store. The same blob and store contents
+    // as that call
+    LLAMA_API size_t llama_state_seq_get_data_store_nowait(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+                         int32_t   store,
+           llama_state_seq_flags   flags);
+
     // restores the state that llama_state_seq_get_data_store wrote into (seq_id of src, store); src is the blob it
     // returned
     LLAMA_API size_t llama_state_seq_set_data_store(
