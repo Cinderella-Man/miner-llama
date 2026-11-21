@@ -170,13 +170,16 @@ struct llama_ubatch_taper {
     uint32_t short_n = 0; // a call that is both and holds short_n tokens or fewer: all of it
     uint32_t short_s = 0; //     in micro-batches of short_s tokens (the remainder last)
     uint32_t min_s   = 9; // no planned micro-batch below min_s tokens (1-8 tokens take the matrix-vector products)
+    bool     cuts    = false; // C905: plan each segment between the call's micro-batch cuts (llama_set_ubatch_cuts,
+                              //     the in-call checkpoints) on its own, so min_s holds in every segment
 
     bool enabled() const {
         return (head_n > 0 && head_s > 0) || (tail_n > 0 && tail_s > 0) || (short_n > 0 && short_s > 0);
     }
 
     // "", "0" or "off": off; "1" or "on": head=256:64,tail=512:128,short=600:64; otherwise any of head=N:S, tail=N:S,
-    // short=N:S and min=N, comma-separated (a rule left out is off, min 9); false with a message in err on a bad spec
+    // short=N:S, min=N and cuts=0|1, comma-separated (a rule left out is off, min 9, cuts 0); false with a message in
+    // err on a bad spec
     bool parse(const char * spec, std::string & err);
 
     // the spec of this schedule, "off" when off
@@ -185,9 +188,12 @@ struct llama_ubatch_taper {
 
 // the ends (token offsets) of the micro-batches of a call of n_tokens under the taper; head: the call starts with
 // nothing in flight, tail: the caller waits after it. Empty when the taper leaves the call to n_ubatch (the split the
-// memory modules make without a plan).
+// memory modules make without a plan). cuts: the call's micro-batch cuts (C217), which the splits apply on top of the
+// plan; with taper.cuts (C905) the plan holds them as ends and lays out each segment between them on its own, else
+// they are not read (the plan of the whole call, which a cut may leave a piece of 1 to min_s - 1 tokens beside).
 std::vector<uint32_t> llama_ubatch_taper_plan(
-        const llama_ubatch_taper & taper, uint32_t n_tokens, uint32_t n_ubatch, bool head, bool tail);
+        const llama_ubatch_taper & taper, uint32_t n_tokens, uint32_t n_ubatch, bool head, bool tail,
+        const std::vector<uint32_t> & cuts = {});
 
 // a helper for sanitizing, fulfilling and splitting a batch
 class llama_batch_allocr {
@@ -251,6 +257,9 @@ public:
     // batch (the trailing tokens of split_equal's n_keep_tail too), so the batch splits into the micro-batches of
     // separate calls cut there. For batches of one sequence (is_one_seq); init() clears them, empty = no cuts
     void set_ubatch_cuts(std::vector<uint32_t> cuts);
+
+    // C905: the cuts set for the current batch (sorted, each once)
+    const std::vector<uint32_t> & get_ubatch_cuts() const { return ubatch_cuts; }
 
     // all tokens of one sequence (the cuts apply)
     bool is_one_seq() const;

@@ -663,6 +663,15 @@ bool llama_ubatch_taper::parse(const char * spec, std::string & err) {
             }
             continue;
         }
+        if (eq != std::string::npos && item.substr(0, eq) == "cuts") {
+            const std::string v = item.substr(eq + 1);
+            if (v != "0" && v != "1") {
+                err = "'" + item + "': cuts=0 (the plan of the whole call) or cuts=1 (each segment between the cuts on its own)";
+                return false;
+            }
+            res.cuts = v == "1";
+            continue;
+        }
         const size_t co = item.find(':', eq == std::string::npos ? 0 : eq);
         if (eq == std::string::npos || co == std::string::npos) {
             err = "'" + item + "' is not <rule>=<tokens>:<size> or min=<tokens>";
@@ -713,11 +722,43 @@ std::string llama_ubatch_taper::str() const {
     if (min_s != llama_ubatch_taper().min_s) {
         res += ",min=" + std::to_string(min_s);
     }
+    if (cuts) {
+        res += ",cuts=1";
+    }
     return res;
 }
 
+// no micro-batch below min_s tokens among the sizes sz (a whole call, or one segment of it between two cuts): a short
+// one (a remainder, a short region) joins its neighbour (the previous one, the next for the first), and a pair above
+// n_ubatch is halved. Batches of 1-8 tokens take the matrix-vector products (the CPU's one-column path, MMVQ on CUDA),
+// which round differently from the matrix-matrix kernels that a prompt's micro-batches run, and cost more per token
+static void llama_ubatch_taper_floor(std::vector<uint32_t> & sz, uint32_t min_s, uint32_t n_ubatch) {
+    // each step removes a short piece or halves a pair into two that are not short
+    const size_t n_steps = 2*sz.size() + 2;
+    for (size_t it = 0; it < n_steps; ++it) {
+        size_t i = 0;
+        while (i < sz.size() && sz[i] >= min_s) {
+            ++i;
+        }
+        if (i == sz.size() || sz.size() < 2) {
+            break;
+        }
+        const size_t a = i > 0 ? i - 1 : 0;
+        const size_t b = a + 1;
+        const uint32_t t = sz[a] + sz[b];
+        if (t <= n_ubatch) {
+            sz[a] = t;
+            sz.erase(sz.begin() + b);
+        } else {
+            sz[a] = t - t/2;
+            sz[b] = t/2;
+        }
+    }
+}
+
 std::vector<uint32_t> llama_ubatch_taper_plan(
-        const llama_ubatch_taper & taper, uint32_t n_tokens, uint32_t n_ubatch, bool head, bool tail) {
+        const llama_ubatch_taper & taper, uint32_t n_tokens, uint32_t n_ubatch, bool head, bool tail,
+        const std::vector<uint32_t> & cuts) {
     std::vector<uint32_t> ends;
     if (!taper.enabled() || n_tokens == 0 || n_ubatch == 0) {
         return ends;
@@ -756,60 +797,98 @@ std::vector<uint32_t> llama_ubatch_taper_plan(
         }
     };
 
-    if (is_short) {
-        add(0, n_tokens, taper.short_s, false);
-    } else {
-        add(0,                 n_head,            taper.head_s, true);
-        add(n_head,            n_tokens - n_tail, n_ubatch,     false);
-        add(n_tokens - n_tail, n_tokens,          taper.tail_s, false);
+    // the rules' parts of the call that lie in [sb, se): the head's tokens in head_s (the remainder first), the body in
+    // n_ubatch, the tail's in tail_s; a short call's in short_s (the remainder last)
+    auto lay_out = [&](uint32_t sb, uint32_t se) {
+        if (is_short) {
+            add(sb, se, taper.short_s, false);
+        } else {
+            add(sb,                              std::min(se, n_head),            taper.head_s, true);
+            add(std::max(sb, n_head),            std::min(se, n_tokens - n_tail), n_ubatch,     false);
+            add(std::max(sb, n_tokens - n_tail), se,                              taper.tail_s, false);
+        }
+    };
+
+    // C905 (cuts=1): the call's cuts inside it, each once; the splits stop at every cut, so each segment between two
+    // cuts is planned on its own
+    std::vector<uint32_t> seg_cuts;
+    if (taper.cuts) {
+        for (const uint32_t c : cuts) {
+            if (c > 0 && c < n_tokens) {
+                seg_cuts.push_back(c);
+            }
+        }
+        std::sort(seg_cuts.begin(), seg_cuts.end());
+        seg_cuts.erase(std::unique(seg_cuts.begin(), seg_cuts.end()), seg_cuts.end());
     }
 
-    // no micro-batch below min_s tokens: a short one (a remainder, a short region) joins its neighbour (the previous
-    // one, the next for the first), and a pair above n_ubatch is halved. Batches of 1-8 tokens take the matrix-vector
-    // products (the CPU's one-column path, MMVQ on CUDA), which round differently from the matrix-matrix kernels that
-    // a prompt's micro-batches run, and cost more per token
-    if (use_min) {
-        std::vector<uint32_t> sz;
-        uint32_t prev = 0;
-        for (const uint32_t e : ends) {
-            sz.push_back(e - prev);
-            prev = e;
-        }
-        // each step removes a short piece or halves a pair into two that are not short
-        const size_t n_steps = 2*sz.size() + 2;
-        for (size_t it = 0; it < n_steps; ++it) {
-            size_t i = 0;
-            while (i < sz.size() && sz[i] >= taper.min_s) {
-                ++i;
+    if (seg_cuts.empty()) {
+        // the plan of the whole call (the cuts, if any, split its micro-batches where they fall)
+        lay_out(0, n_tokens);
+
+        if (use_min) {
+            std::vector<uint32_t> sz;
+            uint32_t prev = 0;
+            for (const uint32_t e : ends) {
+                sz.push_back(e - prev);
+                prev = e;
             }
-            if (i == sz.size() || sz.size() < 2) {
-                break;
-            }
-            const size_t a = i > 0 ? i - 1 : 0;
-            const size_t b = a + 1;
-            const uint32_t t = sz[a] + sz[b];
-            if (t <= n_ubatch) {
-                sz[a] = t;
-                sz.erase(sz.begin() + b);
-            } else {
-                sz[a] = t - t/2;
-                sz[b] = t/2;
+            llama_ubatch_taper_floor(sz, taper.min_s, n_ubatch);
+            ends.clear();
+            uint32_t pos = 0;
+            for (const uint32_t s : sz) {
+                pos += s;
+                ends.push_back(pos);
             }
         }
-        ends.clear();
-        uint32_t pos = 0;
-        for (const uint32_t s : sz) {
-            pos += s;
-            ends.push_back(pos);
+
+        // the split without a plan: n_ubatch tokens at a time, the remainder last
+        bool stock = true;
+        for (size_t i = 0; i < ends.size() && stock; ++i) {
+            stock = ends[i] == std::min<uint64_t>(n_tokens, (uint64_t) (i + 1)*n_ubatch);
         }
+        if (stock) {
+            ends.clear();
+        }
+
+        return ends;
     }
 
-    // the split without a plan: n_ubatch tokens at a time, the remainder last
-    bool stock = true;
-    for (size_t i = 0; i < ends.size() && stock; ++i) {
-        stock = ends[i] == std::min<uint64_t>(n_tokens, (uint64_t) (i + 1)*n_ubatch);
+    // C905: every segment between the cuts laid out on its own, then no piece under min_s inside it; a segment shorter
+    // than min_s (the cut makes it) is one piece. A cut is always an end, so no piece crosses one, and no piece of a
+    // segment of min_s tokens or more is left under min_s by a cut that a plan of the whole call does not see
+    const bool use_min_seg = taper.min_s > 1 && n_ubatch >= 2*taper.min_s;
+    std::vector<uint32_t> plain; // the split without a plan: per segment n_ubatch tokens at a time, the remainder last
+    uint32_t sb = 0;
+    for (size_t k = 0; k <= seg_cuts.size(); ++k) {
+        const uint32_t se = k < seg_cuts.size() ? seg_cuts[k] : n_tokens;
+        const size_t first = ends.size();
+        lay_out(sb, se);
+        if (use_min_seg && se - sb >= taper.min_s) {
+            std::vector<uint32_t> sz;
+            uint32_t prev = sb;
+            for (size_t i = first; i < ends.size(); ++i) {
+                sz.push_back(ends[i] - prev);
+                prev = ends[i];
+            }
+            llama_ubatch_taper_floor(sz, taper.min_s, n_ubatch);
+            ends.resize(first);
+            uint32_t pos = sb;
+            for (const uint32_t s : sz) {
+                pos += s;
+                ends.push_back(pos);
+            }
+        } else if (use_min_seg) {
+            ends.resize(first);
+            ends.push_back(se);
+        }
+        for (uint32_t pos = sb; pos < se; ) {
+            pos = std::min(se, pos + n_ubatch);
+            plain.push_back(pos);
+        }
+        sb = se;
     }
-    if (stock) {
+    if (ends == plain) {
         ends.clear();
     }
 
