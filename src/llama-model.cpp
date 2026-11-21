@@ -1727,6 +1727,37 @@ static bool llama_file_is_nextn_only(const llama_model_loader & ml, uint32_t il_
     return has_nextn;
 }
 
+// copies src's data into dst, a tensor of the same layout in another buffer, without a host buffer of the tensor's size
+// (--mtp-device's head copy on a 4 GB host): from or to host memory directly, device to device in whole rows through a
+// host buffer of at most 16 MiB. ggml_backend_tensor_copy would stage the whole tensor in host memory whenever the
+// backend has no copy of its own between the two buffers (two RPC servers, a CUDA build without peer copies).
+static bool llama_tensor_copy_bounded(const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (src_buf == nullptr || dst_buf == nullptr || !ggml_are_same_layout(src, dst) || !ggml_is_contiguous(src)) {
+        return false;
+    }
+    const size_t nbytes = ggml_nbytes(src);
+    if (ggml_backend_buffer_is_host(src_buf)) {
+        ggml_backend_tensor_set(dst, src->data, 0, nbytes);
+        return true;
+    }
+    if (ggml_backend_buffer_is_host(dst_buf)) {
+        ggml_backend_tensor_get(src, dst->data, 0, nbytes);
+        return true;
+    }
+    constexpr size_t max_chunk = 16u*1024*1024;
+    const size_t row   = std::max<size_t>(src->nb[1], 1); // a 1-D tensor's nb[1] is its size: one chunk
+    const size_t chunk = std::min(nbytes, std::max(row, max_chunk / row * row));
+    std::vector<uint8_t> tmp(chunk);
+    for (size_t offset = 0; offset < nbytes; offset += chunk) {
+        const size_t size = std::min(chunk, nbytes - offset);
+        ggml_backend_tensor_get(src, tmp.data(), offset, size);
+        ggml_backend_tensor_set(dst, tmp.data(), offset, size);
+    }
+    return true;
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -2238,6 +2269,55 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
     }
 
+    // nextn_device (--mtp-device): room for a copy of the output head and its norm on the MTP layers' device, for the
+    // MTP graph. Its buffer is a weight buffer like the ones above, kept in pimpl->ctxs_bufs, so the memory fit's dry
+    // run (no_alloc, which returns below) counts it on that device and llama_model_free frees it. Its data is copied
+    // once the weights are loaded (the end of this function).
+    ggml_tensor * nextn_head      = nullptr;
+    ggml_tensor * nextn_head_norm = nullptr;
+    if (const int k = params.nextn_device; k >= 0 && hparams.n_layer_nextn > 0 && output != nullptr &&
+            k < (int) n_devices() && devices.at(k).dev != dev_output()) {
+        ggml_backend_dev_t         dev  = devices.at(k).dev;
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+        ggml_init_params ip = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * 2,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx { ggml_init(ip) };
+        if (!ctx) {
+            throw std::runtime_error("failed to create the MTP output head copy's context");
+        }
+        ggml_tensor * t = ggml_dup_tensor(ctx.get(), output);
+        ggml_set_name(t, "output_nextn");
+        ggml_tensor * t_norm = output_norm ? ggml_dup_tensor(ctx.get(), output_norm) : nullptr;
+        if (t_norm) {
+            ggml_set_name(t_norm, "output_norm_nextn");
+        }
+
+        ggml_backend_buffer_t buf;
+        if (ml.no_alloc) {
+            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer, as for the weights above
+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx.get()); cur != nullptr; cur = ggml_get_next_tensor(ctx.get(), cur)) {
+                cur->buffer = buf;
+            }
+        } else {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        }
+        if (buf == nullptr) {
+            LLAMA_LOG_ERROR("%s: no room for the MTP output head copy on %s; the MTP graph reads the output head (--mtp-device)\n",
+                    __func__, ggml_backend_dev_name(dev));
+        } else {
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            std::vector<ggml_backend_buffer_ptr> bufs;
+            bufs.emplace_back(buf);
+            pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+            nextn_head      = t;
+            nextn_head_norm = t_norm;
+        }
+    }
+
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
 
@@ -2289,38 +2369,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
-    // nextn_device: the MTP graph's output head, copied to the nextn layer's device
-    if (const int k = params.nextn_device; k >= 0 && hparams.n_layer_nextn > 0 && output != nullptr) {
-        ggml_backend_buffer_t ob = output->view_src ? output->view_src->buffer : output->buffer;
-        if (k >= 0 && k < (int) n_devices() && ob != nullptr && devices.at(k).dev != dev_output()) {
-            ggml_init_params ip = { ggml_tensor_overhead() * 4, nullptr, true };
-            ggml_context * cctx = ggml_init(ip);
-            ggml_tensor * t = ggml_dup_tensor(cctx, output);
-            ggml_set_name(t, "output_nextn");
-            ggml_tensor * tn_ = output_norm ? ggml_dup_tensor(cctx, output_norm) : nullptr;
-            if (tn_) {
-                ggml_set_name(tn_, "output_norm_nextn");
+    // nextn_device: the MTP graph's output head, copied into the room made for it above on the nextn layers' device,
+    // without a host buffer of the head's size (llama_tensor_copy_bounded)
+    if (nextn_head != nullptr) {
+        if (llama_tensor_copy_bounded(output, nextn_head)) {
+            output_nextn = nextn_head;
+            if (nextn_head_norm != nullptr && llama_tensor_copy_bounded(output_norm, nextn_head_norm)) {
+                output_norm_nextn = nextn_head_norm;
             }
-            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(cctx,
-                    ggml_backend_dev_buffer_type(devices.at(k).dev));
-            if (buf == nullptr) {
-                LLAMA_LOG_ERROR("%s: no room for the MTP output head copy on %s\n", __func__, ggml_backend_dev_name(devices.at(k).dev));
-            } else {
-                std::vector<uint8_t> tmp(ggml_nbytes(output));
-                ggml_backend_tensor_get(output, tmp.data(), 0, tmp.size());
-                ggml_backend_tensor_set(t, tmp.data(), 0, tmp.size());
-                output_nextn = t;
-                if (tn_) {
-                    std::vector<uint8_t> tmp_n(ggml_nbytes(output_norm));
-                    ggml_backend_tensor_get(output_norm, tmp_n.data(), 0, tmp_n.size());
-                    ggml_backend_tensor_set(tn_, tmp_n.data(), 0, tmp_n.size());
-                    output_norm_nextn = tn_;
-                }
-                ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-                LLAMA_LOG_INFO("%s: MTP output head copied to %s, %.1f MiB (--mtp-device)\n", __func__,
-                        ggml_backend_dev_name(devices.at(k).dev), tmp.size() / 1024.0 / 1024.0);
-                // kept for the model's lifetime (the buffer is never freed; the process exit releases it)
-            }
+            LLAMA_LOG_INFO("%s: MTP output head copied to %s, %.1f MiB (--mtp-device)\n", __func__,
+                    ggml_backend_dev_name(devices.at(params.nextn_device).dev), ggml_nbytes(output) / 1024.0 / 1024.0);
+        } else {
+            LLAMA_LOG_ERROR("%s: the output head could not be copied; the MTP graph reads the output head (--mtp-device)\n", __func__);
         }
     }
 
