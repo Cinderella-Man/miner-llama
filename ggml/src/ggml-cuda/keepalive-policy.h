@@ -47,6 +47,9 @@
 //                                  evaluation is queued, waited for that evaluation (R131: a long prompt's first chunk
 //                                  queued one card at a time)
 //                                Whenever it is set, llama-server prints the counts after each reply (keep-alive = ...)
+//   GGML_CUDA_KEEPALIVE_TRACE    (C878) at EAGER 1, 2 or 3: a debug line for each key new to a card, naming the first node
+//                                and the size, stride or pick that differs from the card's nearest earlier key
+//                                (keepalive-trace.h; unset: nothing recorded)
 // When a context is freed, each card's runs are logged with the SM clock the block measured while it ran.
 
 #include <chrono>

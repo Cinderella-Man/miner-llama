@@ -17,6 +17,7 @@
 //                                  module loading waits for the block: about the timeout)
 
 #include "../ggml/src/ggml-cuda/keepalive-policy.h"
+#include "../ggml/src/ggml-cuda/keepalive-trace.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -1076,6 +1077,177 @@ static int test_gpu() {
     return n_fail == 0 ? 0 : 1;
 }
 
+// GGML_CUDA_KEEPALIVE_TRACE (C878, keepalive-trace.h): the switch, and the comparison of a new key's fields with the
+// card's nearest earlier key. A record here stands in for ggml_cuda_keepalive_shapes_impl<true>'s: nodes of fields in
+// the order the key mixes them
+static void test_trace_parse() {
+    CHECK(ggml_cuda_keepalive_parse_trace(nullptr) == 0);
+    CHECK(ggml_cuda_keepalive_parse_trace("") == 0);
+    CHECK(ggml_cuda_keepalive_parse_trace("0") == 0);
+    CHECK(ggml_cuda_keepalive_parse_trace("1") == 16);
+    CHECK(ggml_cuda_keepalive_parse_trace("64") == 64);
+    CHECK(ggml_cuda_keepalive_parse_trace("100000") == 4096);
+    CHECK(ggml_cuda_keepalive_parse_trace("-3") == 0);
+    CHECK(ggml_cuda_keepalive_parse_trace("on") == 0);
+    CHECK(ggml_cuda_keepalive_parse_trace("2x") == 0);
+}
+
+// one node as the key mixes it at level 3 for an op outside the depth ops: op and type, ne, nb, 8 parameter words, one
+// source with its type, ne and nb
+static void trace_node(ggml_cuda_ka_trace_rec & r, int32_t index, ggml_op op, int64_t ne0, int64_t ne1, int64_t src_ne1) {
+    r.begin_node(index);
+    r.put(ggml_cuda_ka_field(GGML_CUDA_KA_F_OP, 0, 0), (uint64_t) op | ((uint64_t) GGML_TYPE_F32 << 16));
+    const int64_t ne[4] = { ne0, ne1, 1, 1 };
+    for (int d = 0; d < 4; ++d) {
+        r.put(ggml_cuda_ka_field(GGML_CUDA_KA_F_NE, 0, d), (uint64_t) ne[d]);
+    }
+    for (int d = 1; d < 4; ++d) {
+        r.put(ggml_cuda_ka_field(GGML_CUDA_KA_F_NB, 0, d), (uint64_t) (4*ne0*(d == 1 ? 1 : ne1)));
+    }
+    for (int w = 0; w < 8; ++w) {
+        r.put(ggml_cuda_ka_field(GGML_CUDA_KA_F_PARAM64, 0, w), 0);
+    }
+    r.put(ggml_cuda_ka_field(GGML_CUDA_KA_F_SRC, 1, 0), 1u | ((uint64_t) GGML_TYPE_F16 << 16));
+    const int64_t sne[4] = { ne0, src_ne1, 1, 1 };
+    for (int d = 0; d < 4; ++d) {
+        r.put(ggml_cuda_ka_field(GGML_CUDA_KA_F_NE, 1, d), (uint64_t) sne[d]);
+    }
+    for (int d = 1; d < 4; ++d) {
+        r.put(ggml_cuda_ka_field(GGML_CUDA_KA_F_NB, 1, d), GGML_CUDA_KA_MARK_PACKED);
+    }
+}
+
+// a level-3 depth op's node: its length dimension marked, and a pick
+static void trace_topk(ggml_cuda_ka_trace_rec & r, int32_t index, int64_t tokens, uint64_t path) {
+    r.begin_node(index);
+    r.put(ggml_cuda_ka_field(GGML_CUDA_KA_F_OP, 0, 0), (uint64_t) GGML_OP_TOP_K | ((uint64_t) GGML_TYPE_I32 << 16));
+    r.put(ggml_cuda_ka_field(GGML_CUDA_KA_F_NE, 0, 0), GGML_CUDA_KA_MARK_DEPTH);
+    r.put(ggml_cuda_ka_field(GGML_CUDA_KA_F_NE, 0, 1), (uint64_t) tokens);
+    r.put(ggml_cuda_ka_field(GGML_CUDA_KA_F_TOPK, 0, 0), GGML_CUDA_KA_MARK_TOPK ^ path);
+}
+
+// a graph as R195's last passes: n_tokens per node, the top-k's path, the source's ne[1] in node 2
+static ggml_cuda_ka_trace_rec trace_graph(int64_t tokens, uint64_t path, int64_t src_ne1 = 64, bool extra = false) {
+    ggml_cuda_ka_trace_rec r;
+    r.n_nodes = extra ? 9 : 8;
+    trace_node(r, 0, GGML_OP_GET_ROWS, 2560, tokens, tokens);
+    trace_node(r, 2, GGML_OP_MUL_MAT, 512, tokens, src_ne1);
+    trace_topk(r, 3, tokens, path);
+    trace_node(r, 5, GGML_OP_ADD, 2560, tokens, tokens);
+    if (extra) {
+        trace_node(r, 7, GGML_OP_CPY, 2560, tokens, tokens);
+    }
+    r.end();
+    return r;
+}
+
+static std::string trace_describe(int32_t i) {
+    return "node " + std::to_string(i);
+}
+
+static void test_trace_first_field() {
+    // the key from a record: the seed and mix of ggml_cuda_keepalive_shapes, over every recorded value in order
+    {
+        ggml_cuda_ka_trace_rec r = trace_graph(1, 0);
+        uint64_t h = 0x9e3779b97f4a7c15ull ^ (uint64_t) r.n_nodes;
+        for (const uint64_t v : r.val) {
+            h ^= v;
+            h *= 0xbf58476d1ce4e5b9ull;
+            h ^= h >> 31;
+        }
+        CHECK(ggml_cuda_ka_trace_key_of(r) == h);
+        CHECK(ggml_cuda_ka_trace_key_of(trace_graph(1, 2)) != h && ggml_cuda_ka_trace_key_of(trace_graph(1, 0)) == h);
+    }
+    ggml_cuda_ka_trace_card card;
+    // the warm-up's one-token pass at a short cache (path 0), then its two-token pass
+    ggml_cuda_ka_trace_diff d = ggml_cuda_ka_trace_add(card, 101, trace_graph(1, 0), 1u << 20);
+    CHECK(d.fresh && d.seq == 1 && !d.has_near && d.n_rec == 4);
+    CHECK(ggml_cuda_ka_trace_line(d, 3, trace_describe).find("the card's first key") != std::string::npos);
+    d = ggml_cuda_ka_trace_add(card, 102, trace_graph(2, 0), 1u << 20);
+    CHECK(d.fresh && d.has_near && d.near_key == 101 && d.n_diff == 4);
+    CHECK(!d.nodes.empty() && d.nodes[0].pos == 0 && d.nodes[0].index_now == 0 && d.nodes[0].field_known);
+    CHECK(d.nodes[0].same_field && d.nodes[0].code_now == ggml_cuda_ka_field(GGML_CUDA_KA_F_NE, 0, 1));
+    CHECK(d.nodes[0].val_before == 1 && d.nodes[0].val_now == 2);
+    // a key the card has seen: no line
+    d = ggml_cuda_ka_trace_add(card, 101, trace_graph(1, 0), 1u << 20);
+    CHECK(!d.fresh && card.entries.size() == 2);
+    // the one-token pass at a deep cache: only the top-k's path differs, against the warm-up's one-token key
+    d = ggml_cuda_ka_trace_add(card, 103, trace_graph(1, 2), 1u << 20);
+    CHECK(d.fresh && d.seq == 3 && d.near_key == 101 && d.near_seq == 1 && d.n_diff == 1);
+    CHECK(d.nodes.size() == 1 && d.nodes[0].index_now == 3 && d.nodes[0].field_known && d.nodes[0].same_field);
+    CHECK(d.nodes[0].code_now == ggml_cuda_ka_field(GGML_CUDA_KA_F_TOPK, 0, 0));
+    std::string line = ggml_cuda_ka_trace_line(d, 3, trace_describe);
+    CHECK(line.find("1 nodes differ; first node 3: the top-k's path 0 -> 2") != std::string::npos);
+    // a source's size: named with its source, and a level-3 mark is never the difference
+    d = ggml_cuda_ka_trace_add(card, 104, trace_graph(1, 2, 1088), 1u << 20);
+    CHECK(d.fresh && d.near_key == 103 && d.n_diff == 1 && d.nodes.size() == 1 && d.nodes[0].index_now == 2);
+    line = ggml_cuda_ka_trace_line(d, 3, trace_describe);
+    CHECK(line.find("first node 2: src[0].ne[1] 64 -> 1088") != std::string::npos);
+    CHECK(ggml_cuda_ka_trace_field_value(ggml_cuda_ka_field(GGML_CUDA_KA_F_NE, 0, 0), GGML_CUDA_KA_MARK_DEPTH).find("left out") != std::string::npos);
+    CHECK(ggml_cuda_ka_trace_field_value(ggml_cuda_ka_field(GGML_CUDA_KA_F_NB, 1, 2), GGML_CUDA_KA_MARK_PACKED) == "(packed)");
+    CHECK(ggml_cuda_ka_trace_field_value(ggml_cuda_ka_field(GGML_CUDA_KA_F_OP, 0, 0),
+                                         (uint64_t) GGML_OP_TOP_K | ((uint64_t) GGML_TYPE_I32 << 16)) == "TOP_K/i32");
+    CHECK(ggml_cuda_ka_trace_field_name(ggml_cuda_ka_field(GGML_CUDA_KA_F_PARAM32, 0, 4)) == "op_params[4]");
+    // one node more: the first difference has no counterpart
+    d = ggml_cuda_ka_trace_add(card, 105, trace_graph(1, 2, 1088, true), 1u << 20);
+    CHECK(d.fresh && d.near_key == 104 && d.n_diff == 1 && d.nodes.size() == 1 && !d.nodes[0].in_both);
+    CHECK(ggml_cuda_ka_trace_line(d, 3, trace_describe).find("no counterpart (4 recorded nodes before, 5 now)") != std::string::npos);
+    // the same nodes, another node count (views and no-ops)
+    ggml_cuda_ka_trace_rec r = trace_graph(1, 2, 1088);
+    r.n_nodes = 12;
+    d = ggml_cuda_ka_trace_add(card, 106, std::move(r), 1u << 20);
+    CHECK(d.fresh && d.near_key == 104 && d.n_diff == 0 && d.nodes.empty());
+    CHECK(ggml_cuda_ka_trace_line(d, 3, trace_describe).find("node count (views and no-ops included) 8 -> 12") != std::string::npos);
+}
+
+// the nearest key is the one with the fewest differing nodes, not the latest; other fields at a node are named as such
+static void test_trace_nearest() {
+    ggml_cuda_ka_trace_card card;
+    ggml_cuda_ka_trace_add(card, 1, trace_graph(1, 0), 1u << 20);
+    ggml_cuda_ka_trace_add(card, 2, trace_graph(4, 1), 1u << 20);
+    ggml_cuda_ka_trace_add(card, 3, trace_graph(5, 1), 1u << 20);
+    const ggml_cuda_ka_trace_diff d = ggml_cuda_ka_trace_add(card, 4, trace_graph(1, 1), 1u << 20);
+    CHECK(d.near_key == 1 && d.n_diff == 1);
+
+    ggml_cuda_ka_trace_rec a;
+    a.n_nodes = 1;
+    trace_node(a, 0, GGML_OP_ADD, 8, 1, 1);
+    a.end();
+    ggml_cuda_ka_trace_rec b;
+    b.n_nodes = 1;
+    trace_node(b, 0, GGML_OP_MUL, 8, 1, 1);
+    b.end();
+    ggml_cuda_ka_trace_card c2;
+    ggml_cuda_ka_trace_add(c2, 10, std::move(a), 1u << 20);
+    const ggml_cuda_ka_trace_diff e = ggml_cuda_ka_trace_add(c2, 11, std::move(b), 1u << 20);
+    CHECK(e.n_diff == 1 && e.nodes.size() == 1 && e.nodes[0].field_known);
+    CHECK(ggml_cuda_ka_trace_line(e, 1, trace_describe).find("op and type ADD/f32 -> MUL/f32") != std::string::npos);
+}
+
+// past the budget the oldest keys keep only their hashes: still the nearest, with the node but not the field
+static void test_trace_budget() {
+    ggml_cuda_ka_trace_card card;
+    const size_t one = [] {
+        ggml_cuda_ka_trace_card c;
+        ggml_cuda_ka_trace_add(c, 1, trace_graph(1, 0), SIZE_MAX);
+        return c.field_bytes;
+    }();
+    ggml_cuda_ka_trace_add(card, 1, trace_graph(1, 0), one + one/2);
+    CHECK(card.entries.back().has_fields() && card.field_bytes == one);
+    ggml_cuda_ka_trace_add(card, 2, trace_graph(4, 0), one + one/2);
+    CHECK(!card.entries.front().has_fields() && card.entries.back().has_fields() && card.field_bytes == one);
+    const ggml_cuda_ka_trace_diff d = ggml_cuda_ka_trace_add(card, 3, trace_graph(1, 2), one + one/2);
+    CHECK(d.near_key == 1 && !d.near_fields && d.n_diff == 1 && d.nodes.size() == 1 && !d.nodes[0].field_known);
+    CHECK(d.nodes[0].index_now == 3);
+    CHECK(ggml_cuda_ka_trace_line(d, 3, trace_describe).find("no longer kept") != std::string::npos);
+    CHECK(card.field_bytes <= one + one/2 && card.entries.back().has_fields());
+    // at most max_keys keys a card
+    for (uint64_t k = 10; k < 20; ++k) {
+        ggml_cuda_ka_trace_add(card, k, trace_graph((int64_t) k, 0), SIZE_MAX, 4);
+    }
+    CHECK(card.entries.size() == 4 && card.entries.front().key == 16 && card.n_new == 13);
+}
+
 int main(int argc, char ** argv) {
     if (argc > 1 && strcmp(argv[1], "gpu") == 0) {
         return test_gpu();
@@ -1103,6 +1275,10 @@ int main(int argc, char ** argv) {
     test_held_stop();
     test_held_chunk();
     test_held_threads();
+    test_trace_parse();
+    test_trace_first_field();
+    test_trace_nearest();
+    test_trace_budget();
     printf("test-cuda-keepalive: %d checks, %d failed\n", n_checks, n_fail);
     return n_fail == 0 ? 0 : 1;
 }
