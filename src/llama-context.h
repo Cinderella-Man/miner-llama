@@ -434,6 +434,9 @@ public:
 
     int32_t pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t n_chunk_tokens);
     int32_t pipe_n_slots() const { return (int32_t) pipe_slots.size(); }
+    // C901: the pipe slots' re-plans in submitted steps since the context was created, after no change of device and
+    // after one, and the plans over the whole memory LLAMA_PIPE_SLOT_PLAN=1 made after them (llama_pipe_replans)
+    void pipe_replans(int32_t * n_same, int32_t * n_dev, int32_t * n_plans) const;
     int32_t pipe_submit(int32_t i_slot, const llama_token * tokens, int32_t n_tokens, llama_pos pos, llama_seq_id seq_id);
     int32_t pipe_submit_fed(int32_t i_slot, int32_t i_slot_src, llama_pos pos, llama_seq_id seq_id);
     float * pipe_get_logits(int32_t i_slot);
@@ -481,6 +484,9 @@ private:
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
+
+    // C901: the realloc callback of a pipe slot's scheduler (user_data: the slot), counts its re-plans
+    static void pipe_slot_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -606,6 +612,12 @@ private:
     // graph size is the same as the previously scheduled one (unexpected) or different
     int32_t n_reallocs_same = 0;
     int32_t n_reallocs_diff = 0;
+
+    // C901: the pipe slots' re-plans in submitted steps (pipe_slot_realloc; the counts above leave them out), after no
+    // change of device and after one, and the plans over the whole memory that LLAMA_PIPE_SLOT_PLAN=1 made after them
+    int32_t n_pipe_reallocs_same = 0;
+    int32_t n_pipe_reallocs_dev  = 0;
+    int32_t n_pipe_plans_full    = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
@@ -765,7 +777,21 @@ private:
         bool                    live = false;
         llama_seq_id            seq  = -1;
         llama_pos               pos  = -1; // of its first token
+
+        // C901: the context (for pipe_slot_realloc's counts), whether the slot's scheduler re-planned since the flag
+        // was cleared and whether that re-plan followed a change of device, and LLAMA_PIPE_SLOT_PLAN=1 given up for
+        // this slot (its plan over the whole memory did not hold the step's graph)
+        llama_context *         owner         = nullptr;
+        bool                    replanned     = false;
+        bool                    replanned_dev = false;
+        bool                    plan_full_off = false;
     };
+
+    // C901 (LLAMA_PIPE_SLOT_PLAN=1): after a re-plan of slot i_slot's scheduler in a step, plans its compute buffers
+    // again over the whole memory for that step's samplers, then builds and allocates the step's graph (gparams) again
+    // on that plan; returns the step's graph, or nullptr if it could not be allocated
+    ggml_cgraph * pipe_slot_plan_full(int32_t i_slot, const llm_graph_params & gparams,
+                                      const std::map<llama_seq_id, llama_sampler *> & samplers);
 
     // before slot i_slot writes seq_id's recurrent state for pos: saves the state a rollback may still need if the
     // slot's state group holds it (see llama_memory_recurrent::pipe_stash)

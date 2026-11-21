@@ -1322,6 +1322,15 @@ struct server_slot {
                 "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
                 llama_perf_context(ctx_tgt).n_reallocs_same, llama_perf_context(ctx_tgt).n_reallocs_diff);
 
+        // C901: the pipe slots' re-plans, which the count above leaves out (only with pipe slots)
+        if (llama_pipe_n_slots(ctx_tgt) > 0) {
+            int32_t n_same = 0, n_dev = 0, n_plans = 0;
+            llama_pipe_replans(ctx_tgt, &n_same, &n_dev, &n_plans);
+            SLT_INF(*this,
+                    "   pipe reallocs = %10d    / %5d        (same devices) / (changed devices), %d plans over the whole memory\n",
+                    n_same, n_dev, n_plans);
+        }
+
         {
             const std::string ka = server_keepalive_counts();
             if (!ka.empty()) {

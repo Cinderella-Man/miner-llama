@@ -1147,6 +1147,12 @@ extern "C" {
     // Number of slots set by llama_pipe_init (0 before)
     LLAMA_API int32_t llama_pipe_n_slots(const struct llama_context * ctx);
 
+    // The slots' re-plans of their compute buffers in submitted evaluations since the context was created: after no
+    // change of device (n_same) and after one (n_dev), and the plans over the whole memory that LLAMA_PIPE_SLOT_PLAN=1
+    // made after them (n_plans). The context's own count (llama_perf_context's n_reallocs_*) leaves them out. Any
+    // pointer may be NULL
+    LLAMA_API void llama_pipe_replans(const struct llama_context * ctx, int32_t * n_same, int32_t * n_dev, int32_t * n_plans);
+
     // Returns 0 on success, 1 if no memory slot was found, < 0 on error
     LLAMA_API int32_t llama_pipe_submit(
             struct llama_context * ctx,
