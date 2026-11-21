@@ -186,12 +186,13 @@ static void unit_cuts() {
     }
 
     // fixed calls with llama-server's in-call cuts (n_ubatch 512, head and tail): the v5 preset's short=1400:64 on
-    // C222's 577-, 583- and 1,534-token calls, and "on" on a 3,000-token call, without and with cuts=1
+    // C222's 577- and 583-token calls, short=2048:64 on its 1,534-token call, and "on" on a 3,000-token call, without
+    // and with cuts=1
     struct ccase { const char * spec; uint32_t n; const char * want_old; const char * want_new; };
     const ccase cases[] = {
         { "short=1400:64",  577, "61 3 64x7 61 4",        "61 64x8 4" },
         { "short=1400:64",  583, "64 3 61 64x6 67 4",     "67 64x8 4" },
-        { "short=1400:64", 1534, "64x15 58 6 64x7 58 4",  "64x15 58 64x8 4" },
+        { "short=2048:64", 1534, "64x15 58 6 64x7 58 4",  "64x15 58 64x8 4" },
         { "short=1400:64",  610, "64 30 34 64x7 30 4",    "64 30 64x8 4" },
         { "short=1400:64",  516, "64x8 4",                "64x8 4" },
         { "short=1400:64",  520, "4 60 64x6 68 4",        "4 64x8 4" },
