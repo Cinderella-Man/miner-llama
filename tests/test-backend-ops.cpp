@@ -15801,6 +15801,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1},  113, 1, true,  true,  0,    0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1},  256, 1, true,  false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
 
+    // head size 256 with 2 KV heads of 8 query heads each (Qwen3.5/3.6 full attention), 1-4 query rows (decode, MTP
+    // verify) and a prompt batch, Q8_0 and F16 K/V: on compute 6.1 the Pascal tile kernel takes these, its Q8_0 decode
+    // kernel 1-4 rows and its dp4a K scores the batch when GGML_CUDA_FATTN_TILE_PASCAL_MIN=1,
+    // GGML_CUDA_FATTN_DEC_PASCAL=4 and GGML_CUDA_FATTN_TILE_PASCAL_KDP=1 are set (GGML_CUDA_FATTN_TILE_PASCAL_LDS=1 for
+    // the Q8_0 loads decoded at store)
+    for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+        for (int64_t kv : { 512, 4096 }) {
+            for (int64_t nb : { 1, 2, 3, 4, 128 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                type_KV, type_KV, {0, 2, 1, 3}));
+            }
+        }
+    }
+
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
