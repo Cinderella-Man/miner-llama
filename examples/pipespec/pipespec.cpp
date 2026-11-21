@@ -14,7 +14,7 @@
 // as key=value pairs that override the flags (keys: name mode guess depth copy_min miss oracle prompt n spec probe chat
 // out state_out trace; oracle=@<name> replays the tokens of an earlier job in the list). Each job prints one PIPESPEC line.
 //
-//   --pipe-mode plain|pipe  plain decoding with llama_decode, one token per call (the reference), or pipelined decoding
+//   --pipe-mode plain|pipe  plain decoding with llama_process, one token per call (the reference), or pipelined decoding
 //   --pipe-depth D          guesses in flight (0 = the pipe API without guesses)
 //   --pipe-guess G          none
 //                           copy: the token after the longest earlier match of the history's suffix, if that match is
@@ -37,7 +37,7 @@
 //   --pipe-prompt FILE      prompt file (default: -p / -f)
 //   --pipe-chat             wrap the prompt as one user message with the model's chat template
 //   --pipe-out FILE         one line per generated token: index, token id, FNV-1a hash of the logits it was sampled from
-//   --pipe-probe N          after generation, decode N more tokens with llama_decode; their logits hash checks every KV
+//   --pipe-probe N          after generation, decode N more tokens with llama_process; their logits hash checks every KV
 //                           cell that is still visible
 //   --pipe-state-out FILE   the sequence's KV state (llama_state_seq_get_data) after generation
 //   --pipe-jsonl FILE       append {id, category, prompt_tokens, gen_tokens} (bench/ngram_replay's transcript format, for
@@ -90,6 +90,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "llama-cpp.h"
 #include "ngram-map.h"
 #include "pipe-store.h"
 #include "speculative.h"
@@ -543,14 +544,12 @@ struct job_result {
     std::vector<uint64_t>    hashes; // logits hash of each sampled token
 };
 
-// one token of one sequence through llama_decode
+// one token of one sequence through llama_process, with its logits
 static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos, llama_seq_id seq) {
-    int32_t        n_seq   = 1;
-    llama_seq_id   sid     = seq;
-    llama_seq_id * sids[1] = { &sid };
-    int8_t         out     = 1;
-    const llama_batch b = { 1, &tok, nullptr, &pos, &n_seq, sids, &out };
-    return llama_decode(ctx, b) == 0;
+    llama_batch_ext_ptr b(llama_batch_ext_init(ctx));
+    const int32_t idx = llama_batch_ext_add_token(b.get(), seq, tok);
+    return idx >= 0 && llama_batch_ext_set_pos(b.get(), idx, &pos) && llama_batch_ext_set_output_logits(b.get(), idx, true) &&
+           llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0;
 }
 
 // one device sampler chain per sequence (seeds[i] for sequence i); the other sequences get none
@@ -664,29 +663,31 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
         return false;
     }
 
-    // prompt: identical in both modes
+    // prompt: identical in both modes, in calls of job.chunk tokens (n_batch without one), logits for the last token
     {
-        llama_batch batch = llama_batch_init(n_prompt, 0, 1);
-        for (int i = 0; i < n_prompt; i++) {
-            batch.token[i]     = inp[i];
-            batch.pos[i]       = i;
-            batch.n_seq_id[i]  = 1;
-            batch.seq_id[i][0] = seq;
-            batch.logits[i]    = i == n_prompt - 1;
-        }
-        batch.n_tokens = n_prompt;
         backend_pos(seq, n_prompt - 1);
         const int step = job.chunk > 0 ? job.chunk : (int) llama_n_batch(ctx);
+        llama_batch_ext_ptr batch(llama_batch_ext_init(ctx));
         for (int i0 = 0; i0 < n_prompt; i0 += step) {
             const int n = std::min(step, n_prompt - i0);
-            llama_batch view = { n, batch.token + i0, nullptr, batch.pos + i0, batch.n_seq_id + i0, batch.seq_id + i0, batch.logits + i0 };
-            if (llama_decode(ctx, view) != 0) {
+            llama_batch_ext_clear(batch.get());
+            bool filled = true;
+            for (int i = i0; i < i0 + n && filled; i++) {
+                const llama_pos pos = i;
+                const int32_t   idx = llama_batch_ext_add_token(batch.get(), seq, inp[i]);
+                filled = idx >= 0 && llama_batch_ext_set_pos(batch.get(), idx, &pos) &&
+                         llama_batch_ext_set_output_logits(batch.get(), idx, i == n_prompt - 1);
+            }
+            if (!filled) {
+                LOG_ERR("%s: a prompt call of %d tokens does not fit a batch of n_batch %u\n", __func__, n,
+                        llama_n_batch(ctx));
+                return false;
+            }
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
                 LOG_ERR("%s: prompt decode failed\n", __func__);
-                llama_batch_free(batch);
                 return false;
             }
         }
-        llama_batch_free(batch);
     }
 
     // one sampler per raced sample, seeds seed, seed + 1, ...
@@ -723,7 +724,7 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
     struct trace_row { int64_t t_us; int inflight; char outcome; };
     std::vector<trace_row> trace;
 
-    // the prompt's last evaluations may still run on the cards (llama_decode returns before they finish): wait for them
+    // the prompt's last evaluations may still run on the cards (llama_process returns before they finish): wait for them
     // here, so that the generation time starts at the prompt's end and not at a varying point inside it
     llama_synchronize(ctx);
 
@@ -793,7 +794,7 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
         }
 
         if (job.mode == "plain") {
-            // round robin, one token of one sample per llama_decode
+            // round robin, one token of one sample per llama_process call
             while (race_winner < 0) {
                 for (int s = 0; s < n_race && race_winner < 0; s++) {
                     const llama_pos pos = n_prompt + (llama_pos) rgen[s].size() - 1;
@@ -1357,7 +1358,7 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
 // (job.prompts, cycled), sampler and seed (seed + c). Work items, in submission order:
 //   - a conversation's next token, submitted the moment its previous token is sampled (first);
 //   - prompt chunks of job.chunk tokens on the shared chunk slots (a new prompt joins the pipeline instead of draining
-//     it through llama_decode), prompts in order of arrival, up to job.chunks in flight (job.chunks_gen while a
+//     it through llama_process), prompts in order of arrival, up to job.chunks in flight (job.chunks_gen while a
 //     conversation generates), several of one prompt: each card runs a prompt's chunks in submission order;
 //   - guesses (job.guess, up to job.depth per conversation), only while fewer than job.budget items are in flight:
 //     copy-lookup guesses of any conversation before the other kinds.

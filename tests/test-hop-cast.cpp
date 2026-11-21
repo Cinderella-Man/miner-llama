@@ -22,6 +22,7 @@
 // Exit status 0 when every check passes.
 
 #include "llama.h"
+#include "llama-cpp.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -469,19 +470,21 @@ static bool run_sequence(llama_model * model, const run_opts & o, probe * p, std
     }
 
     logits.clear();
-    llama_batch batch = llama_batch_init(std::max(o.n_prompt, o.n_verify), 0, 1);
+    llama_batch_ext_ptr batch(llama_batch_ext_init(ctx)); // holds up to n_batch entries
     int pos = 0;
     auto eval = [&](int n) -> bool {
-        batch.n_tokens = n;
+        llama_batch_ext_clear(batch.get());
         for (int i = 0; i < n; ++i) {
-            batch.token[i]     = tokens[pos + i];
-            batch.pos[i]       = pos + i;
-            batch.n_seq_id[i]  = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i]    = 1;
+            const llama_pos p   = pos + i;
+            const int32_t   idx = llama_batch_ext_add_token(batch.get(), 0, tokens[pos + i]);
+            if (idx < 0 || !llama_batch_ext_set_pos(batch.get(), idx, &p) ||
+                    !llama_batch_ext_set_output_logits(batch.get(), idx, true)) {
+                fprintf(stderr, "cannot add position %d to the batch (n_batch %u)\n", pos + i, llama_n_batch(ctx));
+                return false;
+            }
         }
-        if (llama_decode(ctx, batch) != 0) {
-            fprintf(stderr, "llama_decode failed at position %d\n", pos);
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            fprintf(stderr, "llama_process failed at position %d\n", pos);
             return false;
         }
         for (int i = 0; i < n; ++i) {
@@ -495,7 +498,7 @@ static bool run_sequence(llama_model * model, const run_opts & o, probe * p, std
     for (int s = 0; ok && s < o.n_steps; ++s) {
         ok = eval(1);
     }
-    llama_batch_free(batch);
+    batch.reset();
     llama_free(ctx);
     return ok;
 }

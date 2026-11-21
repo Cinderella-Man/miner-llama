@@ -14,6 +14,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "llama.h"
+#include "llama-cpp.h"
 
 #include <algorithm>
 #include <clocale>
@@ -35,19 +36,19 @@ struct check_stats {
     int64_t diverged       = 0; // prompts whose greedy or sampled tokens differ
 };
 
+// toks at positions pos0, pos0 + 1, ... of sequence 0 in one call (at most n_batch of them), logits for the last
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & toks, llama_pos pos0) {
-    llama_batch batch = llama_batch_init((int32_t) toks.size(), 0, 1);
+    llama_batch_ext_ptr batch(llama_batch_ext_init(ctx));
     for (size_t i = 0; i < toks.size(); ++i) {
-        batch.token[i]     = toks[i];
-        batch.pos[i]       = pos0 + (llama_pos) i;
-        batch.n_seq_id[i]  = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i]    = i + 1 == toks.size();
+        const llama_pos pos = pos0 + (llama_pos) i;
+        const int32_t   idx = llama_batch_ext_add_token(batch.get(), 0, toks[i]);
+        if (idx < 0 || !llama_batch_ext_set_pos(batch.get(), idx, &pos) ||
+                !llama_batch_ext_set_output_logits(batch.get(), idx, i + 1 == toks.size())) {
+            LOG_ERR("%s: %zu tokens do not fit a batch of n_batch %u\n", __func__, toks.size(), llama_n_batch(ctx));
+            return false;
+        }
     }
-    batch.n_tokens = (int32_t) toks.size();
-    const bool ok = llama_decode(ctx, batch) == 0;
-    llama_batch_free(batch);
-    return ok;
+    return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
 }
 
 static llama_token argmax(const float * v, int n) {

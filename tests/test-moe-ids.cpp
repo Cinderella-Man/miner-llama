@@ -8,6 +8,7 @@
 // on any failure.
 
 #include "llama.h"
+#include "llama-cpp.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -147,25 +148,25 @@ int main(int argc, char ** argv) {
                 const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
                 std::mt19937 rng(238);
                 std::uniform_int_distribution<int> tok(1, n_vocab - 1);
-                llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+                llama_batch_ext_ptr batch(llama_batch_ext_init(ctx)); // holds up to n_batch = n_prompt entries
                 int pos = 0;
                 auto eval = [&](int n) {
-                    batch.n_tokens = n;
+                    llama_batch_ext_clear(batch.get());
+                    bool filled = true;
                     for (int i = 0; i < n; ++i) {
-                        batch.token[i]     = tok(rng);
-                        batch.pos[i]       = pos + i;
-                        batch.n_seq_id[i]  = 1;
-                        batch.seq_id[i][0] = 0;
-                        batch.logits[i]    = i == n - 1;
+                        const llama_pos p   = pos + i;
+                        const int32_t   idx = llama_batch_ext_add_token(batch.get(), 0, tok(rng));
+                        filled = filled && idx >= 0 && llama_batch_ext_set_pos(batch.get(), idx, &p) &&
+                                 llama_batch_ext_set_output_logits(batch.get(), idx, i == n - 1);
                     }
                     pos += n;
-                    return llama_decode(ctx, batch) == 0;
+                    return filled && llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
                 };
                 expect(eval(n_prompt), "the prompt decodes");
                 for (int s = 0; s < n_steps; ++s) {
                     expect(eval(1), "a single token decodes");
                 }
-                llama_batch_free(batch);
+                batch.reset();
                 llama_free(ctx);
 
                 printf("test-moe-ids: %lld MUL_MAT_ID nodes, %lld token columns, %lld with a repeated id, %lld ids out of range\n",

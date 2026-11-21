@@ -1,10 +1,10 @@
 // Checks the rollbacks of pipelined decoding that the executors' slot rotation rarely or never produces, on any model
 // (meant for the recurrent state groups of hybrid models, llama_memory_recurrent::n_grp): greedy decoding of -n tokens
-// after the prompt -p, once with llama_decode one token at a time, once through three pipe slots with
+// after the prompt -p, once with llama_process one token at a time, once through three pipe slots with
 //   - every third token submitted to the slot of the token before it, so the state before it moves to the stash;
 //   - every fourth token followed by a wrong guess, dropped again with llama_memory_seq_rm;
 //   - the token in flight dropped as llama-server's pipe_leave does (llama_memory_seq_rm from its position), then
-//     submitted again through another slot, or decoded with llama_decode, at steps 0, 4, 9 and 6 of every 12.
+//     submitted again through another slot, or decoded with llama_process, at steps 0, 4, 9 and 6 of every 12.
 // Both runs must give the same tokens, the same logits for every token (FNV-1a hashes), the same sequence state
 // (llama_state_seq_get_data) and the same logits for four probe tokens decoded afterwards. Exit status 0 when they do.
 //
@@ -14,6 +14,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "llama-cpp.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -30,13 +31,12 @@ static uint64_t fnv1a(const void * data, size_t n) {
     return h;
 }
 
+// one token of sequence 0 at pos, with its logits
 static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
-    int32_t        n_seq   = 1;
-    llama_seq_id   sid     = 0;
-    llama_seq_id * sids[1] = { &sid };
-    int8_t         out     = 1;
-    const llama_batch b = { 1, &tok, nullptr, &pos, &n_seq, sids, &out };
-    return llama_decode(ctx, b) == 0;
+    llama_batch_ext_ptr b(llama_batch_ext_init(ctx));
+    const int32_t idx = llama_batch_ext_add_token(b.get(), 0, tok);
+    return idx >= 0 && llama_batch_ext_set_pos(b.get(), idx, &pos) && llama_batch_ext_set_output_logits(b.get(), idx, true) &&
+           llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0;
 }
 
 static llama_token argmax(const std::vector<float> & logits) {
@@ -86,20 +86,22 @@ int main(int argc, char ** argv) {
         std::copy(p, p + n_vocab, logits.begin());
     };
 
-    // the prompt with llama_decode, from an empty memory; leaves the last position's logits in `logits`
+    // the prompt with llama_process in one call (at most n_batch tokens), from an empty memory; leaves the last
+    // position's logits in `logits`
     auto prompt = [&]() -> bool {
         llama_memory_clear(mem, true);
-        llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+        llama_batch_ext_ptr batch(llama_batch_ext_init(ctx));
         for (int i = 0; i < n_prompt; i++) {
-            batch.token[i]     = inp[i];
-            batch.pos[i]       = i;
-            batch.n_seq_id[i]  = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i]    = i == n_prompt - 1;
+            const llama_pos pos = i;
+            const int32_t   idx = llama_batch_ext_add_token(batch.get(), 0, inp[i]);
+            if (idx < 0 || !llama_batch_ext_set_pos(batch.get(), idx, &pos) ||
+                    !llama_batch_ext_set_output_logits(batch.get(), idx, i == n_prompt - 1)) {
+                LOG_ERR("%s: the prompt (%d tokens) does not fit a batch of n_batch %u\n", __func__, n_prompt,
+                        llama_n_batch(ctx));
+                return false;
+            }
         }
-        batch.n_tokens = n_prompt;
-        const bool ok = llama_decode(ctx, batch) == 0;
-        llama_batch_free(batch);
+        const bool ok = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
         if (ok) {
             take(llama_get_logits_ith(ctx, -1));
         }
@@ -158,7 +160,7 @@ int main(int argc, char ** argv) {
     if (!prompt()) {
         return fail("prompt decode failed", -1);
     }
-    int prev = 0; // the slot whose state group holds the newest state (llama_decode writes group 0)
+    int prev = 0; // the slot whose state group holds the newest state (a plain decode writes group 0)
     int n_inplace = 0, n_guess = 0, n_leave_pipe = 0, n_leave_decode = 0;
     for (int i = 0; i < n_gen; i++) {
         const llama_token tok = argmax(logits);
@@ -201,7 +203,7 @@ int main(int argc, char ** argv) {
             } else {
                 n_leave_decode++;
                 if (!decode_one(ctx, tok, pos)) {
-                    return fail("llama_decode after dropping failed", i);
+                    return fail("llama_process after dropping failed", i);
                 }
                 take(llama_get_logits_ith(ctx, -1));
                 prev = 0;
