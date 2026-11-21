@@ -1734,7 +1734,8 @@ static bool llama_file_is_nextn_only(const llama_model_loader & ml, uint32_t il_
 static bool llama_tensor_copy_bounded(const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
-    if (src_buf == nullptr || dst_buf == nullptr || !ggml_are_same_layout(src, dst) || !ggml_is_contiguous(src)) {
+    if (src_buf == nullptr || dst_buf == nullptr || src->type != dst->type || !ggml_are_same_shape(src, dst) ||
+            !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
         return false;
     }
     const size_t nbytes = ggml_nbytes(src);
