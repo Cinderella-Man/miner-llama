@@ -135,7 +135,8 @@ static bool pipe_grammar_on() {
 
 // LLAMA_PIPE_MEDIA: the pipe and in-call checkpoints with a projector loaded (--mmproj). Unset, empty or 0 keeps both
 // off whenever one is loaded, as before. 1 checks the media chunks instead (server_tokens::has_mtmd only says a projector
-// is loaded): text prompts get both
+// is loaded): text prompts get both. 2 also runs the pipe with media in the cache, where an image takes more cells than
+// positions under M-RoPE, and in-call checkpoints refuse only media still to decode
 static int pipe_media_mode() {
     static const int mode = [] {
         const char * e = getenv("LLAMA_PIPE_MEDIA");
@@ -5608,7 +5609,7 @@ private:
     // launches the row of the token just submitted at pos when it is the walk's next one; its
     // guess is collected when the next guess is needed, after the device has worked on it alongside the pipe
     void pm_ahead(server_slot & slot, llama_token tok, llama_pos pos) {
-        if (slot.pm_pos < 0 || slot.pm_pend >= 0 || pos + 2 >= slot.n_ctx) {
+        if (slot.pm_pos < 0 || slot.pm_pend >= 0 || pos + 2 + pipe_cells_extra(slot) >= slot.n_ctx) {
             return;
         }
         if (pos != (slot.pm_walk < 0 ? slot.pm_pos : slot.pm_walk + 1)) {
@@ -5708,19 +5709,27 @@ private:
         slot.pm_walk = -1;
     }
 
+    // the cells of the context past the positions: with M-RoPE an image in the cache takes more cells than positions,
+    // and the pipe counts in positions; 0 without media
+    static llama_pos pipe_cells_extra(const server_slot & slot) {
+        return std::max<llama_pos>(0, (llama_pos) slot.prompt.n_tokens() - slot.prompt.tokens.pos_next());
+    }
+
     // the pipe with a projector loaded (LLAMA_PIPE_MEDIA)
     static bool pipe_media_ok(const server_slot & slot) {
         switch (pipe_media_mode()) {
             case 0:  return slot.mctx == nullptr;
-            default: return !slot.prompt.tokens.has_media_from(0);
+            case 1:  return !slot.prompt.tokens.has_media_from(0);
+            default: return true;
         }
     }
 
-    // in-call checkpoints for a prompt (LLAMA_PIPE_MEDIA)
-    static bool incall_media_ok(const server_tokens & input) {
+    // in-call checkpoints for a prompt whose first n_past tokens are in the cache (LLAMA_PIPE_MEDIA)
+    static bool incall_media_ok(const server_tokens & input, const size_t n_past) {
         switch (pipe_media_mode()) {
             case 0:  return !input.has_mtmd;
-            default: return !input.has_media_from(0);
+            case 1:  return !input.has_media_from(0);
+            default: return !input.has_media_from(n_past);
         }
     }
 
@@ -5746,7 +5755,7 @@ private:
                 return false;
             }
             // a rejection left the pipe: back in only once batched decoding has decoded the rejected token's position
-            if (slot.pipe_gram_hold >= 0 && slot.prompt.n_tokens() <= slot.pipe_gram_hold) {
+            if (slot.pipe_gram_hold >= 0 && slot.prompt.tokens.pos_next() <= slot.pipe_gram_hold) {
                 return false;
             }
         }
@@ -5811,7 +5820,7 @@ private:
     // after a submission: the drafter starts on the next position at once (unless the copy lookup has it), so that its
     // guess is ready when a pipe slot opens
     void pipe_draft_ahead(server_slot & slot) {
-        if (!pipe_drafts(slot) || slot.pipe_win.empty() || slot.pipe_win.back().pos + 2 >= slot.n_ctx) {
+        if (!pipe_drafts(slot) || slot.pipe_win.empty() || slot.pipe_win.back().pos + 2 + pipe_cells_extra(slot) >= slot.n_ctx) {
             return;
         }
         // a look ahead: a store guess found here is counted when it is made
@@ -5853,7 +5862,7 @@ private:
     void pipe_top_up(server_slot & slot) {
         while ((int32_t) slot.pipe_win.size() < params_base.pipe_depth + 1) {
             const llama_pos pos = slot.pipe_win.back().pos + 1;
-            if (pos + 1 >= slot.n_ctx) {
+            if (pos + 1 + pipe_cells_extra(slot) >= slot.n_ctx) {
                 break;
             }
             // tokens beyond the limit would never be sampled
@@ -7142,7 +7151,7 @@ private:
                     // part is the call that would have followed without the switch, joined only where it fits whole, and
                     // the decode call cuts its micro-batches where those calls end, so every number stays the same
                     const bool do_checkpoint_all = do_checkpoint;
-                    const bool incall_slot = n_tokens_prev == 0 && do_checkpoint_all && incall_media_ok(input_tokens) && !prefix_break &&
+                    const bool incall_slot = n_tokens_prev == 0 && do_checkpoint_all && incall_media_ok(input_tokens, slot.prompt.n_tokens()) && !prefix_break &&
                             !wait_shared && alora_scale <= 0.0f && slot.task->decision.order.empty() && !use_mixed_batch();
                     for (int part = 0; ; ++part) {
                         do_checkpoint = do_checkpoint_all;
