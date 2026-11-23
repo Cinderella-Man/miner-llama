@@ -25,6 +25,13 @@
 // GGML_CUDA_FATTN_TILE_PASCAL_MIN: fewest query tokens it takes (default 9 with F16 K/V, 3 with Q8_0 K/V).
 // GGML_CUDA_FATTN_TILE_PASCAL_FAULT (tests of the tests): 1 output x 1.05, 2 sinks dropped, 3 each block's last key
 // tile dropped.
+// GGML_CUDA_FATTN_DEC_PASCAL=N (off by default): Q8_0 K/V at head 256 with up to N query tokens (1-4: decode, the pipe,
+// the MTP verify) go to a decode kernel without block barriers in its key loop: warps on their own 32-key slices, Q as
+// int8, dp4a scores, V in registers. It is only reached from GGML_CUDA_FATTN_TILE_PASCAL_MIN tokens, so set _MIN=1.
+// GGML_CUDA_FATTN_TILE_PASCAL_KDP=1 (off by default): Q8_0 K at head 256 is staged as int8 and scored with dp4a against
+// a Q quantized per 32 dimensions, instead of dequantized to FP32.
+// GGML_CUDA_FATTN_TILE_PASCAL_LDS=1 (off by default): the tile kernel issues Q8_0 K/V loads raw and decodes them when
+// it stores them to shared memory, a chunk later, instead of right after the load. Same arithmetic, same results.
 
 // Whether the kernel takes this FLASH_ATTN_EXT node on this device (the same answer at allocation and compute time).
 bool ggml_cuda_fattn_tile_pascal_supported(int device, const ggml_tensor * dst);
