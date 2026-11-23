@@ -802,7 +802,10 @@ static __global__ void flash_attn_dec_pascal(
     // (2026-11-20 rig: 3.9 ms at 104k keys, slower than the tile kernel). The next batch is loaded into nx while the
     // current one (cu) is used, then copied over.
     fdp_piece cu[FDP_KB], nx[FDP_KB];
-    uint4 mcu = make_uint4(0, 0, 0, 0), mnx = make_uint4(0, 0, 0, 0); // the mask of a batch's 8 keys
+    // the mask of a batch's FDP_KB keys, read as one 8-byte vector: k0 is a multiple of 32 keys and a batch starts
+    // FDP_KB keys further, so each read is 8-byte aligned and stays inside the warp's 32-key slice
+    static_assert(FDP_KB*sizeof(half) == sizeof(uint2), "the mask of a batch is one uint2");
+    uint2 mcu = make_uint2(0, 0), mnx = make_uint2(0, 0);
     const int q4 = lane % 4; // the lane's share of its head's keys in the softmax: keys q4, q4 + 4, ...
 
 #pragma unroll 1
@@ -814,7 +817,7 @@ static __global__ void flash_attn_dec_pascal(
         for (int j = 0; j < FDP_KB; ++j) {
             fdp_load(cu[j], K_t + int64_t(j)*nb11, dim0);
         }
-        mcu = *(const uint4 *) (maskh + k0);
+        mcu = *(const uint2 *) (maskh + k0);
 
         // scores of the 32 keys into P_w[k][head], masked
 #pragma unroll 1
@@ -824,14 +827,14 @@ static __global__ void flash_attn_dec_pascal(
                 for (int j = 0; j < FDP_KB; ++j) {
                     fdp_load(nx[j], K_t + int64_t((kb + 1)*FDP_KB + j)*nb11, dim0);
                 }
-                mnx = *(const uint4 *) (maskh + k0 + (kb + 1)*FDP_KB);
+                mnx = *(const uint2 *) (maskh + k0 + (kb + 1)*FDP_KB);
             } else {
 #pragma unroll
                 for (int j = 0; j < FDP_KB; ++j) {
                     fdp_load(nx[j], V_t + int64_t(j)*nb21, dim0);
                 }
             }
-            const unsigned mw[4] = {mcu.x, mcu.y, mcu.z, mcu.w}; // no address of mcu: that put it on the stack
+            const unsigned mw[2] = {mcu.x, mcu.y}; // no address of mcu: that put it on the stack
 #pragma unroll
             for (int j = 0; j < FDP_KB; ++j) {
                 float v[NH];
@@ -1181,7 +1184,7 @@ bool ggml_cuda_flash_attn_ext_tile_pascal(ggml_backend_cuda_context & ctx, ggml_
     const ggml_tensor * K = dst->src[1];
     const bool q8_0 = K->type == GGML_TYPE_Q8_0;
 
-    // the one-token decode kernel (GGML_CUDA_FATTN_DEC_PASCAL); the mask is read as 16-byte vectors of 8 keys
+    // the one-token decode kernel (GGML_CUDA_FATTN_DEC_PASCAL); the mask is read as 8-byte vectors of 4 keys
     {
         const ggml_tensor * Q    = dst->src[0];
         const ggml_tensor * mask = dst->src[3];
