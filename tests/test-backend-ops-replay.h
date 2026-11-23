@@ -24,6 +24,10 @@
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifdef _WIN32
+#include <direct.h>
+#define mkdir(p, m) _mkdir(p)
+#endif
 
 // MD5 (RFC 1321)
 struct tbo_md5 {
