@@ -784,6 +784,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+    // the compute-6.1 tile kernel shares K/V over the GQA group, the vector kernel reads them once per Q head; it takes
+    // the call only from GGML_CUDA_FATTN_TILE_PASCAL_MIN tokens (default 3 for Q8_0, 9 for F16), so by default this
+    // changes nothing
+    if (ggml_cuda_fattn_tile_pascal_supported(device, dst)) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
+
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
