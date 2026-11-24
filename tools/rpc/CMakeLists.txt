@@ -13,6 +13,16 @@ if (LLAMA_BUILD_TESTS AND UNIX AND NOT GGML_BACKEND_DL)
             $<TARGET_FILE:ggml-rpc-server>
             $<TARGET_FILE:test-rpc-multi-server>)
     set_property(TEST test-rpc-multi-server PROPERTY LABELS main)
+    # a graph cached on a server, reused after another buffer there was freed (the script's second server is unused)
+    add_executable(test-rpc-graph-cache ${PROJECT_SOURCE_DIR}/tests/test-rpc-graph-cache.cpp)
+    target_link_libraries(test-rpc-graph-cache PRIVATE ggml ggml-rpc)
+    target_include_directories(test-rpc-graph-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    add_test(
+        NAME test-rpc-graph-cache
+        COMMAND bash ${PROJECT_SOURCE_DIR}/tests/test-rpc-multi-server.sh
+            $<TARGET_FILE:ggml-rpc-server>
+            $<TARGET_FILE:test-rpc-graph-cache>)
+    set_property(TEST test-rpc-graph-cache PROPERTY LABELS main)
     add_executable(test-rpc-unreachable ${PROJECT_SOURCE_DIR}/tests/test-rpc-unreachable.cpp)
     target_link_libraries(test-rpc-unreachable PRIVATE ggml ggml-rpc)
     target_include_directories(test-rpc-unreachable PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
