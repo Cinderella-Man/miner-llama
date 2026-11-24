@@ -3713,6 +3713,112 @@ static std::map<llama_seq_id, llama_sampler *> pipe_samplers(const std::map<llam
     return res;
 }
 
+// LLAMA_PIPE_SLOT_PLAN=1 (C901): a pipe slot whose scheduler re-plans its compute buffers in a step (R181: after the
+// first change of device between the load's reserve and a live token, and from then on each time the context outgrows
+// the plan of that moment, the attention mask first) is planned again over the whole memory for that step's samplers,
+// so that later steps fit; unset, empty or 0: the slot keeps the plan of its last re-plan, as before
+static bool llama_pipe_slot_plan_on() {
+    static const bool on = [] {
+        const char * env = getenv("LLAMA_PIPE_SLOT_PLAN");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return on;
+}
+
+void llama_context::pipe_slot_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
+    GGML_UNUSED(sched);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(graph_size_changed);
+
+    auto * slot = static_cast<pipe_slot *>(user_data);
+    slot->replanned      = true;
+    slot->replanned_dev  = backend_ids_changed;
+    if (slot->owner != nullptr) {
+        if (backend_ids_changed) {
+            slot->owner->n_pipe_reallocs_dev++;
+        } else {
+            slot->owner->n_pipe_reallocs_same++;
+        }
+    }
+}
+
+void llama_context::pipe_replans(int32_t * n_same, int32_t * n_dev, int32_t * n_plans) const {
+    if (n_same)  { *n_same  = n_pipe_reallocs_same; }
+    if (n_dev)   { *n_dev   = n_pipe_reallocs_dev;  }
+    if (n_plans) { *n_plans = n_pipe_plans_full;    }
+}
+
+ggml_cgraph * llama_context::pipe_slot_plan_full(int32_t i_slot, const llm_graph_params & gparams,
+                                                 const std::map<llama_seq_id, llama_sampler *> & samplers) {
+    auto & slot = pipe_slots[i_slot];
+    const bool after_dev = slot.replanned_dev;
+    const int64_t t0 = ggml_time_us();
+
+    // the reserve of pipe_init, with the step's samplers: a graph of the slot's token count over the whole memory
+    bool ok = false;
+    int  n_nodes = 0;
+    {
+        llama_memory_context_ptr mctx_full = memory->init_full();
+        if (mctx_full) {
+            const uint32_t n_stream = cparams.kv_unified ? 1 : cparams.n_seq_max;
+
+            const auto save_n_outputs = this->n_outputs;
+            this->n_outputs = n_stream;
+
+            llama_batch_allocr balloc_reserve(model.hparams.n_pos_per_embd());
+            llama_ubatch ubatch = balloc_reserve.ubatch_reserve((slot.n_tokens_max + n_stream - 1)/n_stream, n_stream);
+            ubatch_prepare_reserve(ubatch, n_stream, samplers, cparams.n_outputs_max_per_seq);
+
+            auto gp = graph_params(slot.res.get(), ubatch, mctx_full.get(), ctx_type_to_graph_type(cparams.ctx_type));
+            gp.sched    = slot.sched.get();
+            gp.cb       = graph_get_cb(slot.sched.get());
+            gp.samplers = samplers;
+
+            slot.res->reset();
+            ggml_backend_sched_reset(slot.sched.get());
+
+            ggml_cgraph * gf_full = model.build_graph(gp);
+            n_nodes = gf_full ? ggml_graph_n_nodes(gf_full) : 0;
+            ok = gf_full && ggml_backend_sched_reserve(slot.sched.get(), gf_full);
+
+            // the graph refers to the whole memory's context, which goes now
+            slot.res->reset();
+            this->n_outputs = save_n_outputs;
+        }
+    }
+    if (ok) {
+        n_pipe_plans_full++;
+    }
+
+    // the step's graph again, on the new plan (or, if the plan failed, on a plan of its own as before)
+    slot.res->reset();
+    ggml_backend_sched_reset(slot.sched.get());
+    slot.replanned = false;
+
+    ggml_cgraph * gf = model.build_graph(gparams);
+    if (!gf || !ggml_backend_sched_alloc_graph(slot.sched.get(), gf)) {
+        return nullptr;
+    }
+
+    const bool held = ok && !slot.replanned;
+    if (!held) {
+        // the plan over the whole memory does not hold this step's graph (or could not be made): this slot keeps
+        // re-planning as before, without a plan over the whole memory after each re-plan
+        slot.plan_full_off = true;
+    }
+
+    LLAMA_LOG_WARN("%s: slot %d re-planned%s; planned over the whole memory for the step's samplers: %d nodes, %.3f ms, %s "
+            "(plan %d)\n", __func__, i_slot, after_dev ? " after a change of device" : "", n_nodes,
+            (ggml_time_us() - t0)/1000.0,
+            !ok ? "the plan failed, LLAMA_PIPE_SLOT_PLAN off for this slot" :
+            held ? "the step's graph fits it" :
+                   (slot.replanned_dev ? "the step's graph is on other devices than that plan's, LLAMA_PIPE_SLOT_PLAN off for this slot"
+                                       : "the step's graph does not fit it, LLAMA_PIPE_SLOT_PLAN off for this slot"),
+            n_pipe_plans_full);
+
+    return gf;
+}
+
 int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t n_chunk_tokens) {
     if (!memory || cparams.embeddings || !cparams.causal_attn) {
         LLAMA_LOG_ERROR("%s: pipelined decoding needs a causal decoder context with a memory module\n", __func__);
@@ -3850,6 +3956,9 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
         ggml_backend_sched_set_copy_callback(slot.sched.get(), sched_copy_experts, this);
         ggml_backend_sched_set_caller_sync(slot.sched.get(), true);
         ggml_backend_sched_set_input_upload(slot.sched.get(), pipe_upload);
+        // C901: count the slot's re-plans (the reserve below is not one)
+        slot.owner = this;
+        ggml_backend_sched_set_realloc_callback(slot.sched.get(), pipe_slot_realloc, &slot);
 
         slot.res.reset(new llm_graph_result(max_nodes));
 
@@ -3902,6 +4011,11 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
     for (size_t i = 0; i < backend_ptrs.size(); i++) {
         LLAMA_LOG_INFO("%s: %10s pipe slots' compute buffers = %8.2f MiB\n", __func__,
                 ggml_backend_name(backend_ptrs[i]), size_dev[i]/1024.0/1024.0);
+    }
+
+    if (llama_pipe_slot_plan_on()) {
+        LLAMA_LOG_WARN("%s: LLAMA_PIPE_SLOT_PLAN=1: a slot that re-plans in a step is planned again over the whole memory "
+                "for that step's samplers\n", __func__);
     }
 
     return 0;
@@ -4094,12 +4208,24 @@ int32_t llama_context::pipe_submit_impl(int32_t i_slot, const llama_token * toke
 
         ggml_backend_sched_reset(slot.sched.get());
 
+        slot.replanned = false;
         gf = model.build_graph(gparams);
         if (!gf || !ggml_backend_sched_alloc_graph(slot.sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to build or allocate the graph\n", __func__);
             this->n_outputs = save_n_outputs;
             memory->seq_rm(seq_id, pos, -1);
             return -2;
+        }
+
+        // LLAMA_PIPE_SLOT_PLAN=1 (C901): the allocation re-planned the slot's buffers for this step's graph alone
+        if (slot.replanned && llama_pipe_slot_plan_on() && !slot.plan_full_off) {
+            gf = pipe_slot_plan_full(i_slot, gparams, samplers);
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: failed to build or allocate the graph after the plan over the whole memory\n", __func__);
+                this->n_outputs = save_n_outputs;
+                memory->seq_rm(seq_id, pos, -1);
+                return -2;
+            }
         }
 
         slot.res_valid = true;
@@ -9037,6 +9163,10 @@ int32_t llama_pipe_init_ext(llama_context * ctx, int32_t n_slots, int32_t n_chun
 
 int32_t llama_pipe_n_slots(const llama_context * ctx) {
     return ctx->pipe_n_slots();
+}
+
+void llama_pipe_replans(const llama_context * ctx, int32_t * n_same, int32_t * n_dev, int32_t * n_plans) {
+    ctx->pipe_replans(n_same, n_dev, n_plans);
 }
 
 int32_t llama_pipe_submit(llama_context * ctx, int32_t slot, llama_token token, llama_pos pos, llama_seq_id seq_id) {
