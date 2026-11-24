@@ -177,6 +177,35 @@ bool ggml_cuda_mmq_kq_fp32scale(const int cc, const ggml_type type) {
     return cfg.on[type] && GGML_CUDA_CC_IS_NVIDIA(cc) && (cfg.mode == 2 || (cfg.mode == 1 && cc == GGML_CUDA_CC_DP4A));
 }
 
+// GGML_CUDA_MMQ_J64_I64 (C1024, Q1757): prompt products of 49 or more columns on the DP4A table (the tile config compute 6.1
+// runs) take the J=64 tile, which upstream #31352 (b12674) gave 128 rows instead of 64 for Q1_0, Q2_0, Q4_0, Q4_1, Q5_0,
+// Q5_1, Q8_0, IQ2_XXS, IQ3_XXS, IQ4_NL and IQ4_XS: half as many blocks, and a P106 has 5 SMs to fill. With the switch on,
+// those launches take a second copy of the J=64 kernels built with the 64-row tile (template-instances/mmq-instance-j64i64-*.cu).
+// The switch only picks the launch: with it off every kernel and launch is upstream's.
+// 0 (default) off; 1 compute capability 6.1 only; 2 any NVIDIA GPU whose prompt products take the DP4A table (a compute 6.1
+// build on a newer card, for tests).
+bool ggml_cuda_mmq_j64_i64() {
+    static const int mode = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_J64_I64");
+        const int m = env != nullptr ? atoi(env) : 0;
+        if (m != 0) {
+            GGML_LOG_INFO("%s: GGML_CUDA_MMQ_J64_I64=%d: 64-column prompt tiles keep 64 rows (%s)\n", __func__, m,
+                          m == 2 ? "any NVIDIA GPU on the DP4A table" : "compute 6.1 only");
+        }
+        return m;
+    }();
+    if (mode == 0) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || blackwell_mma_available(cc)) {
+        return false;
+    }
+    const int arch = ggml_cuda_highest_compiled_arch(cc);
+    const bool dp4a_table = arch >= GGML_CUDA_CC_DP4A && arch < GGML_CUDA_CC_VOLTA; // as ggml_cuda_mmq_get_config picks it
+    return dp4a_table && (mode == 2 || (mode == 1 && cc == GGML_CUDA_CC_DP4A));
+}
+
 // overrides the src1 precision requested by the graph, "auto" keeps the requested one
 static ggml_prec ggml_cuda_mmq_get_prec_env() {
     const char * env_c = getenv("GGML_CUDA_MMQ_PREC");

@@ -234,6 +234,27 @@ struct ggml_cuda_mmq_config {
 
 #undef CASE
 
+// GGML_CUDA_MMQ_J64_I64 (Miner Llama, C1024): the types whose J=64 tile on the DP4A table upstream #31352 raised from 64 to
+// 128 rows. The translation units template-instances/mmq-instance-j64i64-*.cu define GGML_CUDA_MMQ_J64_I64_TU and so build
+// these J=64 kernels with 64-row tiles again; ggml_cuda_mmq_j64_i64() (mmq.cu) sends the J=64 launches to them. Every other
+// translation unit reads the table as upstream wrote it.
+static constexpr __host__ __device__ bool ggml_cuda_mmq_j64_i64_type(const ggml_type type) {
+    return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 ||
+        type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ2_XXS ||
+        type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ4_XS;
+}
+
+static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_dp4a(ggml_type type, int J, bool fallback) {
+#ifdef GGML_CUDA_MMQ_J64_I64_TU
+    if (J == 64 && ggml_cuda_mmq_j64_i64_type(type)) {
+        ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
+        config.I = 64;
+        return config;
+    }
+#endif // GGML_CUDA_MMQ_J64_I64_TU
+    return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
+}
+
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_GCN(cc)) {
@@ -267,7 +288,7 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
     }
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A) {
-        return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
+        return ggml_cuda_mmq_get_config_dp4a(type, J, fallback);
     }
     return ggml_cuda_mmq_get_config_pascal_older(type, J, fallback);
 }
@@ -299,7 +320,7 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
 #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
-    return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
+    return ggml_cuda_mmq_get_config_dp4a(type, J, fallback);
 #else
     return ggml_cuda_mmq_get_config_pascal_older(type, J, fallback);
 #endif // BLACKWELL_MMA_AVAILABLE
@@ -1657,6 +1678,30 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          ntj_fd);
 }
 
+// GGML_CUDA_MMQ_J64_I64 (C1024; mmq.cu): true if the J=64 launches of the types ggml_cuda_mmq_j64_i64_type lists take the
+// DP4A table's 64-row tile on the current device.
+bool ggml_cuda_mmq_j64_i64();
+
+// That J=64 launch: defined and instantiated only in template-instances/mmq-instance-j64i64-*.cu, where the J=64 tile of
+// these types has 64 rows (ggml_cuda_mmq_get_config_dp4a). The first launch of each kernel logs the tile it took.
+template <ggml_type type, bool fallback, ggml_prec prec_src1>
+void mul_mat_q_j64_i64(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream)
+#ifdef GGML_CUDA_MMQ_J64_I64_TU
+{
+    static const bool logged = [] {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        GGML_LOG_INFO("%s: GGML_CUDA_MMQ_J64_I64: first launch of %s's J=64 kernel (%s), tile %d x %d\n", __func__,
+            ggml_type_name(type), fallback ? "row check" : "no row check",
+            ggml_cuda_mmq_get_config(type, 64, fallback, cc, prec_src1).I, ggml_cuda_mmq_get_config(type, 64, fallback, cc, prec_src1).J);
+        return true;
+    }();
+    GGML_UNUSED(logged);
+    launch_mul_mat_q<type, 64, fallback, prec_src1, /*has_fusion =*/ false>(ctx, args, stream);
+}
+#else
+;
+#endif // GGML_CUDA_MMQ_J64_I64_TU
+
 template <ggml_type type, bool fallback, ggml_prec prec_src1, bool has_fusion, bool kq_fp32 = false>
 void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.J_best) {
@@ -1682,6 +1727,14 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             launch_mul_mat_q<type,  56, fallback, prec_src1, has_fusion, kq_fp32>(ctx, args, stream);
             break;
         case  64:
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            if constexpr (ggml_cuda_mmq_j64_i64_type(type) && prec_src1 == GGML_PREC_Q8 && !has_fusion && !kq_fp32) {
+                if (ggml_cuda_mmq_j64_i64()) {
+                    mul_mat_q_j64_i64<type, fallback, prec_src1>(ctx, args, stream);
+                    break;
+                }
+            }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             launch_mul_mat_q<type,  64, fallback, prec_src1, has_fusion, kq_fp32>(ctx, args, stream);
             break;
         case  72:
@@ -1758,6 +1811,12 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
 // FP4 variant: uses native FP4 MMA instead of keeping src1 at Q8_1.
 #define DECL_MMQ_CASE_W4A4(type)                                                   \
     template void mul_mat_q_case<type, GGML_PREC_Q4>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
+
+// GGML_CUDA_MMQ_J64_I64 (C1024): the J=64 launches with the DP4A table's 64-row tile, without and with the row check;
+// only in template-instances/mmq-instance-j64i64-*.cu.
+#define DECL_MMQ_J64_I64(type)                                                                                                    \
+    template void mul_mat_q_j64_i64<type, false, GGML_PREC_Q8>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream); \
+    template void mul_mat_q_j64_i64<type, true,  GGML_PREC_Q8>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream)  \
 
 extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
