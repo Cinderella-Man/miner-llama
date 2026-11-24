@@ -326,6 +326,32 @@ static int ggml_cuda_parse_id(const char * devName) {
 }
 #endif // defined(GGML_USE_HIP)
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Miner Llama (C1025): the NVML probe's log line. A monotonic clock in microseconds (ggml_time_us needs ggml_time_init
+// on Windows, which may not have run yet) and the process's resident memory in KiB (-1 without /proc/self/statm).
+static int64_t ggml_cuda_nvml_clock_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static long ggml_cuda_rss_kib() {
+#if defined(__linux__)
+    FILE * f = fopen("/proc/self/statm", "r");
+    if (f == nullptr) {
+        return -1;
+    }
+    long size = 0;
+    long resident = -1;
+    if (fscanf(f, "%ld %ld", &size, &resident) != 2) {
+        resident = -1;
+    }
+    fclose(f);
+    return resident < 0 ? -1 : resident * (sysconf(_SC_PAGESIZE) / 1024);
+#else
+    return -1;
+#endif // defined(__linux__)
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
@@ -367,10 +393,19 @@ static ggml_cuda_device_info ggml_cuda_init() {
     }
 
     int64_t total_vram = 0;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // Miner Llama (C1025): whether a card reads NVML's answer below (should_use_fp32_acc: a card with fast BF16 other
+    // than GB10). If none does, GGML_CUDA_NVML_PROBE unset skips the probe.
+    bool nvml_answer_read = false;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     for (int id = 0; id < info.physical_device_count; ++id) {
         cudaDeviceProp prop;
         CUDA_CHECK(cudaGetDeviceProperties(&prop, id));
         total_vram += prop.totalGlobalMem;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        const int cc = 100*prop.major + 10*prop.minor;
+        nvml_answer_read = nvml_answer_read || (cc != GGML_CUDA_CC_GB10 && fast_bf16_hardware_available(cc));
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     }
     GGML_LOG_INFO("%s: found %d " GGML_CUDA_NAME " devices (Total VRAM: %zu MiB):\n",
                   __func__, info.physical_device_count, (size_t)(total_vram / (1024 * 1024)));
@@ -381,10 +416,26 @@ static ggml_cuda_device_info ggml_cuda_init() {
     total_vram = 0;
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // Miner Llama (C1025): NVML (the driver's management library) is opened and initialised only to pick the cuBLAS
+    // accumulation of quantized products on cards with fast BF16 (Quadro and RTX brands), so the probe is skipped when
+    // no card would read its answer: then every device's choice is the same without it. GGML_CUDA_NVML_PROBE=1 probes
+    // always (upstream), =0 never (cards with fast BF16 then choose as when NVML is missing). One INFO line either way.
+    const char * nvml_probe_env = getenv("GGML_CUDA_NVML_PROBE");
+    int nvml_probe_mode = -1; // -1: the rule above, 0: never, 1: always
+    if (nvml_probe_env != nullptr && nvml_probe_env[0] != '\0') {
+        if (strcmp(nvml_probe_env, "0") == 0 || strcmp(nvml_probe_env, "1") == 0) {
+            nvml_probe_mode = nvml_probe_env[0] - '0';
+        } else {
+            GGML_LOG_WARN("%s: ignoring invalid GGML_CUDA_NVML_PROBE=\"%s\" (0 or 1)\n", __func__, nvml_probe_env);
+        }
+    }
+    const bool nvml_probe = nvml_probe_mode == -1 ? nvml_answer_read : nvml_probe_mode == 1;
+    const int64_t nvml_t0   = ggml_cuda_nvml_clock_us();
+    const long    nvml_rss0 = ggml_cuda_rss_kib();
 #if defined(_WIN32)
     // NVML is installed by the driver; its NVSMI directory is not added to PATH on Windows.
-    dl_handle_ptr library(LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32));
-    if (!library) {
+    dl_handle_ptr library(nvml_probe ? LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32) : nullptr);
+    if (nvml_probe && !library) {
         const DWORD size = GetEnvironmentVariableW(L"ProgramW6432", nullptr, 0);
         if (size > 0) {
             std::wstring path(size, L'\0');
@@ -399,7 +450,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
         }
     }
 #else
-    dl_handle_ptr library(dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL));
+    dl_handle_ptr library(nvml_probe ? dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL) : nullptr);
 #endif // defined(_WIN32)
     const auto get_symbol = [&](const char * name) {
 #if defined(_WIN32)
@@ -413,6 +464,9 @@ static ggml_cuda_device_info ggml_cuda_init() {
     const auto get_device = reinterpret_cast<decltype(&nvmlDeviceGetHandleByPciBusId_v2)>(get_symbol("nvmlDeviceGetHandleByPciBusId_v2"));
     const auto get_brand = reinterpret_cast<decltype(&nvmlDeviceGetBrand)>(get_symbol("nvmlDeviceGetBrand"));
     const bool nvml_initialized = init && shutdown && get_device && get_brand && init() == NVML_SUCCESS;
+    const bool    nvml_loaded   = library != nullptr;
+    const int64_t nvml_t1       = ggml_cuda_nvml_clock_us();
+    const long    nvml_rss1     = ggml_cuda_rss_kib();
 
     const auto should_use_fp32_acc = [&](const cudaDeviceProp & prop, const int cc) {
         if (cc == GGML_CUDA_CC_GB10) {
@@ -538,10 +592,32 @@ static ggml_cuda_device_info ggml_cuda_init() {
     }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const int64_t nvml_t2 = ggml_cuda_nvml_clock_us();
     if (nvml_initialized) {
         (void) shutdown();
     }
     library.reset();
+    if (nvml_probe) {
+        const int64_t nvml_t3   = ggml_cuda_nvml_clock_us();
+        const long    nvml_rss3 = ggml_cuda_rss_kib();
+        std::string fp32_acc_devices;
+        for (int id = 0; id < info.device_count; ++id) {
+            if (info.devices[id].prefer_fp32_acc) {
+                fp32_acc_devices += (fp32_acc_devices.empty() ? "" : ",") + std::to_string(id);
+            }
+        }
+        const auto rss_mib = [](long kib0, long kib1) { return kib0 < 0 || kib1 < 0 ? 0.0 : (kib1 - kib0) / 1024.0; };
+        GGML_LOG_INFO("%s: NVML probe ran (%s): library %s, nvmlInit %s; open and init %.1f ms, shutdown and close %.1f ms;"
+                      " host RSS %+.1f MiB after init, %+.1f MiB after close; BF16 accumulation for quantized cuBLAS on devices: %s\n",
+                      __func__, nvml_probe_mode == 1 ? "GGML_CUDA_NVML_PROBE=1" : "a device has fast BF16",
+                      nvml_loaded ? "loaded" : "not found", nvml_initialized ? "ok" : "failed",
+                      (nvml_t1 - nvml_t0) / 1000.0, (nvml_t3 - nvml_t2) / 1000.0,
+                      rss_mib(nvml_rss0, nvml_rss1), rss_mib(nvml_rss0, nvml_rss3),
+                      fp32_acc_devices.empty() ? "none" : fp32_acc_devices.c_str());
+    } else {
+        GGML_LOG_INFO("%s: NVML probe skipped (%s)\n", __func__,
+                      nvml_probe_mode == 0 ? "GGML_CUDA_NVML_PROBE=0" : "no device has fast BF16; GGML_CUDA_NVML_PROBE=1 runs it");
+    }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     if (ggml_cuda_highest_compiled_arch(GGML_CUDA_CC_TURING) >= GGML_CUDA_CC_TURING && !turing_devices_without_mma.empty()) {
