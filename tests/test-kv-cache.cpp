@@ -1,6 +1,7 @@
 #include "llama-kv-cache.h"
 #include "llama-model.h"
 
+#include <cstdlib>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -161,7 +162,11 @@ int main() {
         // freed cells are taken in cell order, so a higher position can sit in a lower cell
         GGML_ASSERT(add(0, 7, 3) == 0);
         GGML_ASSERT(kv.seq_rm(0, 6, -1));
-        GGML_ASSERT(add(0, 6, 1) == 0);
+        // Miner Llama (C881): LLAMA_KV_HEAD_TAIL, on unless set to 0, puts head on the cell of the first removed position
+        // (cell 6, where position 6 was), so that a re-decoded tail takes the cells it had and attention sums its keys
+        // in the same order; set to 0, upstream's lowest freed cell
+        const char * head_tail = getenv("LLAMA_KV_HEAD_TAIL");
+        GGML_ASSERT(add(0, 6, 1) == (head_tail == nullptr || atoi(head_tail) != 0 ? 6 : 0));
 
         // a cell shared with another sequence stays for that sequence
         kv.seq_cp(0, 1, 5, -1);
