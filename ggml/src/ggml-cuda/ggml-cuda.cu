@@ -97,6 +97,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <deque>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -3463,10 +3464,13 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
     return cuda_ctx->name.c_str();
 }
 
+static void ggml_cuda_profile_host_flush(int device); // GGML_CUDA_PROFILE_HOST (C877)
+
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     ggml_cuda_keepalive_log(ggml_cuda_get_physical_device(cuda_ctx->device));
+    ggml_cuda_profile_host_flush(cuda_ctx->device);
 
     delete cuda_ctx;
     delete backend;
@@ -7636,18 +7640,42 @@ static int ggml_cuda_graph_patch(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
 #endif // USE_CUDA_GRAPH
 
 // GGML_CUDA_PROFILE_HOST=<file>: one CSV line per graph evaluation: device, evaluation, the host time at entry to and
-// exit from the backend's graph_compute (ms since the first evaluation) and the GPU time between two CUDA events around
-// the evaluation's work. The events are read one evaluation later, so nothing synchronizes and only two events per
-// evaluation are added. Comparing the GPU chain with the host timeline shows whether the GPUs or the host set the time
-// per token.
+// exit from the backend's graph_compute (ms since the first evaluation), the GPU time between two CUDA events around
+// the evaluation's work, and queued: how many of this card's earlier evaluations were still running on the card when the
+// host entered this one. Only two events per evaluation are added. Comparing the GPU chain with the host timeline shows
+// whether the GPUs or the host set the time per token.
+// By default the host waits at each entry for the card's earlier evaluations and writes them (queued is then 0 or 1, and
+// 1 means the host waited). That serializes a pipeline, which queues a card's next evaluation before its last one ends
+// (R176: Flint's pipelined preset took 34.98 ms a token under it, 18.09 without).
+// GGML_CUDA_PROFILE_HOST_NOWAIT=1 (C877): nothing waits. Each card keeps its evaluations in a queue of event pairs; at
+// each entry the host writes, in order, those whose end event has passed (cudaEventQuery) and leaves the rest for a
+// later entry. Whatever is left is written when the card's backend is freed, with one log line of counts per card.
 struct ggml_cuda_profile_host_state {
-    struct device_state {
-        cudaEvent_t ev[2][2];   // [slot][start, end]
-        double      enter[2] = { 0.0, 0.0 };
-        double      exit[2]  = { 0.0, 0.0 };
-        int64_t     n        = 0;
+    struct eval_rec {
+        const void * ctx    = nullptr; // the backend context that entered it
+        cudaEvent_t  start  = nullptr;
+        cudaEvent_t  end    = nullptr;
+        int64_t      eval   = 0;
+        double       enter  = 0.0;
+        double       exit   = 0.0;
+        int          queued = 0;
+        bool         ended  = false;   // its end event is recorded (at exit from graph_compute)
     };
-    FILE * f = nullptr;
+    struct device_state {
+        std::deque<eval_rec> recs;                              // entered and not yet written, oldest first
+        std::vector<std::pair<cudaEvent_t, cudaEvent_t>> spare; // event pairs written and free again
+        int64_t n          = 0; // evaluations entered
+        int64_t n_written  = 0;
+        int64_t n_queued   = 0; // entries with an earlier evaluation still unwritten
+        int64_t n_waited   = 0; // entries at which the host waited
+        int     max_queued = 0;
+    };
+    // GGML_CUDA_PROFILE_HOST_NOWAIT: at most this many unwritten evaluations per card; past it the host waits for the
+    // oldest (counted in n_waited), so a card that never finishes cannot grow the queue without bound
+    static constexpr size_t max_recs = 1024;
+
+    FILE * f      = nullptr;
+    bool   nowait = false;
     std::mutex mutex;
     std::map<int, device_state> devices;
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
@@ -7657,6 +7685,9 @@ struct ggml_cuda_profile_host_state {
     }
 };
 
+// set once the profile is on, for the flush at a backend's free
+static ggml_cuda_profile_host_state * ggml_cuda_profile_host_on = nullptr;
+
 static ggml_cuda_profile_host_state * ggml_cuda_profile_host() {
     static ggml_cuda_profile_host_state * state = []() -> ggml_cuda_profile_host_state * {
         const char * path = getenv("GGML_CUDA_PROFILE_HOST");
@@ -7664,48 +7695,124 @@ static ggml_cuda_profile_host_state * ggml_cuda_profile_host() {
             return nullptr;
         }
         ggml_cuda_profile_host_state * st = new ggml_cuda_profile_host_state;
+        const char * nowait = getenv("GGML_CUDA_PROFILE_HOST_NOWAIT");
+        st->nowait = nowait != nullptr && atoi(nowait) != 0;
         st->f = fopen(path, "w");
         GGML_ASSERT(st->f != nullptr);
-        fprintf(st->f, "device,eval,host_enter_ms,host_exit_ms,gpu_us\n");
+        fprintf(st->f, "device,eval,host_enter_ms,host_exit_ms,gpu_us,queued\n");
         // the steady clock's time of the file's 0 ms: LLAMA_STEP_TRACE's header gives its own on the same clock (C405)
-        GGML_LOG_INFO("%s: timing every graph evaluation into %s (its 0 ms is %.3f ms on the steady clock)\n", __func__,
-                path, std::chrono::duration<double, std::milli>(st->t0.time_since_epoch()).count());
+        GGML_LOG_INFO("%s: timing every graph evaluation into %s (its 0 ms is %.3f ms on the steady clock), %s\n", __func__,
+                path, std::chrono::duration<double, std::milli>(st->t0.time_since_epoch()).count(),
+                st->nowait ? "without waiting (GGML_CUDA_PROFILE_HOST_NOWAIT=1)" : "waiting for each card's earlier evaluations");
+        ggml_cuda_profile_host_on = st;
         return st;
     }();
     return state;
 }
 
-// at entry to graph_compute: write the previous evaluation of this device, record the start event of this one
-static void ggml_cuda_profile_host_enter(ggml_cuda_profile_host_state * ph, ggml_backend_cuda_context * cuda_ctx) {
-    std::lock_guard<std::mutex> lock(ph->mutex);
-    auto [it, inserted] = ph->devices.try_emplace(cuda_ctx->device);
-    ggml_cuda_profile_host_state::device_state & ds = it->second;
-    if (inserted) {
-        for (auto & slot : ds.ev) {
-            CUDA_CHECK(cudaEventCreate(&slot[0]));
-            CUDA_CHECK(cudaEventCreate(&slot[1]));
-        }
+// whether the evaluation's end event has passed, without waiting
+static bool ggml_cuda_profile_host_done(const ggml_cuda_profile_host_state::eval_rec & rec) {
+    const cudaError_t err = cudaEventQuery(rec.end);
+    if (err == cudaErrorNotReady) {
+        (void) cudaGetLastError(); // not an error: clear it so that the next error check does not report it
+        return false;
     }
-    const int slot = ds.n & 1;
-    if (ds.n > 0) {
-        const int prev = slot ^ 1;
-        CUDA_CHECK(cudaEventSynchronize(ds.ev[prev][1]));
-        float ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&ms, ds.ev[prev][0], ds.ev[prev][1]));
-        fprintf(ph->f, "%d,%" PRId64 ",%.3f,%.3f,%.2f\n", cuda_ctx->device, ds.n - 1, ds.enter[prev], ds.exit[prev], 1000.0 * ms);
-    }
-    ds.enter[slot] = ph->now_ms();
-    CUDA_CHECK(cudaEventRecord(ds.ev[slot][0], cuda_ctx->stream()));
+    CUDA_CHECK(err);
+    return true;
 }
 
-// at exit from graph_compute: record the end event
+// writes the card's oldest unwritten evaluation, whose end event has passed, and keeps its events for reuse; called
+// with ph->mutex held
+static void ggml_cuda_profile_host_write_front(ggml_cuda_profile_host_state * ph, const int device,
+                                               ggml_cuda_profile_host_state::device_state & ds) {
+    const ggml_cuda_profile_host_state::eval_rec & rec = ds.recs.front();
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, rec.start, rec.end));
+    fprintf(ph->f, "%d,%" PRId64 ",%.3f,%.3f,%.2f,%d\n", device, rec.eval, rec.enter, rec.exit, 1000.0 * ms, rec.queued);
+    ds.spare.emplace_back(rec.start, rec.end);
+    ds.recs.pop_front();
+    ds.n_written++;
+}
+
+// at entry to graph_compute: write the card's earlier evaluations that have finished (by default after waiting for all
+// of them), record the start event of this one
+static void ggml_cuda_profile_host_enter(ggml_cuda_profile_host_state * ph, ggml_backend_cuda_context * cuda_ctx) {
+    std::lock_guard<std::mutex> lock(ph->mutex);
+    const int device = cuda_ctx->device;
+    ggml_cuda_profile_host_state::device_state & ds = ph->devices[device];
+
+    // the finished ones, in order; the rest (the first one still running and every later one) are queued
+    while (!ds.recs.empty() && ds.recs.front().ended && ggml_cuda_profile_host_done(ds.recs.front())) {
+        ggml_cuda_profile_host_write_front(ph, device, ds);
+    }
+    const int queued = (int) ds.recs.size();
+    if (queued > 0) {
+        ds.n_queued++;
+        ds.max_queued = std::max(ds.max_queued, queued);
+    }
+    // by default wait for every one of them; without waiting only past max_recs, for the oldest
+    const size_t keep = ph->nowait ? ggml_cuda_profile_host_state::max_recs - 1 : 0;
+    bool waited = false;
+    while (ds.recs.size() > keep && ds.recs.front().ended) {
+        CUDA_CHECK(cudaEventSynchronize(ds.recs.front().end));
+        ggml_cuda_profile_host_write_front(ph, device, ds);
+        waited = true;
+    }
+    ds.n_waited += waited ? 1 : 0;
+
+    ggml_cuda_profile_host_state::eval_rec rec;
+    if (!ds.spare.empty()) {
+        rec.start = ds.spare.back().first;
+        rec.end   = ds.spare.back().second;
+        ds.spare.pop_back();
+    } else {
+        CUDA_CHECK(cudaEventCreate(&rec.start));
+        CUDA_CHECK(cudaEventCreate(&rec.end));
+    }
+    rec.ctx    = cuda_ctx;
+    rec.eval   = ds.n++;
+    rec.queued = queued;
+    rec.enter  = ph->now_ms();
+    CUDA_CHECK(cudaEventRecord(rec.start, cuda_ctx->stream()));
+    ds.recs.push_back(rec);
+}
+
+// at exit from graph_compute: record the end event of the evaluation this backend context entered
 static void ggml_cuda_profile_host_exit(ggml_cuda_profile_host_state * ph, ggml_backend_cuda_context * cuda_ctx) {
     std::lock_guard<std::mutex> lock(ph->mutex);
     ggml_cuda_profile_host_state::device_state & ds = ph->devices[cuda_ctx->device];
-    const int slot = ds.n & 1;
-    CUDA_CHECK(cudaEventRecord(ds.ev[slot][1], cuda_ctx->stream()));
-    ds.exit[slot] = ph->now_ms();
-    ds.n++;
+    for (auto it = ds.recs.rbegin(); it != ds.recs.rend(); ++it) {
+        if (!it->ended && it->ctx == cuda_ctx) {
+            CUDA_CHECK(cudaEventRecord(it->end, cuda_ctx->stream()));
+            it->exit  = ph->now_ms();
+            it->ended = true;
+            return;
+        }
+    }
+    GGML_ABORT("%s: CUDA%d: no evaluation entered by this backend", __func__, cuda_ctx->device);
+}
+
+// at a backend's free: the card's evaluations not yet written, waited for and written, then the card's counts
+static void ggml_cuda_profile_host_flush(const int device) {
+    ggml_cuda_profile_host_state * ph = ggml_cuda_profile_host_on;
+    if (ph == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ph->mutex);
+    auto it = ph->devices.find(device);
+    if (it == ph->devices.end()) {
+        return;
+    }
+    ggml_cuda_profile_host_state::device_state & ds = it->second;
+    ggml_cuda_set_device(device);
+    while (!ds.recs.empty() && ds.recs.front().ended) {
+        CUDA_CHECK(cudaEventSynchronize(ds.recs.front().end));
+        ggml_cuda_profile_host_write_front(ph, device, ds);
+    }
+    fflush(ph->f);
+    GGML_LOG_INFO("%s: CUDA%d: %" PRId64 " evaluations, %" PRId64 " written; %" PRId64 " entered with earlier ones "
+                  "still running (at most %d), the host waited at %" PRId64 "\n", __func__, device, ds.n, ds.n_written,
+                  ds.n_queued, ds.max_queued, ds.n_waited);
 }
 
 #ifdef USE_CUDA_GRAPH
