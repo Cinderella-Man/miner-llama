@@ -19,6 +19,7 @@ static void print_usage(int, char ** argv) {
 int llama_batched_bench(int argc, char ** argv);
 
 int llama_batched_bench(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;

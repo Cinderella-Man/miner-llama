@@ -1872,6 +1872,7 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     pipe_job    def;

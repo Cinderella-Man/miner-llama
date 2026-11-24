@@ -4,6 +4,7 @@
 #include "arg.h"
 #include "build-info.h"
 #include "common.h"
+#include "log.h"
 #include "llama.h"
 #include "pca.hpp"
 #include "mean.hpp"
@@ -310,6 +311,7 @@ static std::vector<std::string> ctrlvec_load_prompt_file(std::string path, bool 
     std::ifstream file(path);
     if (!file.is_open()) {
         fprintf(stderr, "error: unable to open file: %s\n", path.c_str());
+        common_log_flush(common_log_main());
         exit(1);
     }
     std::string line;
@@ -396,6 +398,7 @@ static int prepare_entries(common_params & params, train_context & ctx_train) {
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;

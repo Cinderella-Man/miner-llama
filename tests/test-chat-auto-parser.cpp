@@ -512,6 +512,7 @@ static int debug_single_template(const debug_options & opts) {
 }
 
 int main(int argc, char * argv[]) {
+    common_log_flush_guard log_flush_guard;
     if (argc > 1) {
         std::string arg = argv[1];
         if (arg == "-h" || arg == "--help") {

@@ -31,6 +31,7 @@ static void signal_handler(int) {
 int llama_cli(int argc, char ** argv);
 
 int llama_cli(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     common_params params;
 
     params.verbosity = LOG_LEVEL_ERROR; // by default, less verbose logs

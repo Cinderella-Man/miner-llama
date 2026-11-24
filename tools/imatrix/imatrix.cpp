@@ -644,10 +644,12 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         }
         else if (e.values.size() != (size_t)src1->ne[0]*n_as) {
             LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n", __func__, wname.c_str(), (int)e.values.size(), (int)(src1->ne[0]*n_as));
+            common_log_flush(common_log_main());
             exit(1); //GGML_ABORT("fatal error");
         }
         else if (e.counts.size() != (size_t)n_as) {
             LOG_ERR("%s: inconsistent expert count for %s (%d vs %d)\n", __func__, wname.c_str(), (int)e.counts.size(), (int)n_as);
+            common_log_flush(common_log_main());
             exit(1); //GGML_ABORT("fatal error");
         }
         LOG_DBGV(2, "%s[%d]: %32s, %s, %5d x %5d, %d\n", __func__, m_last_chunk, wname.c_str(), ggml_op_name(t->op), (int)src1->ne[0], (int)src1->ne[2], (int)src1->type);
@@ -680,6 +682,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         for (int64_t ex = 0; ex < n_as; ++ex) {
             if (touched[ex] && !all_finite(e.values.data() + ex * ne0, ne0)) {
                 LOG_ERR("%s: non-finite values detected in %s\n", __func__, wname.c_str());
+                common_log_flush(common_log_main());
                 exit(1);
             }
         }
@@ -723,6 +726,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         else if (e.values.size() != (size_t)(src1->ne[0] * n_mat)) {
             LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n",
                 __func__, wname.c_str(), (int)e.values.size(), (int)(src1->ne[0] * n_mat));
+            common_log_flush(common_log_main());
             exit(1); //GGML_ABORT("fatal error");
         }
         LOG_DBGV(2, "%s[%d]: %32s, %s, %5d x %5d x %5d, %d\n",
@@ -749,6 +753,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         // check for non-finite values
         if (!all_finite(e.values.data(), e.values.size())) {
             LOG_ERR("%s: non-finite values detected in %s\n", __func__, wname.c_str());
+            common_log_flush(common_log_main());
             exit(1);
         }
         // only 1 count in practice, except when a tensor is used for both MUL_MAT_ID and MUL_MAT
@@ -797,6 +802,7 @@ void IMatrixCollector::collect_span(const struct ggml_tensor * t, const char * d
         if (n_tokens != m_span_n) {
             LOG_ERR("%s: %s has %d token rows in a batch of %d tokens, so its rows cannot be given their tokens' classes\n",
                 __func__, wname.c_str(), (int) n_tokens, (int) m_span_n);
+            common_log_flush(common_log_main());
             exit(1);
         }
         for (size_t c = 0; c < n_cls; ++c) {
@@ -807,6 +813,7 @@ void IMatrixCollector::collect_span(const struct ggml_tensor * t, const char * d
                 e.counts.resize(n_as, 0);
             } else if (e.values.size() != (size_t) (ne0*n_as)) {
                 LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n", __func__, wname.c_str(), (int) e.values.size(), (int) (ne0*n_as));
+                common_log_flush(common_log_main());
                 exit(1);
             }
             ent[c] = &e;
@@ -845,6 +852,7 @@ void IMatrixCollector::collect_span(const struct ggml_tensor * t, const char * d
             e.counts.resize(1, 0);
         } else if (e.values.size() != (size_t) (ne0 * n_mat)) {
             LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n", __func__, wname.c_str(), (int) e.values.size(), (int) (ne0 * n_mat));
+            common_log_flush(common_log_main());
             exit(1);
         }
         ent[c] = &e;
@@ -2061,6 +2069,7 @@ static bool span_dump(const common_params & params) {
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;

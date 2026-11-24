@@ -637,6 +637,7 @@ static const char * test_status_str(test_status status) {
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         printf("Usage: %s (-m model.gguf | --models DIR) [--kv [-b backend]]\n", argv[0]);
         return 0;

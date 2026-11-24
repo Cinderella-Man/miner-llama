@@ -50,6 +50,7 @@ static void show_additional_info(int /*argc*/, char ** argv) {
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     ggml_time_init();
@@ -99,6 +100,7 @@ int main(int argc, char ** argv) {
         ctx_mtmd.reset(mtmd_init_from_file(mmproj_path, model, mparams));
         if (!ctx_mtmd.get()) {
             LOG_ERR("Failed to load vision model from %s\n", mmproj_path);
+            common_log_flush(common_log_main());
             exit(1);
         }
     }

@@ -228,6 +228,7 @@ static void usage(const char * argv0) {
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     std::string models_dir;
     std::string model_file;
     std::string device_name;
@@ -239,12 +240,14 @@ int main(int argc, char ** argv) {
         const auto next = [&](const char * name) -> std::string {
             if (i + 1 >= argc) {
                 LOG_ERR("%s: %s requires an argument\n", __func__, name);
+                common_log_flush(common_log_main());
                 exit(1);
             }
             return argv[++i];
         };
         if (arg == "-h" || arg == "--help") {
             usage(argv[0]);
+            common_log_flush(common_log_main());
             exit(0);
         }
         if (arg == "--models")     { models_dir  = next("--models"); }

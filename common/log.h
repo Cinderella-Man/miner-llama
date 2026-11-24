@@ -58,7 +58,8 @@ struct common_log;
 struct common_log * common_log_init();
 
 // Singleton, intentionally leaked to avoid Windows teardown hangs.
-// Call common_log_flush() before exit if you want to ensure all logs are flushed.
+// Call common_log_flush() before exit if you want to ensure all logs are flushed,
+// or declare a common_log_flush_guard at the top of main() (see below).
 struct common_log * common_log_main();
 
 void                common_log_pause (struct common_log * log); // pause  the worker thread, not thread-safe
@@ -98,6 +99,17 @@ bool common_log_get_colors    (struct common_log * log);                    // w
 void common_log_set_prefix    (struct common_log * log, bool prefix);       // whether to output prefix to each log
 void common_log_set_timestamps(struct common_log * log, bool timestamps);   // whether to output timestamps in the prefix
 void common_log_flush         (struct common_log * log);                    // flush all pending log messages
+
+// Flushes the main logger when it goes out of scope. Declare one as the first statement of main() (or of the function
+// main returns) so that the lines still queued are printed on every return, after the destructors of the other locals
+// have logged. It runs while main is still on the stack, so not at a DLL's teardown (where joining the worker thread
+// hangs on Windows). It does not cover exit() or abort(): call common_log_flush() before those.
+struct common_log_flush_guard {
+    common_log_flush_guard() = default;
+    common_log_flush_guard(const common_log_flush_guard &) = delete;
+    common_log_flush_guard & operator=(const common_log_flush_guard &) = delete;
+    ~common_log_flush_guard() { common_log_flush(common_log_main()); }
+};
 
 // helper macros for logging
 // use these to avoid computing log arguments if the verbosity of the log is higher than the threshold

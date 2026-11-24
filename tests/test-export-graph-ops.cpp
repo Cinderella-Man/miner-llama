@@ -126,6 +126,7 @@ static void extract_graph_ops(ggml_cgraph * cgraph, const char * label, std::set
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     common_params params;
     params.out_file = "tests.txt";
 

@@ -100,6 +100,7 @@ static std::string format_input_text(const std::string & prompt, const std::stri
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     ggml_time_init();

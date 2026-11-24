@@ -4,6 +4,7 @@
 
 #include "arg.h"
 #include "common.h"
+#include "log.h"
 
 #include <clocale>
 #include <map>
@@ -416,6 +417,7 @@ static void print_usage(int, char ** argv) {
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;
@@ -434,6 +436,7 @@ int main(int argc, char ** argv) {
         ctx.run_merge();
     } catch (const std::exception & err) {
         fprintf(stderr, "%s\n", err.what());
+        common_log_flush(common_log_main());
         exit(EXIT_FAILURE);
     }
 
