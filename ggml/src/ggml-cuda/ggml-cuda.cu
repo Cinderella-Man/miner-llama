@@ -3466,13 +3466,13 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
     return cuda_ctx->name.c_str();
 }
 
-static void ggml_cuda_profile_host_flush(ggml_backend_cuda_context * cuda_ctx); // GGML_CUDA_PROFILE_HOST (C877, C1004)
+static void ggml_cuda_profile_host_flush(int device); // GGML_CUDA_PROFILE_HOST (C877)
 
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     ggml_cuda_keepalive_log(ggml_cuda_get_physical_device(cuda_ctx->device));
-    ggml_cuda_profile_host_flush(cuda_ctx);
+    ggml_cuda_profile_host_flush(cuda_ctx->device);
 
     delete cuda_ctx;
     delete backend;
@@ -7654,13 +7654,15 @@ static int ggml_cuda_graph_patch(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
 // later entry. Whatever is left is written when the card's backend is freed, with one log line of counts per card.
 // GGML_CUDA_PROFILE_HOST_ANCHORS (C1004; on by default with GGML_CUDA_PROFILE_HOST_NOWAIT=1, 0 turns it off, 1 turns it
 // on in the waiting profile too): two more columns, gpu_start_ms and gpu_end_ms, the evaluation's start and end events on
-// the card placed on the file's clock, so a pipelined step's map shows where each card sits idle. At an entry where none
-// of the backend context's evaluations is left unwritten and its stream is idle (cudaStreamQuery), an anchor event is
-// recorded and the host's clock read: the card reaches it at once, so its time is the host's reading. An evaluation's
-// events are placed from the newest base with cudaEventElapsedTime; the base then moves up to the evaluation's end event,
-// so every elapsed time is short and the float keeps microseconds. Nothing waits; the columns are empty until the
-// context's first anchor. Each new anchor is checked against the base before it (the card's clock against the host's),
-// and the counts are logged at the backend's free.
+// the card placed on the file's clock, so a pipelined step's map shows where each card sits idle. Each card gets a stream
+// of its own that never holds work, and at an entry where the card's newest anchor is older than anchor_ms, an anchor
+// event is recorded on that stream and the host's clock read: the card reaches it at once, so its time is the host's
+// reading. (The card's compute stream cannot carry the anchor: in a pipeline a later card's stream always holds the next
+// input's copy when the host enters it.) Each evaluation's events are placed from the newest anchor the card has reached,
+// with cudaEventElapsedTime, which also gives the negative time to an event before the anchor; the anchor is never more
+// than a few hundred milliseconds away, so the float keeps microseconds. Nothing waits; the columns are empty until the
+// card reaches its first anchor. Each anchor is checked against the one before it (the card's clock against the
+// host's), and the counts are logged at the backend's free.
 struct ggml_cuda_profile_host_state {
     struct eval_rec {
         const void * ctx    = nullptr; // the backend context that entered it
@@ -7672,24 +7674,10 @@ struct ggml_cuda_profile_host_state {
         int          queued = 0;
         bool         ended  = false;   // its end event is recorded (at exit from graph_compute)
     };
-    // GGML_CUDA_PROFILE_HOST_ANCHORS: one per backend context on a card, so the base is always earlier on the same stream
-    // than the events placed from it
-    struct anchor_state {
-        cudaEvent_t ev        = nullptr; // the base: the newest anchor, or the end event of the newest evaluation written
-        cudaEvent_t prev      = nullptr; // the base before the newest anchor, kept for the anchor's check
-        double      ms        = 0.0;     // the base's time on the file's clock
-        double      prev_ms   = 0.0;
-        double      anchor_ms = 0.0;     // the newest anchor's time
-        bool        valid     = false;   // an anchor has been recorded
-        bool        check     = false;   // the newest anchor not yet checked against the base before it
-        int64_t     unwritten = 0;       // this context's evaluations entered and not yet written
-        int64_t     n         = 0;       // anchors recorded
-        int64_t     n_checked = 0;
-        double      sum_dev_us      = 0.0; // card's clock minus host's, summed over the checks
-        double      sum_span_ms     = 0.0; // the host's time between the two bases, summed over the checks
-        double      max_dev_us      = 0.0; // the largest |card's clock minus host's| at a check
-        double      max_dev_span_ms = 0.0; // the time between the two bases of that check
-        double      max_age_ms      = 0.0; // the longest an evaluation's end lay after the newest anchor
+    // GGML_CUDA_PROFILE_HOST_ANCHORS: an event on the card's anchor stream and the host's reading when it was recorded
+    struct anchor_rec {
+        cudaEvent_t ev = nullptr;
+        double      ms = 0.0;
     };
     struct device_state {
         std::deque<eval_rec> recs;                              // entered and not yet written, oldest first
@@ -7699,8 +7687,21 @@ struct ggml_cuda_profile_host_state {
         int64_t n_queued   = 0; // entries with an earlier evaluation still unwritten
         int64_t n_waited   = 0; // entries at which the host waited
         int     max_queued = 0;
-        std::map<const void *, anchor_state> anchors; // GGML_CUDA_PROFILE_HOST_ANCHORS, by backend context
+        // GGML_CUDA_PROFILE_HOST_ANCHORS
+        cudaStream_t             anchor_stream = nullptr; // never holds work, so the card reaches an anchor at once
+        std::deque<anchor_rec>   anchors;                 // recorded, not yet reached by the card, oldest first
+        anchor_rec               base;                    // the newest anchor the card has reached (ev null: none yet)
+        std::vector<cudaEvent_t> anchor_spare;
+        int64_t n_anchors       = 0;
+        int64_t n_checked       = 0;   // anchors checked against the one before
+        double  sum_dev_us      = 0.0; // card's clock minus host's between two anchors, summed over the checks
+        double  sum_span_ms     = 0.0; // the host's time between the two anchors, summed over the checks
+        double  max_dev_us      = 0.0; // the largest |card's clock minus host's| at a check
+        double  max_dev_span_ms = 0.0; // the time between the two anchors of that check
+        double  max_dist_ms     = 0.0; // the farthest an event was placed from its anchor
     };
+    // GGML_CUDA_PROFILE_HOST_ANCHORS: a card's new anchor at an entry once its newest is this old
+    static constexpr double anchor_ms = 100.0;
     // GGML_CUDA_PROFILE_HOST_NOWAIT: at most this many unwritten evaluations per card; past it the host waits for the
     // oldest (counted in n_waited), so a card that never finishes cannot grow the queue without bound
     static constexpr size_t max_recs = 1024;
@@ -7762,24 +7763,28 @@ static bool ggml_cuda_profile_host_done(const ggml_cuda_profile_host_state::eval
     return ggml_cuda_profile_host_done_event(rec.end);
 }
 
-// GGML_CUDA_PROFILE_HOST_ANCHORS: the newest anchor against the base before it, once the card has reached the anchor:
-// the base's time plus the card's clock between the two, minus the host's reading at the anchor
-static void ggml_cuda_profile_host_anchor_check(ggml_cuda_profile_host_state::anchor_state & as) {
-    if (!as.check || !ggml_cuda_profile_host_done_event(as.ev)) {
-        return;
+// GGML_CUDA_PROFILE_HOST_ANCHORS: the anchors the card has reached, in order, each checked against the one before (the
+// card's clock between the two minus the host's) and made the base; called with ph->mutex held
+static void ggml_cuda_profile_host_anchor_reached(ggml_cuda_profile_host_state::device_state & ds) {
+    while (!ds.anchors.empty() && ggml_cuda_profile_host_done_event(ds.anchors.front().ev)) {
+        const ggml_cuda_profile_host_state::anchor_rec a = ds.anchors.front();
+        ds.anchors.pop_front();
+        if (ds.base.ev != nullptr) {
+            float gpu_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&gpu_ms, ds.base.ev, a.ev));
+            const double span_ms = a.ms - ds.base.ms;
+            const double dev_us  = 1000.0 * (gpu_ms - span_ms);
+            ds.n_checked++;
+            ds.sum_dev_us  += dev_us;
+            ds.sum_span_ms += span_ms;
+            if (std::fabs(dev_us) >= std::fabs(ds.max_dev_us)) {
+                ds.max_dev_us      = dev_us;
+                ds.max_dev_span_ms = span_ms;
+            }
+            ds.anchor_spare.push_back(ds.base.ev);
+        }
+        ds.base = a;
     }
-    float gpu_ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&gpu_ms, as.prev, as.ev));
-    const double span_ms = as.anchor_ms - as.prev_ms;
-    const double dev_us  = 1000.0 * (gpu_ms - span_ms);
-    as.n_checked++;
-    as.sum_dev_us  += dev_us;
-    as.sum_span_ms += span_ms;
-    if (std::fabs(dev_us) >= std::fabs(as.max_dev_us)) {
-        as.max_dev_us      = dev_us;
-        as.max_dev_span_ms = span_ms;
-    }
-    as.check = false;
 }
 
 // writes the card's oldest unwritten evaluation, whose end event has passed, and keeps its events for reuse; called
@@ -7793,24 +7798,16 @@ static void ggml_cuda_profile_host_write_front(ggml_cuda_profile_host_state * ph
     if (!ph->anchors) {
         fprintf(ph->f, "%d,%" PRId64 ",%.3f,%.3f,%.2f,%d\n", device, rec.eval, rec.enter, rec.exit, 1000.0 * ms, rec.queued);
     } else {
-        ggml_cuda_profile_host_state::anchor_state & as = ds.anchors[rec.ctx];
-        as.unwritten--;
-        if (as.valid) {
-            // the base is earlier on this context's stream: its newest anchor, recorded at or before this evaluation's
-            // entry, or the end event of its previous evaluation
-            ggml_cuda_profile_host_anchor_check(as);
+        ggml_cuda_profile_host_anchor_reached(ds);
+        if (ds.base.ev != nullptr) {
+            // from the newest anchor the card has reached, before or after the events (a negative time is exact too)
             float to_start = 0.0f;
             float to_end   = 0.0f;
-            CUDA_CHECK(cudaEventElapsedTime(&to_start, as.ev, rec.start));
-            CUDA_CHECK(cudaEventElapsedTime(&to_end,   as.ev, rec.end));
-            const double start_ms = as.ms + to_start;
-            const double end_ms   = as.ms + to_end;
+            CUDA_CHECK(cudaEventElapsedTime(&to_start, ds.base.ev, rec.start));
+            CUDA_CHECK(cudaEventElapsedTime(&to_end,   ds.base.ev, rec.end));
             fprintf(ph->f, "%d,%" PRId64 ",%.3f,%.3f,%.2f,%d,%.3f,%.3f\n", device, rec.eval, rec.enter, rec.exit, 1000.0 * ms,
-                    rec.queued, start_ms, end_ms);
-            as.max_age_ms = std::max(as.max_age_ms, end_ms - as.anchor_ms);
-            // the base moves up to this end event; the old base's event goes back with the start event for reuse
-            std::swap(as.ev, rec.end);
-            as.ms = end_ms;
+                    rec.queued, ds.base.ms + to_start, ds.base.ms + to_end);
+            ds.max_dist_ms = std::max(ds.max_dist_ms, (double) std::max(std::fabs(to_start), std::fabs(to_end)));
         } else {
             fprintf(ph->f, "%d,%" PRId64 ",%.3f,%.3f,%.2f,%d,,\n", device, rec.eval, rec.enter, rec.exit, 1000.0 * ms, rec.queued);
         }
@@ -7819,34 +7816,27 @@ static void ggml_cuda_profile_host_write_front(ggml_cuda_profile_host_state * ph
     ds.n_written++;
 }
 
-// GGML_CUDA_PROFILE_HOST_ANCHORS: at an entry, an anchor when none of the context's evaluations is left unwritten and its
-// stream is idle, so the card reaches the event at once; called with ph->mutex held, after the earlier ones are written
-static void ggml_cuda_profile_host_anchor(ggml_cuda_profile_host_state * ph, ggml_cuda_profile_host_state::device_state & ds,
-                                         ggml_backend_cuda_context * cuda_ctx) {
-    ggml_cuda_profile_host_state::anchor_state & as = ds.anchors[cuda_ctx];
-    if (as.unwritten != 0) {
+// GGML_CUDA_PROFILE_HOST_ANCHORS: at an entry, a new anchor on the card's anchor stream once its newest is anchor_ms old;
+// called with ph->mutex held, on the card's device
+static void ggml_cuda_profile_host_anchor(ggml_cuda_profile_host_state * ph, ggml_cuda_profile_host_state::device_state & ds) {
+    const double newest = !ds.anchors.empty() ? ds.anchors.back().ms : ds.base.ev != nullptr ? ds.base.ms : -1e300;
+    if (ph->now_ms() - newest < ggml_cuda_profile_host_state::anchor_ms) {
         return;
     }
-    const cudaError_t err = cudaStreamQuery(cuda_ctx->stream());
-    if (err == cudaErrorNotReady) {
-        (void) cudaGetLastError(); // not an error: the stream still has work, so no anchor here
-        return;
+    if (ds.anchor_stream == nullptr) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&ds.anchor_stream, cudaStreamNonBlocking));
     }
-    CUDA_CHECK(err);
-    if (as.ev == nullptr) {
-        CUDA_CHECK(cudaEventCreate(&as.ev));
-        CUDA_CHECK(cudaEventCreate(&as.prev));
+    ggml_cuda_profile_host_state::anchor_rec a;
+    if (!ds.anchor_spare.empty()) {
+        a.ev = ds.anchor_spare.back();
+        ds.anchor_spare.pop_back();
+    } else {
+        CUDA_CHECK(cudaEventCreate(&a.ev));
     }
-    if (as.valid) {
-        ggml_cuda_profile_host_anchor_check(as); // an earlier anchor's check still open: the stream is idle, so it is ready
-        std::swap(as.ev, as.prev);
-        as.prev_ms = as.ms;
-        as.check   = true;
-    }
-    CUDA_CHECK(cudaEventRecord(as.ev, cuda_ctx->stream()));
-    as.ms = as.anchor_ms = ph->now_ms();
-    as.valid = true;
-    as.n++;
+    CUDA_CHECK(cudaEventRecord(a.ev, ds.anchor_stream));
+    a.ms = ph->now_ms();
+    ds.anchors.push_back(a);
+    ds.n_anchors++;
 }
 
 // at entry to graph_compute: write the card's earlier evaluations that have finished (by default after waiting for all
@@ -7876,8 +7866,7 @@ static void ggml_cuda_profile_host_enter(ggml_cuda_profile_host_state * ph, ggml
     ds.n_waited += waited ? 1 : 0;
 
     if (ph->anchors) {
-        ggml_cuda_profile_host_anchor(ph, ds, cuda_ctx);
-        ds.anchors[cuda_ctx].unwritten++;
+        ggml_cuda_profile_host_anchor(ph, ds);
     }
 
     ggml_cuda_profile_host_state::eval_rec rec;
@@ -7912,14 +7901,12 @@ static void ggml_cuda_profile_host_exit(ggml_cuda_profile_host_state * ph, ggml_
     GGML_ABORT("%s: CUDA%d: no evaluation entered by this backend", __func__, cuda_ctx->device);
 }
 
-// at a backend's free: the card's evaluations not yet written, waited for and written, then the card's counts (and the
-// backend context's anchors, whose events are then freed)
-static void ggml_cuda_profile_host_flush(ggml_backend_cuda_context * cuda_ctx) {
+// at a backend's free: the card's evaluations not yet written, waited for and written, then the card's counts
+static void ggml_cuda_profile_host_flush(const int device) {
     ggml_cuda_profile_host_state * ph = ggml_cuda_profile_host_on;
     if (ph == nullptr) {
         return;
     }
-    const int device = cuda_ctx->device;
     std::lock_guard<std::mutex> lock(ph->mutex);
     auto it = ph->devices.find(device);
     if (it == ph->devices.end()) {
@@ -7935,23 +7922,12 @@ static void ggml_cuda_profile_host_flush(ggml_backend_cuda_context * cuda_ctx) {
     GGML_LOG_INFO("%s: CUDA%d: %" PRId64 " evaluations, %" PRId64 " written; %" PRId64 " entered with earlier ones "
                   "still running (at most %d), the host waited at %" PRId64 "\n", __func__, device, ds.n, ds.n_written,
                   ds.n_queued, ds.max_queued, ds.n_waited);
-
-    auto ait = ds.anchors.find(cuda_ctx);
-    if (ait == ds.anchors.end()) {
-        return;
-    }
-    ggml_cuda_profile_host_state::anchor_state & as = ait->second;
-    ggml_cuda_profile_host_anchor_check(as);
-    GGML_LOG_INFO("%s: CUDA%d: %" PRId64 " anchors while the card was idle, evaluations placed up to %.3f ms after the newest; "
-                  "%" PRId64 " checked against the base before: card's clock minus host's %.1f us at most (over %.3f ms), "
-                  "%.2f ppm over all\n", __func__, device, as.n, as.max_age_ms, as.n_checked, as.max_dev_us,
-                  as.max_dev_span_ms, as.sum_span_ms > 0.0 ? 1000.0 * as.sum_dev_us / as.sum_span_ms : 0.0);
-    if (as.unwritten == 0) {
-        if (as.ev != nullptr) {
-            CUDA_CHECK(cudaEventDestroy(as.ev));
-            CUDA_CHECK(cudaEventDestroy(as.prev));
-        }
-        ds.anchors.erase(ait);
+    if (ph->anchors) {
+        ggml_cuda_profile_host_anchor_reached(ds);
+        GGML_LOG_INFO("%s: CUDA%d: %" PRId64 " anchors, events placed at most %.3f ms from theirs; %" PRId64 " checked "
+                      "against the one before: card's clock minus host's %.1f us at most (over %.3f ms), %.2f ppm over "
+                      "all\n", __func__, device, ds.n_anchors, ds.max_dist_ms, ds.n_checked, ds.max_dev_us,
+                      ds.max_dev_span_ms, ds.sum_span_ms > 0.0 ? 1000.0 * ds.sum_dev_us / ds.sum_span_ms : 0.0);
     }
 }
 
