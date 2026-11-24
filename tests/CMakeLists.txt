@@ -241,6 +241,8 @@ llama_build(test-bytes-switches.cpp)
 llama_build(test-moe-ids.cpp)
 # route once per verify block (Q860) on a model file, e.g. one test-llama-archs wrote: run by hand
 llama_build(test-route-once.cpp)
+# the order of ggml_top_k's columns per device, GGML_CUDA_TOP_K_SORT (C985): on a GPU, run by hand
+llama_build(test-top-k-sort.cpp LINK ggml)
 # the QSA k-pool tables kept on the devices (C100) on a qwen4exp file, e.g. one test-llama-archs wrote: run by hand
 llama_build(test-kpool-dev.cpp)
 # the small k-pool inputs in the tables' update (C720) on a qwen4exp file: run by hand

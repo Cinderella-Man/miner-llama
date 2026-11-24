@@ -1,6 +1,9 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 
+#include <atomic>
+#include <climits>
+
 // Adjusted implementation thresholds from #28547, can be overridden at build time
 #ifndef GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC
 #    if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
@@ -324,6 +327,89 @@ static void top_k_argsort_cuda(
     }
 }
 
+// GGML_CUDA_TOP_K_SORT=1 (C985, Q1718): each row's k columns in descending order of value, as the host sampler sorts
+// its candidates, equal values by the lower column. The radix gather writes every column above the threshold at the
+// slot an atomicAdd hands out, so its order is the order in which the warps reach that counter and changes from call to
+// call (DeviceTopK's is unspecified too). A sampling chain that sums the candidates' probabilities in that order
+// (top-k -> temperature -> dist) then gives other tokens for one seed and the same logits. One block per row sorts the
+// row's (key, column) pairs in shared memory with a bitonic network over a strict total order, so the result does not
+// depend on the order the gather wrote. The key is the radix select's own (the float's bits in float order).
+static __global__ void top_k_sort_rows(const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k,
+                                       const int k_pad) {
+    extern __shared__ uint32_t top_k_sort_smem[];
+    uint32_t * keys = top_k_sort_smem;
+    int *      cols = (int *) (top_k_sort_smem + k_pad);
+
+    const float * row_src = src + (size_t) blockIdx.x * ncols;
+    int *         row_dst = dst + (size_t) blockIdx.x * k;
+
+    // the padding has the lowest key and a column above every real one, so it sorts last
+    for (int i = threadIdx.x; i < k_pad; i += blockDim.x) {
+        const int col = i < k ? row_dst[i] : INT_MAX;
+        cols[i] = col;
+        keys[i] = i < k ? top_k_float_to_ordered(row_src[col]) : 0;
+    }
+    __syncthreads();
+
+    for (int size = 2; size <= k_pad; size *= 2) {
+        for (int stride = size / 2; stride > 0; stride /= 2) {
+            for (int i = threadIdx.x; i < k_pad; i += blockDim.x) {
+                const int j = i ^ stride;
+                if (j <= i) {
+                    continue;
+                }
+                // j goes first: the larger key, or the same key and the lower column
+                const bool j_first = keys[j] > keys[i] || (keys[j] == keys[i] && cols[j] < cols[i]);
+                // the runs with (i & size) == 0 put the pair in order, the others in reverse
+                if (((i & size) == 0) == j_first) {
+                    const uint32_t key = keys[i];
+                    keys[i] = keys[j];
+                    keys[j] = key;
+                    const int col = cols[i];
+                    cols[i] = cols[j];
+                    cols[j] = col;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        row_dst[i] = cols[i];
+    }
+}
+
+// GGML_CUDA_TOP_K_SORT: 0 (default) off, upstream's order; 1 the radix select's and DeviceTopK's results sorted as above,
+// on any NVIDIA GPU. The bitonic and CUB argsort paths already return each row sorted by descending value.
+static bool top_k_sort_enabled() {
+    static const bool on = [] {
+        const char * env = getenv("GGML_CUDA_TOP_K_SORT");
+        const bool   v   = env != nullptr && atoi(env) != 0;
+        if (v) {
+            GGML_LOG_INFO("%s: GGML_CUDA_TOP_K_SORT=1: the radix top-k's columns sorted by descending value, ties by column\n",
+                          __func__);
+        }
+        return v;
+    }();
+    return on;
+}
+
+static void top_k_sort_cuda(const float * src, int * dst, const int ncols, const int64_t nrows, const int k,
+                            cudaStream_t stream) {
+    const int    k_pad = next_power_of_2(k);
+    const size_t smem  = (size_t) k_pad * (sizeof(uint32_t) + sizeof(int));
+    if (smem > ggml_cuda_info().devices[ggml_cuda_get_device()].smpb) {
+        static std::atomic<bool> warned(false);
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("%s: GGML_CUDA_TOP_K_SORT: k = %d does not fit in shared memory, its columns stay unsorted\n",
+                          __func__, k);
+        }
+        return;
+    }
+    GGML_ASSERT(nrows <= INT_MAX);
+    top_k_sort_rows<<<(int) nrows, std::min(k_pad, 256), smem, stream>>>(src, dst, ncols, k, k_pad);
+}
+
 // which of ggml_cuda_op_top_k's kernels a call of nrows rows of ncols columns runs on the device. One function for the op
 // and for GGML_CUDA_KEEPALIVE_EAGER=3's key (C866), which leaves the row length out and asks this instead
 static ggml_cuda_top_k_path top_k_pick(const int device, const int64_t ncols, const int64_t nrows) {
@@ -387,12 +473,18 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             return;
         case GGML_CUDA_TOP_K_PATH_RADIX:
             top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+            if (top_k_sort_enabled()) {
+                top_k_sort_cuda(src0_d, dst_d, ncols, nrows, k, stream);
+            }
             return;
         case GGML_CUDA_TOP_K_PATH_CUB_TOP_K:
 #ifdef CUB_TOP_K_AVAILABLE
             // TODO: Assess perf of `DeviceBatchedTopK` for multi-row TopK & CCCL >= 3.5.0, re-running perf sweep of https://github.com/ggml-org/llama.cpp/pull/28713
             for (int64_t i = 0; i < nrows; i++) {
                 top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
+            }
+            if (top_k_sort_enabled()) {
+                top_k_sort_cuda(src0_d, dst_d, ncols, nrows, k, stream);
             }
             return;
 #else
