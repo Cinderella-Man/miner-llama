@@ -196,6 +196,8 @@ static void usage(char ** argv) {
     LOG("  --mtp-h-dev              Check that LLAMA_MTP_H_DEV's host and device rows give the MTP draft the same caches and drafts (CPU only)\n");
     LOG("  --mtp-incall-overlap     Check that checkpoints inside a call (C217) give the MTP draft's parts and drafts of separate calls,\n");
     LOG("                           with LLAMA_MTP_CATCHUP_OVERLAP off and on (CPU only)\n");
+    LOG("  --quantize               Check that each model, quantized with llama-quantize's default rules (Q8_0), loads and\n");
+    LOG("                           decodes one token with finite logits (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -5794,6 +5796,153 @@ static int test_kv_seq_rm_time(const std::string & arch_filter, const size_t see
     return n_failed == 0 ? 0 : 1;
 }
 
+// --quantize (C983): each random model saved as F32, quantized by llama_model_quantize with its default rules (Q8_0,
+// no tensor named), then loaded on the CPU and decoded for one token. The quantized file must load, decode and give
+// finite logits, and must hold at least one quantized tensor (a file the rules left whole would test nothing). A tensor
+// the rules quantize although the graph needs it unquantized (an elementwise MUL operand, e.g.) aborts the decode in
+// the CPU backend (binary_op: unsupported types), which fails the test.
+static int test_quantize(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    size_t max_arch_name_length = 0;
+    for (const llm_arch & arch : llama_arch_all()) {
+        max_arch_name_length = std::max(max_arch_name_length, strlen(llama_arch_name(arch)));
+    }
+    const std::string template_row = "|%" + std::to_string(max_arch_name_length) + "s|%6s|%10s|%s\n";
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    common_log_flush(common_log_main());
+    LOG(template_row.c_str(), "Model arch.", "Config", "Quantized", "Status");
+
+    // distinct from other processes' files: ctest runs tests side by side
+    const std::string tmp_tag = std::to_string(std::random_device{}());
+
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !arch_supported(arch)) {
+            continue;
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+            continue;
+        }
+        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
+        if (encode || !llama_arch_supports_save(arch)) {
+            continue;
+        }
+        for (bool moe : {false, true}) {
+            if (moe && !moe_implemented(arch)) {
+                continue;
+            }
+            if (!moe && moe_mandatory(arch)) {
+                continue;
+            }
+            n_tests++;
+            // the arch first, so a decode that aborts names its model
+            LOG("|%*s|%6s|", (int) max_arch_name_length, llama_arch_name(arch), moe ? "MoE" : "Dense");
+            common_log_flush(common_log_main());
+
+            const std::filesystem::path dir  = std::filesystem::temp_directory_path();
+            const std::string           stem = "test-llama-archs-quantize-" + tmp_tag + "-" + llama_arch_name(arch) + (moe ? "-moe" : "-dense");
+            const std::string path_f32 = (dir / (stem + "-f32.gguf")).string();
+            const std::string path_q   = (dir / (stem + "-q8_0.gguf")).string();
+
+            std::string quantized_str = "-";
+            std::string status;
+            try {
+                uint32_t n_vocab = 0;
+                {
+                    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+                    llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+                    llama_model_save_to_file(model.get(), path_f32.c_str());
+                    n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+                }
+
+                llama_model_quantize_params qparams = llama_model_quantize_default_params();
+                qparams.ftype   = LLAMA_FTYPE_MOSTLY_Q8_0;
+                qparams.nthread = 4;
+                if (llama_model_quantize(path_f32.c_str(), path_q.c_str(), &qparams) != 0) {
+                    throw std::runtime_error("llama_model_quantize failed");
+                }
+
+                int64_t n_tensors   = 0;
+                int64_t n_quantized = 0;
+                {
+                    gguf_init_params gparams = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+                    gguf_context_ptr qctx(gguf_init_from_file(path_q.c_str(), gparams));
+                    if (!qctx) {
+                        throw std::runtime_error("cannot read the quantized file");
+                    }
+                    n_tensors = gguf_get_n_tensors(qctx.get());
+                    for (int64_t i = 0; i < n_tensors; i++) {
+                        n_quantized += ggml_is_quantized(gguf_get_tensor_type(qctx.get(), i)) ? 1 : 0;
+                    }
+                }
+                quantized_str = std::to_string(n_quantized) + "/" + std::to_string(n_tensors);
+
+                FILE * file = fopen(path_q.c_str(), "rb");
+                GGML_ASSERT(file != nullptr);
+                bool finite = true;
+                {
+                    auto model_and_ctx = get_model_and_ctx(nullptr, file, seed, stdev, {});
+                    const std::vector<llama_token> tokens = get_tokens(1, n_vocab, seed);
+                    const std::vector<float> logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+                    for (const float x : logits) {
+                        finite = finite && std::isfinite(x);
+                    }
+                }
+                fclose(file);
+
+                if (n_quantized == 0) {
+                    n_failed++;
+                    status = "\033[1;31mFAIL\033[0m (no tensor quantized)";
+                } else if (!finite) {
+                    n_failed++;
+                    status = "\033[1;31mFAIL\033[0m (logits not finite)";
+                } else {
+                    status = "\033[1;32mOK\033[0m";
+                }
+            } catch (const std::exception & err) {
+                n_failed++;
+                status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
+            }
+            std::filesystem::remove(path_f32);
+            std::filesystem::remove(path_q);
+            LOG("%10s|%s\n", quantized_str.c_str(), status.c_str());
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -5814,6 +5963,7 @@ int main(int argc, char ** argv) {
     bool kv_seq_rm = false;
     bool kv_seq_rm_time = false;
     bool ngram_prefetch = false;
+    bool quantize = false;
     bool mtp_graph_keep = false;
     bool mtp_replan = false;
     bool verify_prepare = false;
@@ -5912,6 +6062,8 @@ int main(int argc, char ** argv) {
             mtp_incall_overlap = true;
         } else if (strcmp(argv[i], "--ngram-prefetch") == 0) {
             ngram_prefetch = true;
+        } else if (strcmp(argv[i], "--quantize") == 0) {
+            quantize = true;
         } else if (strcmp(argv[i], "--mtp") == 0) {
             save_mtp = true;
         } else if (strcmp(argv[i], "--mtp-draft") == 0) {
@@ -5974,6 +6126,9 @@ int main(int argc, char ** argv) {
         }
         if (ngram_prefetch) {
             return test_ngram_prefetch(arch_filter, seed, stdev, verbosity);
+        }
+        if (quantize) {
+            return test_quantize(arch_filter, seed, stdev, verbosity);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {

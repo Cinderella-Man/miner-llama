@@ -274,6 +274,11 @@ set_tests_properties(test-generate-models PROPERTIES
     FIXTURES_SETUP generate-models
 )
 
+# the models Miner Llama runs, quantized with llama-quantize's default rules (Q8_0), load and decode a token (C983);
+# qwen4exp's ple_norm_* tensors are elementwise MUL operands, which the rules must leave unquantized
+llama_test(test-llama-archs NAME test-quantize-default-rules LABEL "main behavior backend"
+    ARGS --quantize -a "^(qwen4exp|qwen35moe|flint)$" -s 1)
+
 # Target model for test-speculative-rejection-sampling
 set(SPEC_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-speculative-models/target")
 file(MAKE_DIRECTORY "${SPEC_TARGET_DIR}")
