@@ -528,6 +528,7 @@ public:
     void busy_spin_acquire();
     void busy_spin_release();
     void graph_compute(uint32_t device, const ggml_cgraph * cgraph);
+    void free_buffer(uint64_t remote_ptr);
 
     bool start(const std::string & endpoint);
     void work();
@@ -556,7 +557,10 @@ private:
     };
 
     std::mutex graph_mutex;
-    std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
+    // per device, the uids of the graphs the server has an entry for (rpc_server::stored_graphs): true while the
+    // server still holds the graph, false once a FREE_BUFFER made it drop the graph; the server keeps such an entry,
+    // so both sides count it toward GRAPH_CACHE_MAX
+    std::unordered_map<uint32_t, std::unordered_map<uint64_t, bool>> graph_uids;
 
     rpc_msg_queue queue;
     socket_ptr    sock;
@@ -741,10 +745,8 @@ static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoi
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    auto request = std::make_shared<rpc_msg_free_buffer_req>();
-    request->remote_ptr = ctx->remote_ptr;
-    LOG_DBG2("[%s] remote_ptr: 0x%" PRIx64 "\n", __func__, request->remote_ptr);
-    ctx->dispatcher->send(RPC_CMD_FREE_BUFFER, request, sizeof(*request), nullptr, 0, nullptr, 0);
+    LOG_DBG2("[%s] remote_ptr: 0x%" PRIx64 "\n", __func__, ctx->remote_ptr);
+    ctx->dispatcher->free_buffer(ctx->remote_ptr);
     delete ctx;
 }
 
@@ -1272,7 +1274,8 @@ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) 
     std::lock_guard<std::mutex> lock(graph_mutex);
     GGML_ASSERT(cgraph->n_nodes > 0);
     auto & device_graph_uids = graph_uids[device];
-    bool reuse = cgraph->uid != 0 && device_graph_uids.count(cgraph->uid) > 0;
+    auto it = cgraph->uid != 0 ? device_graph_uids.find(cgraph->uid) : device_graph_uids.end();
+    bool reuse = it != device_graph_uids.end() && it->second;
     LOG_DBG("[%s] device: %u, uid: %" PRIu64 ", n_nodes: %u, reuse: %s\n", __func__, device, cgraph->uid, cgraph->n_nodes, reuse ? "yes" : "no");
     if (reuse) {
         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
@@ -1286,7 +1289,7 @@ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) 
                         __func__, device, device_graph_uids.size());
                 device_graph_uids.clear();
             }
-            device_graph_uids.insert(cgraph->uid);
+            device_graph_uids[cgraph->uid] = true;
         }
         size_t input_size = 0;
         uint8_t * input = serialize_graph(device, cgraph, this, &input_size);
@@ -1294,6 +1297,30 @@ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) 
         std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
         send_async(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
     }
+}
+
+// FREE_BUFFER makes the server drop every graph it caches, on all of its devices, since their nodes may point into the
+// freed buffer (rpc_server::free_buffer). Mark them dropped here too: otherwise the next reuse of such a graph sends a
+// GRAPH_RECOMPUTE the server rejects, it closes the connection and the client aborts. A scheduler that grows a compute
+// buffer frees the old one, so this happens whenever one scheduler re-plans while another's graphs are cached (for
+// example a context's pipe slots). The entries stay, as on the server, so both sides still clear their caches at the
+// same point. graph_mutex is held while the command is queued, so a GRAPH_RECOMPUTE decided before the marking cannot
+// be queued after the FREE_BUFFER.
+void rpc_dispatcher::free_buffer(uint64_t remote_ptr) {
+    auto request = std::make_shared<rpc_msg_free_buffer_req>();
+    request->remote_ptr = remote_ptr;
+    std::lock_guard<std::mutex> lock(graph_mutex);
+    size_t n_dropped = 0;
+    for (auto & device_graph_uids : graph_uids) {
+        for (auto & entry : device_graph_uids.second) {
+            n_dropped += entry.second ? 1 : 0;
+            entry.second = false;
+        }
+    }
+    if (n_dropped > 0) {
+        LOG_DBG("[%s] remote_ptr: 0x%" PRIx64 ", %zu cached graphs dropped\n", __func__, remote_ptr, n_dropped);
+    }
+    send(RPC_CMD_FREE_BUFFER, request, sizeof(*request), nullptr, 0, nullptr, 0);
 }
 
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
