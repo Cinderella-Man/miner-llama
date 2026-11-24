@@ -84,6 +84,7 @@
 #include "ggml-cuda/moe-persistent.cuh"
 #include "ggml-cuda/hop-mailbox.cuh"
 #include "ggml-cuda/keepalive.cuh"
+#include "ggml-cuda/keepalive-trace.h"
 #include "ggml-cuda/graph-force.h"
 #include "ggml.h"
 
@@ -7789,76 +7790,151 @@ static uint32_t ggml_cuda_keepalive_depth_dims(const ggml_tensor * node, const i
 // past the sparse attention's threshold (n_kv >= _MIN_RATIO x n_kv_max) is such a pass: the sparse kernels take it
 // (R191: its first launch waited about 1 s on card 8 with no stop), while the draft's earlier one-token passes, at the
 // warm-up's 256 cells, ran the dense ones. Every other op's sizes, and every token count, stay in the key as at 1.
-static uint64_t ggml_cuda_keepalive_shapes(const ggml_cgraph * cgraph, const int device = -1, const bool no_depth = false) {
+// GGML_CUDA_KEEPALIVE_TRACE (C878, keepalive-trace.h): trace = true also records each field mixed, with what it is, in
+// rec; trace = false is the key alone
+template <bool trace>
+static uint64_t ggml_cuda_keepalive_shapes_impl(const ggml_cgraph * cgraph, const int device, const bool no_depth,
+                                                ggml_cuda_ka_trace_rec * rec) {
     uint64_t h = 0x9e3779b97f4a7c15ull ^ (uint64_t) cgraph->n_nodes;
     auto mix = [&h](uint64_t v) {
         h ^= v;
         h *= 0xbf58476d1ce4e5b9ull;
         h ^= h >> 31;
     };
-    // a tensor of such an op: its sizes with those along the cache's length marked, its strides as packed or as they are
-    auto mix_depth = [&mix](const ggml_tensor * t, const uint32_t dims) {
-        for (int d = 0; d < GGML_MAX_DIMS; d++) {
-            mix((dims >> d) & 1 ? 0xd3b7d3b7d3b7d3b7ull : (uint64_t) t->ne[d]);
-        }
-        for (int d = 1; d < GGML_MAX_DIMS; d++) {
-            mix(t->nb[d] == t->nb[d - 1]*(size_t) t->ne[d - 1] ? 0x9ac4ed9ac4ed9ac4ull : (uint64_t) t->nb[d]);
+    // a field: mixed, and recorded when tracing
+    auto put = [&mix, rec](const uint16_t code, const uint64_t v) {
+        mix(v);
+        if constexpr (trace) {
+            rec->put(code, v);
+        } else {
+            GGML_UNUSED(code);
+            GGML_UNUSED(rec);
         }
     };
+    // a tensor of such an op: its sizes with those along the cache's length marked, its strides as packed or as they are
+    auto mix_depth = [&put](const ggml_tensor * t, const uint32_t dims, const int slot) {
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            put(ggml_cuda_ka_field(GGML_CUDA_KA_F_NE, slot, d), (dims >> d) & 1 ? GGML_CUDA_KA_MARK_DEPTH : (uint64_t) t->ne[d]);
+        }
+        for (int d = 1; d < GGML_MAX_DIMS; d++) {
+            put(ggml_cuda_ka_field(GGML_CUDA_KA_F_NB, slot, d),
+                t->nb[d] == t->nb[d - 1]*(size_t) t->ne[d - 1] ? GGML_CUDA_KA_MARK_PACKED : (uint64_t) t->nb[d]);
+        }
+    };
+    if constexpr (trace) {
+        rec->n_nodes = cgraph->n_nodes;
+    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
         }
-        mix((uint64_t) node->op | ((uint64_t) node->type << 16));
+        if constexpr (trace) {
+            rec->begin_node(i);
+        }
+        put(ggml_cuda_ka_field(GGML_CUDA_KA_F_OP, 0, 0), (uint64_t) node->op | ((uint64_t) node->type << 16));
         if (no_depth && ggml_cuda_keepalive_depth_op(node->op)) {
-            mix_depth(node, ggml_cuda_keepalive_depth_dims(node, 0));
+            mix_depth(node, ggml_cuda_keepalive_depth_dims(node, 0), 0);
             for (int w = 0; w < (int) (GGML_MAX_OP_PARAMS / sizeof(int32_t)); w++) {
                 const int32_t v = ggml_get_op_params_i32(node, w);
-                mix(node->op == GGML_OP_FLASH_ATTN_EXT && w == 4 ? (uint64_t) (v > 0) : (uint64_t) (uint32_t) v);
+                put(ggml_cuda_ka_field(GGML_CUDA_KA_F_PARAM32, 0, w),
+                    node->op == GGML_OP_FLASH_ATTN_EXT && w == 4 ? (uint64_t) (v > 0) : (uint64_t) (uint32_t) v);
             }
             for (int j = 0; j < GGML_MAX_SRC; j++) {
                 const ggml_tensor * s = node->src[j];
                 if (s == nullptr) {
                     continue;
                 }
-                mix((uint64_t) (j + 1) | ((uint64_t) s->type << 16));
-                mix_depth(s, ggml_cuda_keepalive_depth_dims(node, j + 1));
+                put(ggml_cuda_ka_field(GGML_CUDA_KA_F_SRC, j + 1, 0), (uint64_t) (j + 1) | ((uint64_t) s->type << 16));
+                mix_depth(s, ggml_cuda_keepalive_depth_dims(node, j + 1), j + 1);
             }
             if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-                mix(0xfa00000000000000ull ^ ggml_cuda_flash_attn_ext_length_choice(device, node));
+                put(ggml_cuda_ka_field(GGML_CUDA_KA_F_FA, 0, 0),
+                    GGML_CUDA_KA_MARK_FA ^ ggml_cuda_flash_attn_ext_length_choice(device, node));
             } else if (node->op == GGML_OP_TOP_K) {
-                mix(0x7c00000000000000ull ^ (uint64_t) ggml_cuda_top_k_path_of(device, node));
+                put(ggml_cuda_ka_field(GGML_CUDA_KA_F_TOPK, 0, 0),
+                    GGML_CUDA_KA_MARK_TOPK ^ (uint64_t) ggml_cuda_top_k_path_of(device, node));
             }
             continue;
         }
         for (int d = 0; d < GGML_MAX_DIMS; d++) {
-            mix((uint64_t) node->ne[d]);
+            put(ggml_cuda_ka_field(GGML_CUDA_KA_F_NE, 0, d), (uint64_t) node->ne[d]);
         }
         for (int d = 1; d < GGML_MAX_DIMS; d++) {
-            mix((uint64_t) node->nb[d]);
+            put(ggml_cuda_ka_field(GGML_CUDA_KA_F_NB, 0, d), (uint64_t) node->nb[d]);
         }
         uint64_t p[GGML_MAX_OP_PARAMS / sizeof(uint64_t)];
         memcpy(p, node->op_params, sizeof(p));
-        for (uint64_t v : p) {
-            mix(v);
+        for (int w = 0; w < (int) (GGML_MAX_OP_PARAMS / sizeof(uint64_t)); w++) {
+            put(ggml_cuda_ka_field(GGML_CUDA_KA_F_PARAM64, 0, w), p[w]);
         }
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             const ggml_tensor * s = node->src[j];
             if (s == nullptr) {
                 continue;
             }
-            mix((uint64_t) (j + 1) | ((uint64_t) s->type << 16));
+            put(ggml_cuda_ka_field(GGML_CUDA_KA_F_SRC, j + 1, 0), (uint64_t) (j + 1) | ((uint64_t) s->type << 16));
             for (int d = 0; d < GGML_MAX_DIMS; d++) {
-                mix((uint64_t) s->ne[d]);
+                put(ggml_cuda_ka_field(GGML_CUDA_KA_F_NE, j + 1, d), (uint64_t) s->ne[d]);
             }
             for (int d = 1; d < GGML_MAX_DIMS; d++) {
-                mix((uint64_t) s->nb[d]);
+                put(ggml_cuda_ka_field(GGML_CUDA_KA_F_NB, j + 1, d), (uint64_t) s->nb[d]);
             }
         }
     }
+    if constexpr (trace) {
+        rec->end();
+    }
     return h;
+}
+
+static uint64_t ggml_cuda_keepalive_shapes(const ggml_cgraph * cgraph, const int device = -1, const bool no_depth = false) {
+    return ggml_cuda_keepalive_shapes_impl<false>(cgraph, device, no_depth, nullptr);
+}
+
+// GGML_CUDA_KEEPALIVE_TRACE's MiB of recorded fields a card, 0 off; read once
+static int ggml_cuda_keepalive_trace_mib() {
+    static const int mib = ggml_cuda_keepalive_parse_trace(getenv("GGML_CUDA_KEEPALIVE_TRACE"));
+    return mib;
+}
+
+// GGML_CUDA_KEEPALIVE_TRACE (C878): the key's record on the card dev (physical), and a line when the key is new to it
+static void ggml_cuda_keepalive_trace(const int dev, const int level, const uint64_t key, const ggml_cgraph * cgraph,
+                                      ggml_cuda_ka_trace_rec && rec) {
+    static std::mutex mutex;
+    static ggml_cuda_ka_trace_card cards[GGML_CUDA_MAX_DEVICES];
+    static bool announced = false;
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!announced) {
+        announced = true;
+        GGML_LOG_INFO("%s: GGML_CUDA_KEEPALIVE_TRACE: a line for each key new to a card at GGML_CUDA_KEEPALIVE_EAGER=%d, set "
+                      "against the card's nearest earlier key; up to %d MiB of fields kept a card\n", __func__, level,
+                      ggml_cuda_keepalive_trace_mib());
+    }
+    if (ggml_cuda_ka_trace_key_of(rec) != key) {
+        GGML_LOG_WARN("%s: CUDA%d: the record of key 0x%016" PRIx64 " does not give the key: the trace misses a field\n",
+                      __func__, dev, key);
+    }
+    const ggml_cuda_ka_trace_diff d = ggml_cuda_ka_trace_add(cards[dev], key, std::move(rec),
+                                                             (size_t) ggml_cuda_keepalive_trace_mib() << 20);
+    if (!d.fresh) {
+        return;
+    }
+    auto describe = [cgraph](const int32_t i) -> std::string {
+        if (i < 0 || i >= cgraph->n_nodes) {
+            return "node ?";
+        }
+        const ggml_tensor * t = cgraph->nodes[i];
+        char buf[256];
+        snprintf(buf, sizeof(buf), "node %d '%s' (%s %s [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "])", i, t->name,
+                 ggml_op_desc(t), ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+        return buf;
+    };
+    GGML_LOG_INFO("%s: CUDA%d: %s\n", __func__, dev, ggml_cuda_ka_trace_line(d, level, describe).c_str());
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -7994,6 +8070,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 ka_slot & slot = ka_cache[(k ^ (k >> 17) ^ (k >> 33)) & 255];
                 if (cgraph->uid != 0 && cgraph->uid == slot.uid) {
                     shapes = slot.shapes;
+                } else if (ggml_cuda_keepalive_trace_mib() > 0) {
+                    // GGML_CUDA_KEEPALIVE_TRACE (C878): the same key, its fields recorded, and a line if it is new to the card
+                    ggml_cuda_ka_trace_rec rec;
+                    shapes      = ggml_cuda_keepalive_shapes_impl<true>(cgraph, ka_level == 3 ? cuda_ctx->device : -1,
+                                                                        ka_level == 3, &rec);
+                    slot.uid    = cgraph->uid;
+                    slot.shapes = shapes;
+                    ggml_cuda_keepalive_trace(ggml_cuda_get_physical_device(cuda_ctx->device), ka_level, shapes, cgraph,
+                                              std::move(rec));
                 } else {
                     shapes      = ka_level == 3 ? ggml_cuda_keepalive_shapes(cgraph, cuda_ctx->device, true) :
                                                       ggml_cuda_keepalive_shapes(cgraph);
