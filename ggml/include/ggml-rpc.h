@@ -10,15 +10,17 @@ extern "C" {
 // after GGML_OP_GLU, GGML_OP_MOE_TAIL after it and GGML_OP_RANGE_MASK after that. Every op from GGML_OP_UNARY on
 // therefore has another number than in stock llama.cpp, and a graph sent between a fork build and a stock build would
 // run the wrong ops. The fork's major version (stock 10 + 100) makes each side refuse the other at the handshake: a client
-// accepts only a server with its own major version. A fork server without GGML_OP_MOE_TAIL (patch 2) or without
-// GGML_OP_RANGE_MASK (patch 3) rejects that op and runs every other. Major 109 (stock 9) numbered the ops before
+// accepts only a server with its own major version. Stock ops added upstream after the fork's own go after them
+// (upstream b12674's GGML_OP_SLEEP and GGML_OP_SIGMOID_BACK, patch 6), so the fork's numbers stay. A fork server
+// without GGML_OP_MOE_TAIL (patch 2), without GGML_OP_RANGE_MASK (patch 3) or without the two b12674 ops (before
+// patch 6) rejects that op and runs every other. Major 109 (stock 9) numbered the ops before
 // upstream's prune (#29801) removed GGML_OP_ADD1, GGML_OP_DIAG_MASK_INF and GGML_OP_DIAG_MASK_ZERO.
 #define RPC_PROTO_MAJOR_VERSION    110
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    4
+#define RPC_PROTO_PATCH_VERSION    6
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

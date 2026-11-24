@@ -43,8 +43,6 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
-    bool fused_lid;          // use fused lightning indexer
-    bool auto_flid;
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
@@ -130,6 +128,7 @@ struct llama_cparams {
     // llama_head_bound_*): while head_bound_on, a decode with one output computes the shortlist's logits and keeps
     // the head's input row for the bound and the full-head fallback
     bool head_bound_on = false;
+    bool moe_random_routing; // benchmark only: random expert ids in the MoE GEMMs
 
     size_t moe_cache_size;
     float  moe_cache_cpu_share;

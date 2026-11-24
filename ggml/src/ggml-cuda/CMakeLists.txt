@@ -146,6 +146,8 @@ if (CUDAToolkit_FOUND)
         message(STATUS "Extra nvcc options for the Pascal kernel files: ${GGML_CUDA_PASCAL_FLAGS}")
     endif()
 
+    target_link_libraries(ggml-cuda PRIVATE ${CMAKE_DL_LIBS})
+
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
     endif()

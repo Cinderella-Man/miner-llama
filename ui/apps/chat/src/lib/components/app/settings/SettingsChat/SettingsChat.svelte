@@ -7,6 +7,7 @@
 		SettingsChatImportExportTab,
 		SettingsChatMobileHeader,
 		SettingsChatToolsTab,
+		SettingsChatVoiceTab,
 		SettingsFooter,
 		SettingsResetButton
 	} from '#lib/components/app/settings/index.ts';
@@ -20,7 +21,6 @@
 	import { ColorMode } from '#lib/enums/ui.enums.ts';
 	import { modelsStore, serverStore, settingsStore } from '#lib/stores/index.ts';
 	import type { SettingsSection, SettingsSectionTitle } from '#lib/types/index.ts';
-	import { applySurfaceTheme } from '#lib/utils/index.ts';
 	import { setMode } from 'mode-watcher';
 	import { fade } from 'svelte/transition';
 	interface Props {
@@ -90,20 +90,20 @@
 	function handleConfigChange(key: string, value: string | boolean) {
 		localConfig[key] = value;
 
-		// the surface theme previews at once, like the colour theme
-		if (key === SETTINGS_KEYS.SURFACE_THEME) applySurfaceTheme(value);
-
 		// discover needs the hub metadata reads: checking it turns the hub on,
 		// unchecking it turns the hub back off, so the checkbox never lies
 		if (key === SETTINGS_KEYS.ENABLE_DISCOVER_MODELS) {
 			localConfig[SETTINGS_KEYS.USE_HUGGING_FACE_HUB] = value === true;
+
+			// it opens from the Models page, so checking it shows Models too; unchecking it
+			// leaves Models as it is, since Models is useful without it
+			if (value === true) localConfig[SETTINGS_KEYS.SHOW_MODELS_MANAGER] = true;
 		}
 	}
 
 	function handleReset() {
 		localConfig = { ...settingsStore.config };
 		setMode(localConfig.theme as ColorMode);
-		applySurfaceTheme(localConfig[SETTINGS_KEYS.SURFACE_THEME]);
 		mobileHeader?.updateCarousel();
 	}
 
@@ -181,6 +181,12 @@
 						<SettingsChatToolsTab />
 					{:else if currentSection.slug === SETTINGS_SECTION_SLUGS.IMPORT_EXPORT}
 						<SettingsChatImportExportTab />
+					{:else if currentSection.slug === SETTINGS_SECTION_SLUGS.VOICE && currentSection.fields}
+						<SettingsChatVoiceTab
+							fields={currentSection.fields}
+							{localConfig}
+							onConfigChange={handleConfigChange}
+						/>
 					{:else if currentSection.fields}
 						<div class="space-y-6">
 							<SettingsChatFields
@@ -205,7 +211,9 @@
 				</div>
 
 				<div class="mt-8 border-t border-border/30 pt-6 pb-6">
-					<p class="text-xs text-muted-foreground">Settings are saved in browser's localStorage</p>
+					<p class="text-caption text-muted-foreground">
+						Settings are saved in browser's localStorage
+					</p>
 				</div>
 			</div>
 

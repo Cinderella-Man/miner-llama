@@ -152,6 +152,10 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(ggml_backend_dev_t dev);
 
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if (ggml_flash_attn_ext_has_indexed_bias(op)) {
+        return false;
+    }
+
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
@@ -973,7 +977,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_CONCAT: {
                 split_state = handle_concat(src_ss);
             } break;
-            case GGML_OP_SILU_BACK: {
+            case GGML_OP_SILU_BACK:
+            case GGML_OP_SIGMOID_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_NORM:
@@ -2157,8 +2162,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                 };
 
-                skip_unrelated();
-                if (id + 1 >= cgraph->n_nodes) {
+                // Chain of MULs with MIRRORED src[1], returns false at the end of the graph
+                auto absorb_muls = [&]() -> bool {
+                    while (true) {
+                        skip_unrelated();
+                        if (id + 1 >= cgraph->n_nodes) {
+                            return false;
+                        }
+                        ggml_tensor * next = cgraph->nodes[id+1];
+                        if (next->op == GGML_OP_MUL && next->src[0] == node &&
+                                ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                            node = next;
+                            id++;
+                            idr = id;
+                            n_used = ggml_node_get_use_count(cgraph, id);
+                        } else {
+                            return true;
+                        }
+                    }
+                };
+
+                // MULs before the PARTIAL bias (e.g. a per-expert weight scale): sum_j(s*p_j + b/n) == s*sum_j(p_j) + b
+                if (!absorb_muls()) {
                     return idr;
                 }
                 {
@@ -2172,22 +2197,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         n_used = ggml_node_get_use_count(cgraph, id);
                     }
                 }
-                // Chain of MULs with MIRRORED src[1]
-                while (true) {
-                    skip_unrelated();
-                    if (id + 1 >= cgraph->n_nodes) {
-                        return idr;
-                    }
-                    ggml_tensor * next = cgraph->nodes[id+1];
-                    if (next->op == GGML_OP_MUL && next->src[0] == node &&
-                            ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-                        node = next;
-                        id++;
-                        idr = id;
-                        n_used = ggml_node_get_use_count(cgraph, id);
-                    } else {
-                        break;
-                    }
+                if (!absorb_muls()) {
+                    return idr;
                 }
 
                 if (n_used != node->ne[1] || id + 2*n_used-1 >= cgraph->n_nodes) {
