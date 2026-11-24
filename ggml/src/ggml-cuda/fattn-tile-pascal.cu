@@ -1113,8 +1113,8 @@ static float ftp_fault_scale() {
         char * end = nullptr;
         const float v = strtof(env, &end);
         if (end == env || *end != '\0' || !std::isfinite(v)) {
-            GGML_LOG_WARN("%s: GGML_CUDA_FATTN_TILE_PASCAL_FAULT_SCALE=%s is not a number: %.2f is used\n",
-                __func__, env, (double) FTP_FAULT_SCALE_DEFAULT);
+            GGML_LOG_WARN("ftp_fault_scale: GGML_CUDA_FATTN_TILE_PASCAL_FAULT_SCALE=%s is not a number: %.2f is used\n",
+                env, (double) FTP_FAULT_SCALE_DEFAULT);
             return FTP_FAULT_SCALE_DEFAULT;
         }
         return v;
