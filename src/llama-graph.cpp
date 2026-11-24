@@ -983,7 +983,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     // the mask built on the device or on the host, as the new ubatch needs, and the same shapes
-    const bool kq_mask_dev = llama_kq_mask_on_device(params.hparams, params.cparams, params.ubatch) && mctx->get_kq_cells_resident();
+    const bool kq_mask_dev = llama_kq_mask_on_device(params.model->hparams, params.cparams, params.ubatch) && mctx->get_kq_cells_resident();
     res &= kq_mask_dev == (kq_dev.upd != nullptr);
     if (kq_dev.upd) {
         kq_dev.caches[0].mctx = mctx;
@@ -1158,7 +1158,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     }
 
     // the mask built on the device or on the host, as the new ubatch needs, and the same shapes
-    const bool kq_mask_dev = llama_kq_mask_on_device(params.hparams, params.cparams, params.ubatch) &&
+    const bool kq_mask_dev = llama_kq_mask_on_device(params.model->hparams, params.cparams, params.ubatch) &&
         mctx->get_base()->get_kq_cells_resident() && mctx->get_swa()->get_kq_cells_resident();
     res &= kq_mask_dev == (kq_dev.upd != nullptr);
     if (kq_dev.upd) {
@@ -1583,7 +1583,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     // the mask built on the device or on the host, as the new ubatch needs, and the same shapes
-    const bool kq_mask_dev = llama_kq_mask_on_device(params.hparams, params.cparams, params.ubatch) &&
+    const bool kq_mask_dev = llama_kq_mask_on_device(params.model->hparams, params.cparams, params.ubatch) &&
         mctx->get_attn()->get_kq_cells_resident();
     res &= kq_mask_dev == (inp_attn->kq_dev.upd != nullptr);
     bool mask_ok;
