@@ -270,7 +270,7 @@ llama_test(
     test-llama-archs
     NAME test-generate-models
     LABEL "main behavior backend"
-    ARGS -o "${MODEL_DIR}"
+    ARGS -s 1 -o "${MODEL_DIR}"
 )
 set_tests_properties(test-generate-models PROPERTIES
     FIXTURES_SETUP generate-models
