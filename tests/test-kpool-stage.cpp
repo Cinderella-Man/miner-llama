@@ -22,6 +22,7 @@
 #include "../src/llama-ext.h"
 
 #include "llama.h"
+#include "llama-cpp.h"
 #include "ggml-backend.h"
 
 #include <cstdio>
@@ -198,21 +199,36 @@ struct lockstep {
         for (const auto & p : parts) {
             n += p.second;
         }
-        llama_batch b = llama_batch_init(n, 0, 1);
+        // the entries, drawn once for all contexts
+        struct entry {
+            llama_token  id;
+            llama_pos    pos;
+            llama_seq_id seq;
+            bool         out;
+        };
+        std::vector<entry> es;
+        es.reserve(n);
         for (const auto & p : parts) {
             for (int i = 0; i < p.second; ++i) {
-                const int j = b.n_tokens++;
-                b.token[j]     = tok();
-                b.pos[j]       = pos[p.first] + i;
-                b.n_seq_id[j]  = 1;
-                b.seq_id[j][0] = p.first;
-                b.logits[j]    = all_out || i == p.second - 1;
+                es.push_back({ tok(), pos[p.first] + i, p.first, all_out || i == p.second - 1 });
             }
         }
 
         bool ok = true;
         for (llama_context * c : ctxs) {
-            const int rc = llama_decode(c, b);
+            // a batch per context: a batch checks its positions against the memory of the context it was made for
+            llama_batch_ext_ptr b(llama_batch_ext_init(c));
+            bool filled = true;
+            for (const entry & e : es) {
+                const int32_t idx = llama_batch_ext_add_token(b.get(), e.seq, e.id);
+                filled = filled && idx >= 0 && llama_batch_ext_set_pos(b.get(), idx, &e.pos) &&
+                         llama_batch_ext_set_output_logits(b.get(), idx, e.out);
+            }
+            if (!filled) {
+                fprintf(stderr, "decode %llu: %zu entries do not fit a batch of n_batch %u\n",
+                        (unsigned long long) n_decodes + 1, es.size(), llama_n_batch(c));
+            }
+            const int rc = filled ? llama_process(c, LLAMA_PROCESS_TYPE_DECODE, b.get()) : -1;
             CHECK(rc == 0);
             ok = ok && rc == 0;
         }
@@ -220,8 +236,8 @@ struct lockstep {
         compare_reads();
 
         if (ok) {
-            for (int j = 0; j < b.n_tokens; ++j) {
-                if (!b.logits[j]) {
+            for (int j = 0; j < (int) es.size(); ++j) {
+                if (!es[j].out) {
                     continue;
                 }
                 const float * l0 = llama_get_logits_ith(ctxs[0], j);
@@ -241,7 +257,6 @@ struct lockstep {
             }
         }
 
-        llama_batch_free(b);
         return ok;
     }
 
