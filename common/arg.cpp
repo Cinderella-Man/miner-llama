@@ -1664,7 +1664,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "pipeline, n_ubatch in between (results unchanged). SPEC: off, on (= head=256:64,tail=512:128,short=600:64), or "
         "any of head=N:S (first N tokens of a call that starts on idle devices, in micro-batches of S), tail=N:S (last "
         "N tokens before the server waits), short=N:S (a call of at most N tokens that is both: all of it in S), "
-        "min=N (no micro-batch under N tokens, default 9), comma-separated; a request's \"ubatch_taper\" overrides it "
+        "min=N (no micro-batch under N tokens, default 9), cuts=1 (each segment between in-call checkpoint cuts planned "
+        "on its own, so min=N holds in every segment; default 0), comma-separated; a request's \"ubatch_taper\" overrides it "
         "(default: off, or LLAMA_UBATCH_TAPER)",
         [](common_params & params, const std::string & value) {
             params.ubatch_taper = value;

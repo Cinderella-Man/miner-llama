@@ -5125,7 +5125,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // Q771: the micro-batch taper's plan for this call, which the memory module's splits follow; without one (taper off,
     // other batches, or a plan equal to the plain split) they take n_ubatch tokens at a time as before. The head rule
-    // applies when nothing is in flight now (after every wait above), unless the caller said otherwise.
+    // applies when nothing is in flight now (after every wait above), unless the caller said otherwise. With cuts=1
+    // (C905) the plan reads this call's cuts (set above) and plans each segment between them on its own.
     const bool taper_log = vprep_mode != 2 && taper.enabled() && n_tokens_all > 8;
     bool taper_head = false;
     bool taper_tail = false;
@@ -5133,7 +5134,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (vprep_mode != 2 && taper.enabled() && !embd_all && balloc->is_one_seq_tokens()) {
         taper_head = taper_hint_head < 0 ? !gf_in_flight : taper_hint_head > 0;
         taper_tail = taper_hint_tail != 0;
-        balloc->set_ubatch_plan(llama_ubatch_taper_plan(taper, n_tokens_all, cparams.n_ubatch, taper_head, taper_tail));
+        balloc->set_ubatch_plan(llama_ubatch_taper_plan(taper, n_tokens_all, cparams.n_ubatch, taper_head, taper_tail,
+                                                        balloc->get_ubatch_cuts()));
     }
 
     llama_memory_context_ptr mctx;

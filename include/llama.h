@@ -1410,6 +1410,9 @@ extern "C" {
     //   short=N:S  a call that is both and holds N tokens or fewer: all of it in micro-batches of S tokens
     //   min=N      no micro-batch under N tokens, a shorter remainder joins its neighbour (default 9: batches of 1-8
     //              tokens take the matrix-vector kernels)
+    //   cuts=1     with micro-batch cuts in a call (llama_set_ubatch_cuts, llama_state_seq_store_at: in-call
+    //              checkpoints), each segment between them planned on its own, so min=N holds inside every segment
+    //              (default cuts=0: the plan of the whole call, which a cut may leave a piece under N tokens beside)
     // comma-separated. Returns false and keeps the current schedule on a bad spec.
     LLAMA_API bool         llama_set_ubatch_taper(struct llama_context * ctx, const char * spec);
     // the current schedule as a spec, "off" when off
