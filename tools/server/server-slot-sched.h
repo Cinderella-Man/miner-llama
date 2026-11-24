@@ -48,10 +48,6 @@ struct server_prompt {
     // TODO: slot files do not store it
     std::vector<common_adapter_lora_info> lora;
 
-    // the lora config that the tokens were processed with, it follows the state to the prompt cache and back
-    // TODO: slot files do not store it
-    std::vector<common_adapter_lora_info> lora;
-
     void clear() {
         tokens.clear();
         checkpoints.clear();
