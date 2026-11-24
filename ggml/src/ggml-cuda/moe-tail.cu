@@ -149,16 +149,19 @@ static __global__ void k_skip_ids_fix(const char * __restrict__ ids, char * __re
     }
 }
 
-// grid (slots, tokens): the dst row of a slot whose id is -1 becomes zeros
+// grid (slots, min(tokens, 65535)): the dst row of a slot whose id is -1 becomes zeros. A grid's y size is at most
+// 65,535, so the y blocks stride over the tokens (one pass up to 65,535 tokens)
 static __global__ void k_skip_ids_zero_rows(const char * __restrict__ ids, float * __restrict__ dst, const int64_t ids_nb1,
-                                            const int64_t ne0, const int64_t s1, const int64_t s2) {
-    const int32_t id = *(const int32_t *) (ids + blockIdx.y*ids_nb1 + blockIdx.x*sizeof(int32_t));
-    if (id >= 0) {
-        return;
-    }
-    float * row = dst + blockIdx.x*s1 + blockIdx.y*s2;
-    for (int64_t i = threadIdx.x; i < ne0; i += blockDim.x) {
-        row[i] = 0.0f;
+                                            const int64_t ne0, const int64_t s1, const int64_t s2, const int64_t n_tokens) {
+    for (int64_t t = blockIdx.y; t < n_tokens; t += gridDim.y) {
+        const int32_t id = *(const int32_t *) (ids + t*ids_nb1 + blockIdx.x*sizeof(int32_t));
+        if (id >= 0) {
+            continue;
+        }
+        float * row = dst + blockIdx.x*s1 + t*s2;
+        for (int64_t i = threadIdx.x; i < ne0; i += blockDim.x) {
+            row[i] = 0.0f;
+        }
     }
 }
 
@@ -182,9 +185,9 @@ ggml_cuda_skip_ids::ggml_cuda_skip_ids(ggml_backend_cuda_context & ctx, const gg
 void ggml_cuda_ids_zero_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * orig, ggml_tensor * dst) {
     GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->nb[0] == sizeof(float));
     GGML_ASSERT(dst->ne[1] == orig->ne[0] && dst->ne[2] == orig->ne[1]);
-    const dim3 grid(orig->ne[0], orig->ne[1]);
+    const dim3 grid(orig->ne[0], (unsigned int) std::min<int64_t>(orig->ne[1], 65535));
     k_skip_ids_zero_rows<<<grid, 128, 0, ctx.stream()>>>((const char *) orig->data, (float *) dst->data, orig->nb[1],
-        dst->ne[0], dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float));
+        dst->ne[0], dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), orig->ne[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 
