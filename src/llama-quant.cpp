@@ -314,6 +314,10 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // do not quantize norm tensors
     quantize &= name.find("_norm.weight") == std::string::npos;
 
+    // qwen4exp's per-layer-embedding norms (ple_norm_key/query/conv) are elementwise MUL operands like the norms above,
+    // but their names miss that rule; the loader takes them 1-D or {n_embd, hc}, and stored 2-D they would be quantized
+    quantize &= name.find("ple_norm_") == std::string::npos;
+
     quantize &= params->quantize_output_tensor || name != "output.weight";
 
     // do not quantize expert gating tensors
