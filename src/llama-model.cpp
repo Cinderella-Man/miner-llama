@@ -3507,8 +3507,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         if (arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
                             filter_recr = [&](uint32_t)    { return false; };
-                            if (filter_idx) {
+                            // C898: the indexer cache only for an MTP block its file marks QSA (compress ratio above
+                            // 0). A block marked plain attention (ratio 0, as Flash-Next's published distilled head)
+                            // gets none, so its graph builds no k-pool input and runs dense attention over its own
+                            // cache, as a plain layer of the trunk does (hparams.indexer_kpool comes from the trunk's
+                            // QSA layers too). A QSA block keeps the filter it had before.
+                            bool mtp_qsa = false;
+                            for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+                                mtp_qsa = mtp_qsa || hparams.dsv4_compress_ratios[il] > 0;
+                            }
+                            if (filter_idx && mtp_qsa) {
                                 filter_idx = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            } else {
+                                filter_idx = nullptr;
                             }
                         }
                     }
