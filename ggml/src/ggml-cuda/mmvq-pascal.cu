@@ -1,5 +1,6 @@
 #include "mmvq-pascal.cuh"
 #include "mmvq-pascal-impl.cuh"
+#include "mmvq-pascal-pick.h"
 #include "unary.cuh"
 
 #include <algorithm>
@@ -69,7 +70,9 @@
 //
 // For the types of Ornith-1.5's files (mmvqp_mt_type: IQ2_S, IQ3_XXS, N2P, N3P, Q8_0, Q5_0), 2 to MMVQP_MAX_COLS tokens
 // can run mul_mat_vec_q_pascal_mt instead, which decodes each weight once for all tokens (GGML_CUDA_MMVQ_PASCAL_MT=1; off
-// by default: the kernel above, and before both -mtok's expert kernels and -kcol's plain products take what they take).
+// by default: the kernel above, and before both -mtok's expert kernels and -kcol's plain products take what they take;
+// =2, C899: only the plain Q5_0 and Q8_0 products that a P106 ran faster on it, which -kcol then leaves to it, by
+// mmvq-pascal-pick.h's rule).
 // It keeps the lane groups, launch shapes and weight staging of the single-token kernel and changes three things:
 //   - MUL_MAT_ID: block y serves group y of the step's (token, slot) entries, the entries that picked one expert (up to
 //     MMVQP_MAX_COLS of them in entry order; a further entry starts a new group). Each warp finds the groups in ids
@@ -1240,14 +1243,8 @@ static __device__ __forceinline__ void mmvqp_mt_rows(const mmvqp_args_mt & p, co
 }
 
 // GGML_CUDA_MMVQ_PASCAL_MT=1: 2 to MMVQP_MAX_COLS tokens of the mmvqp_mt_type types that reach this file go to
-// mul_mat_vec_q_pascal_mt; off by default (mul_mat_vec_q_pascal_mc, as on pascal-p106-v3-b12076-ladder4)
-static bool mmvqp_mt_enabled() {
-    static const bool mt = [] {
-        const char * env = getenv("GGML_CUDA_MMVQ_PASCAL_MT");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    return mt;
-}
+// mul_mat_vec_q_pascal_mt; off by default (mul_mat_vec_q_pascal_mc, as on pascal-p106-v3-b12076-ladder4); =2 (C899) only
+// the plain Q5_0 and Q8_0 products a P106 ran faster there (ggml_cuda_mmvq_pascal_mt_on, mmvq-pascal-pick.h)
 
 // GGML_CUDA_MMVQ_PASCAL_MT_RB=<n>: row blocks per block where a row's activations are staged at once (default: enough
 // for ~32 KB of weights per block); GGML_CUDA_MMVQ_PASCAL_MT_ACT_KB=<kb>: the budget of the staged activations per block
@@ -1548,6 +1545,11 @@ bool ggml_cuda_mmvq_pascal_skips(const ggml_type type) {
     return mmvqp_skip_type(type);
 }
 
+int ggml_cuda_mmvq_pascal_mt_mode() {
+    static const int mode = ggml_cuda_mmvq_pascal_mt_parse(getenv("GGML_CUDA_MMVQ_PASCAL_MT"));
+    return mode;
+}
+
 bool ggml_cuda_mmvq_pascal(
         const void * vx, ggml_type type, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion,
         float * dst, int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst, int64_t stride_row_x, int64_t stride_col_y,
@@ -1705,10 +1707,8 @@ bool ggml_cuda_mmvq_pascal(
     if (s.tile && p.stage_act && smem + MMVQ_PASCAL_NWARPS * WARP_SIZE * (yb_seg >> lpr_log2) > MMVQP_TILE_MAX_BYTES) {
         p.stage_act = false;
     }
-    p.mt                 = ncols_dst > 1 && mmvqp_mt_enabled() &&
-        (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_N2P || type == GGML_TYPE_N3P ||
-         type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q5_0) &&
-        (!ids || nchannels_dst * ncols_dst <= MMVQP_MT_MAX_ENTRIES);
+    p.mt                 = ggml_cuda_mmvq_pascal_mt_on(ggml_cuda_mmvq_pascal_mt_mode(), type, ids != nullptr, ncols_x, nrows_x,
+                                                       ncols_dst, nchannels_dst, nsamples_dst, MMVQP_MT_MAX_ENTRIES);
 
     // several tokens with ids: one block per (token, slot) entry (mul_mat_vec_q_pascal_mt: at most one per group)
     const int64_t nblocks_y = ids && ncols_dst > 1 ? nchannels_dst * ncols_dst : nchannels_dst;
@@ -1943,6 +1943,10 @@ bool ggml_cuda_mmvq_pascal_active(const int cc) {
 bool ggml_cuda_mmvq_pascal_skips(const ggml_type type) {
     GGML_UNUSED(type);
     return false;
+}
+
+int ggml_cuda_mmvq_pascal_mt_mode() {
+    return 0;
 }
 
 bool ggml_cuda_mmvq_pascal(

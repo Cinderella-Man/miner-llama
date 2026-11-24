@@ -352,6 +352,10 @@ llama_build_and_test(test-cuda-keepalive.cpp  LABEL behavior)
 # GGML_CUDA_MMVF_F32_MT_ROWS's limits per token count and GGML_CUDA_MMVF_F32_MT's row decision (C807, C822)
 llama_build_and_test(test-cuda-mmvf-f32-rows.cpp  LABEL behavior)
 
+# the Pascal matrix-vector kernels' dispatch tables: Q824's k-column table and GGML_CUDA_MMVQ_PASCAL_MT's modes, with
+# C899's measured rule for =2 checked against R197's per-product timings of Ornith-1.5-122B
+llama_build_and_test(test-cuda-mmvq-pascal-pick.cpp  LABEL behavior)
+
 # GGML_CUDA_GRAPHS_FORCE's choice of graphs and its capture decisions, in a model of the warm-up and capture logic
 llama_build_and_test(test-cuda-graph-force.cpp  LABEL behavior)
 
