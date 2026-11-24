@@ -7446,6 +7446,37 @@ size_t llama_context::state_seq_get_data_store(llama_seq_id seq_id, int32_t stor
     }
 }
 
+// C907: a server checkpoint taken between two calls of a prompt (one that the next call could not take inside it)
+// waited in llama_state_seq_get_data_store's synchronize for the whole of the last call's queued work to leave every
+// card before its copies started: on nine P106 cards an Ornith prompt of 47,012 tokens stopped 8.20, 11.85 and
+// 12.37 s at its three such checkpoints (R183). Here the copies go behind that work on each card's stream instead, as a
+// fill inside a call does; synchronize() then sweeps every backend next time, since work was queued
+size_t llama_context::state_seq_get_data_store_nowait(llama_seq_id seq_id, int32_t store_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    const bool queued = gf_in_flight || n_queued_tokens > 0 ||
+            std::any_of(pipe_slots.begin(), pipe_slots.end(), [](const pipe_slot & s) { return s.busy; });
+    if (!queued) {
+        synchronize();
+        return state_seq_get_data_store(seq_id, store_id, dst, size, flags);
+    }
+
+    store_at_req r;
+    r.seq_id = seq_id;
+    r.store  = store_id;
+    r.i_end  = 0;
+    r.flags  = flags | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+
+    if (!state_seq_fill_store_at(r)) {
+        return 0;
+    }
+    if (r.blob.size() > size) {
+        LLAMA_LOG_ERROR("%s: the state needs %zu bytes, dst holds %zu\n", __func__, r.blob.size(), size);
+        return 0;
+    }
+    memcpy(dst, r.blob.data(), r.blob.size());
+
+    return r.blob.size();
+}
+
 size_t llama_context::state_seq_set_data_store(llama_seq_id seq_id, int32_t store_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
     flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
 
@@ -7472,6 +7503,12 @@ size_t llama_context::state_seq_set_data_store(llama_seq_id seq_id, int32_t stor
     if (store == nullptr) {
         LLAMA_LOG_ERROR("%s: store %d of seq %d does not hold this state\n", __func__, store_id, seq_id_read);
         return 0;
+    }
+
+    // a fill that did not wait (inside a decode, C217, or behind one, C907): its copies first (the caller's synchronize
+    // has normally waited for them already)
+    for (const auto & ev : store->fences) {
+        ggml_backend_event_synchronize(ev.get());
     }
 
     llama_io_read_store io(src, size, *store);
@@ -9051,6 +9088,11 @@ size_t llama_state_seq_get_data_store(llama_context * ctx, uint8_t * dst, size_t
     ctx->synchronize();
 
     return ctx->state_seq_get_data_store(seq_id, store, dst, size, flags);
+}
+
+// no synchronize: the copies queue behind the work on the devices (C907)
+size_t llama_state_seq_get_data_store_nowait(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, int32_t store, llama_state_seq_flags flags) {
+    return ctx->state_seq_get_data_store_nowait(seq_id, store, dst, size, flags);
 }
 
 size_t llama_state_seq_set_data_store(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id dest_seq_id, int32_t store, llama_state_seq_flags flags) {

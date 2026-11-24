@@ -2085,6 +2085,21 @@ static uint32_t server_tail_ckpt_min() {
     return n_min;
 }
 
+// LLAMA_SERVER_CKPT_NOWAIT=1 (C907): a prompt's checkpoint that is taken between two of its calls (one the next call
+// cannot take inside it with --ctx-checkpoints-incall, or every checkpoint without it) is filled into its device store
+// (--ctx-checkpoints-vram) without waiting for the cards: the copies are queued on each card's stream behind the last
+// call's work, as an in-call checkpoint's are. Before, the fill waited for that whole call to leave every card: on nine
+// P106 cards an Ornith prompt of 47,012 tokens stopped 8.20, 11.85 and 12.37 s at its three such checkpoints (R183).
+// The calls, the checkpoints and their contents stay the same; a host copy or a restore waits for the copies.
+// Checkpoints on the host, and those taken while generating, are unchanged. Off by default.
+static bool server_ckpt_nowait() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_SERVER_CKPT_NOWAIT");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // LLAMA_SERVER_YIELD (C741): the yields to the task queue (server_queue::yield_to_queue), which let the queue's worker
 // thread answer metrics and slot reads while the server computes. Each one wakes the worker and at its end waits for it
 // to stop: on a two-core host ~0.1 ms, three times a speculative step (the draft, the verify pass, the catch-up).
@@ -4271,7 +4286,8 @@ private:
     // a sliding-window model's checkpoints hold the whole ring (ckpt_trim): a restore then occupies the cells that
     // processing the prompt again does, so attention sums over the same cells, and one cut back to an earlier divergence
     // still has a complete window
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    // nowait (LLAMA_SERVER_CKPT_NOWAIT, C907): a device store's copies queued behind the work on the cards, no wait for it
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool nowait = false) {
         const bool ring = ckpt_trim && ckpt_ring;
 
         const int id_task = slot.task->id;
@@ -4304,12 +4320,13 @@ private:
         bool on_dev = false;
         if (ckpt_vram_n > 0) {
             const int32_t store = ckpt_store_free(slot);
-            on_dev = store >= 0 && cur.update_tgt_store(ctx_tgt, slot.id, store, flags_tgt);
+            on_dev = store >= 0 && cur.update_tgt_store(ctx_tgt, slot.id, store, flags_tgt, nowait);
             if (!on_dev) {
                 SLT_WRN(slot, "context checkpoints on the devices failed (store %d) - on the host from now on\n", store);
                 ckpt_vram_n = 0;
             }
         }
+        const bool filled_nowait = on_dev && nowait;
         if (!on_dev) {
             cur.update_tgt(ctx_tgt, slot.id, flags_tgt);
         }
@@ -4324,11 +4341,13 @@ private:
 
         slot.stats.t_ckpt_save_us += t_save_us;
         slot.stats.n_ckpt_dev     += on_dev ? 1 : 0;
+        slot.stats.n_ckpt_nowait  += filled_nowait ? 1 : 0;
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, on the devices %.3f MiB, store %d, %.1f ms)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, on the devices %.3f MiB, store %d%s, %.1f ms)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, (float) cur.size_dev / 1024 / 1024, cur.store, t_save_us / 1000.0);
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, (float) cur.size_dev / 1024 / 1024, cur.store,
+                filled_nowait ? ", no wait" : "", t_save_us / 1000.0);
 
         if (on_dev) {
             ckpt_vram_trim(slot);
@@ -7361,7 +7380,7 @@ private:
                         //       yet processed and therefore it is not part of the checkpoint.
                         if (do_checkpoint) {
                             if (part == 0) {
-                                create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                                create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, server_ckpt_nowait());
                             } else {
                                 create_checkpoint_incall(slot, n_tokens_cur, n_part_prev);
                             }
