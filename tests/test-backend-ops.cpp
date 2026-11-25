@@ -1480,6 +1480,13 @@ struct test_case {
         return nmse(a, b, n);
     }
 
+    // the error of node t (the tested backend's tensor) from its values a and the reference's b, for a check that
+    // depends on which node it compares; the nodes come in graph order, live and replayed
+    virtual double err_node(const ggml_tensor * t, const float * a, const float * b, size_t n) {
+        GGML_UNUSED(t);
+        return err(a, b, n);
+    }
+
     virtual float grad_eps() {
         return 1e-1f;
     }
@@ -1619,7 +1626,7 @@ struct test_case {
             }
         }
 
-        double err = this->err(f1.data(), f2.data(), f1.size());
+        double err = this->err_node(t1, f1.data(), f2.data(), f1.size());
         err_out = err;
         if (err > max_err(backend1)) {
             printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, max_err(backend1));
@@ -9749,6 +9756,8 @@ struct test_topk_moe_tail : public test_case {
         }
 
         // the graph is built from out: its src[1] (the cut weights) comes right before its src[2] (the cut ids)
+        w_cut_a.clear();
+        w_cut_b.clear();
         w_cut   = ggml_moe_tail(ctx, weights, selected, p, w, renorm);
         ids_cut = ggml_moe_tail_ids(ctx, weights, selected, p, w, n_skip, repeat);
         ggml_set_name(w_cut, "w_cut");
@@ -9763,15 +9772,82 @@ struct test_topk_moe_tail : public test_case {
 
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { ids_cut, w_cut, out }; }
 
-    // logits of a wide range, so that some tokens favour a few experts and the tail cuts deep
+    // logits of a wide range, so that some tokens favour a few experts and the tail cuts deep, drawn again for a token
+    // until its n_expert_used + 1 best probabilities (on the host, in double) are each a relative 2^-16 apart: with a
+    // near tie a backend's gating, a few float32 ulps from the processor's, may route a slot to the other expert or
+    // move an expert across the tail's cut, and the expert product then differs (sigmoid gating of logits near 6
+    // saturates, so such ties come up there; upstream's TOPK_MOE draws its logits without ties for the same reason)
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "logits") == 0) {
-                init_tensor_uniform(t, -6.0f, 6.0f);
+                init_logits(t);
             } else if (t->type == GGML_TYPE_F32) {
                 init_tensor_uniform(t);
             }
         }
+    }
+
+    void init_logits(ggml_tensor * logits) {
+        std::default_random_engine            rng(std::random_device{}());
+        std::uniform_real_distribution<float> u(-6.0f, 6.0f);
+        const int64_t k1 = std::min<int64_t>(n_expert_used + 1, n_expert);
+
+        std::vector<float>  x(ggml_nelements(logits));
+        std::vector<double> prob(n_expert);
+        for (int64_t r = 0; r < n_tokens; ++r) {
+            float * row = x.data() + r*n_expert;
+            for (int tries = 0;; ++tries) {
+                GGML_ASSERT(tries < 10000);
+                for (int64_t i = 0; i < n_expert; ++i) {
+                    row[i] = u(rng);
+                }
+                // sigmoid's probabilities, or softmax's up to their common factor
+                const double mx = *std::max_element(row, row + n_expert);
+                for (int64_t i = 0; i < n_expert; ++i) {
+                    prob[i] = gating_func == GATING_FUNC_SIGMOID ? 1.0 / (1.0 + std::exp(-(double) row[i])) :
+                                                                   std::exp((double) row[i] - mx);
+                }
+                std::partial_sort(prob.begin(), prob.begin() + k1, prob.end(), std::greater<double>());
+                bool apart = true;
+                for (int64_t i = 1; i < k1 && apart; ++i) {
+                    apart = prob[i - 1] - prob[i] >= 0x1p-16 * prob[i - 1];
+                }
+                if (apart) {
+                    break;
+                }
+            }
+        }
+        ggml_backend_tensor_set(logits, x.data(), 0, ggml_nbytes(logits));
+    }
+
+    // the cut weights of the last compared w_cut (the graph puts it right before ids_cut): tested, reference
+    std::vector<float> w_cut_a;
+    std::vector<float> w_cut_b;
+
+    // past n_skip tokens every slot keeps its own expert (ggml_moe_tail_ids) and the product multiplies a cut slot's
+    // by 0, so a slot that both backends cut to weight 0 there only has to hold an expert (0 <= id < n_expert): with a
+    // near tie in the router its expert may be another one than the processor's. Every other id (a kept slot's, -1,
+    // or with repeat the last kept expert) is compared.
+    double err_node(const ggml_tensor * t, const float * a, const float * b, size_t n) override {
+        if (t == w_cut) {
+            w_cut_a.assign(a, a + n);
+            w_cut_b.assign(b, b + n);
+        } else if (t == ids_cut && n_tokens > n_skip && w_cut_a.size() == n && w_cut_b.size() == n) {
+            std::vector<float> a2(a, a + n);
+            std::vector<float> b2(b, b + n);
+            for (size_t i = 0; i < n; ++i) {
+                const bool cut    = w_cut_a[i] == 0.0f && w_cut_b[i] == 0.0f;
+                const bool expert = a2[i] >= 0.0f && a2[i] < (float) n_expert &&
+                                    b2[i] >= 0.0f && b2[i] < (float) n_expert;
+                if (cut && expert) {
+                    a2[i] = b2[i] = -2.0f; // a value no compared slot holds
+                }
+            }
+            w_cut_a.clear();
+            w_cut_b.clear();
+            return err(a2.data(), b2.data(), n);
+        }
+        return err(a, b, n);
     }
 
     // the top-k may come in another order for equal weights
