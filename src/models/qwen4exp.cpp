@@ -1638,8 +1638,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    // C20 (Q438): the conv window in one op, with the q and k heads already L2-normalized
-    const bool fuse_conv = qwen4exp_gdn_fuse_enabled() && conv_kernel->type == GGML_TYPE_F32 &&
+    // C20 (Q438): the conv window in one op, with the q and k heads already L2-normalized. Not with upstream's replay
+    // rollback (LLAMA_RS_REPLAY=1, #31669): its conv history holds the window and the pending columns, which only
+    // build_conv_state_at reads
+    const bool fuse_conv = !cparams.rs_replay && qwen4exp_gdn_fuse_enabled() && conv_kernel->type == GGML_TYPE_F32 &&
                            ggml_is_contiguous(conv_kernel) && conv_kernel_size >= 2;
 
     ggml_tensor * conv_qkv_mix = nullptr;
