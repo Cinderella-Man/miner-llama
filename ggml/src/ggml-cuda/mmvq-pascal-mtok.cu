@@ -589,6 +589,19 @@ static bool mtok_iq_skipped(const ggml_type type) {
     return skip[type] != 0;
 }
 
+// GGML_CUDA_MTOK_IQ_FAST (C1138): 0 (default) the kernels of mmvq-pascal-mtok-iq.cuh for every type; 1 IQ2_XXS's fast
+// kernel in CUDA C (mmvq-pascal-mtok-iq2_xxs-fast.cu) where its shapes allow (rows of 2 lanes: 256 n weights with
+// n = 2 mod 4; 16-byte-aligned matrices whose rows are a multiple of 4 bytes); 2 the hand-written PTX of the same kernel
+// where it covers the product, else as 1. Read once.
+static int mtok_iq_fast_mode() {
+    static const int mode = [] {
+        const char * env = getenv("GGML_CUDA_MTOK_IQ_FAST");
+        const int v = env ? atoi(env) : 0;
+        return v >= 0 && v <= 2 ? v : 0;
+    }();
+    return mode;
+}
+
 // The grid types and IQ1_M (mmvq-pascal-mtok-iq.cuh): the arguments as for Q2_0.
 static bool mtok_iq_run(
         const void * vx, ggml_type type, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion,
@@ -693,6 +706,34 @@ static bool mtok_iq_run(
 
     const dim3 grid((unsigned) ((nrowblocks + rb - 1) / rb), (unsigned) (ne + (fusion.shared_up ? 1 : 0)),
                     (unsigned) nsamples_dst);
+
+    // IQ2_XXS's fast kernel (C1138): rows of 2 lanes, every matrix 16-byte aligned and ending at a 16-byte boundary (its
+    // lanes load the aligned 16-byte units around their super-blocks), rows a multiple of 4 bytes (a warp's rows, 4
+    // apart, then start at the same word of a unit)
+    if (type == GGML_TYPE_IQ2_XXS && mtok_iq_fast_mode() > 0 && lpr_log2 == 1 && row_bytes % 4 == 0 &&
+            (nrows_x * row_bytes) % 16 == 0 && mtok_aligned(vx, 16) && mtok_aligned(fusion.gate, 16) &&
+            mtok_aligned(fusion.shared_up, 16) && mtok_aligned(fusion.shared_gate, 16) &&
+            (stride_channel_x * bs) % 16 == 0 && (stride_sample_x * bs) % 16 == 0 &&
+            smem + ggml_cuda_mtok_iq2_xxs_fast_static_smem() <= 48 * 1024) {
+        // GGML_CUDA_MTOK_IQ_FAST_FAULT=1, a test fault: the fast kernels take the up and gate matrices the wrong way
+        // round, so that a check comparing them with the old kernel must see the gate/up products differ
+        static const bool fault = [] {
+            const char * env = getenv("GGML_CUDA_MTOK_IQ_FAST_FAULT");
+            return env != nullptr && atoi(env) == 1;
+        }();
+        if (fault && gate) {
+            ggml_cuda_mm_fusion_args_device ff = fusion;
+            mtok_iq::args pf = p;
+            pf.vx   = (const char *) fusion.gate;
+            ff.gate = vx;
+            std::swap(ff.shared_up, ff.shared_gate);
+            ggml_cuda_mtok_iq_fast_launch_iq2_xxs(pf, ff, grid, smem, gate, ntm, stream);
+            return true;
+        }
+        ggml_cuda_mtok_iq_fast_launch_iq2_xxs(p, fusion, grid, smem, gate, ntm, stream);
+        return true;
+    }
+
     switch (type) {
         case GGML_TYPE_IQ2_XXS: ggml_cuda_mtok_iq_launch_iq2_xxs(p, fusion, grid, smem, gate, su, ntm, stream); break;
         case GGML_TYPE_IQ2_XS:  ggml_cuda_mtok_iq_launch_iq2_xs(p, fusion, grid, smem, gate, su, ntm, stream);  break;

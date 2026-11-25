@@ -497,4 +497,13 @@ MMVQP_MTOK_IQ_DECL(iq3_xxs);
 MMVQP_MTOK_IQ_DECL(iq3_s);
 MMVQP_MTOK_IQ_DECL(iq1_m);
 
+// The fast versions (C1138, GGML_CUDA_MTOK_IQ_FAST; mmvq-pascal-mtok-<type>-fast.cu): the same arguments, the gate and
+// up matrices in one pass; mtok_iq_run (mmvq-pascal-mtok.cu) checks the shapes and alignments each one needs.
+#define MMVQP_MTOK_IQ_FAST_DECL(name) \
+    void ggml_cuda_mtok_iq_fast_launch_##name(const mtok_iq::args & p, const ggml_cuda_mm_fusion_args_device & fusion, \
+                                              const dim3 grid, const int smem, const bool gate, const int ntm, \
+                                              cudaStream_t stream)
+MMVQP_MTOK_IQ_FAST_DECL(iq2_xxs);
+int ggml_cuda_mtok_iq2_xxs_fast_static_smem();
+
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
