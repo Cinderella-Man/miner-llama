@@ -721,16 +721,17 @@ static bool mtok_iq_run(
             const char * env = getenv("GGML_CUDA_MTOK_IQ_FAST_FAULT");
             return env != nullptr && atoi(env) == 1;
         }();
+        ggml_cuda_mm_fusion_args_device ff = fusion;
+        mtok_iq::args pf = p;
         if (fault && gate) {
-            ggml_cuda_mm_fusion_args_device ff = fusion;
-            mtok_iq::args pf = p;
             pf.vx   = (const char *) fusion.gate;
             ff.gate = vx;
             std::swap(ff.shared_up, ff.shared_gate);
-            ggml_cuda_mtok_iq_fast_launch_iq2_xxs(pf, ff, grid, smem, gate, ntm, stream);
+        }
+        if (mtok_iq_fast_mode() == 2 && ggml_cuda_mtok_iq2_xxs_ptx_launch(pf, ff, grid, smem, gate, ntm, stream)) {
             return true;
         }
-        ggml_cuda_mtok_iq_fast_launch_iq2_xxs(p, fusion, grid, smem, gate, ntm, stream);
+        ggml_cuda_mtok_iq_fast_launch_iq2_xxs(pf, ff, grid, smem, gate, ntm, stream);
         return true;
     }
 

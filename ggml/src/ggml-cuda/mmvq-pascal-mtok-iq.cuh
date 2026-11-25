@@ -505,5 +505,9 @@ MMVQP_MTOK_IQ_DECL(iq1_m);
                                               cudaStream_t stream)
 MMVQP_MTOK_IQ_FAST_DECL(iq2_xxs);
 int ggml_cuda_mtok_iq2_xxs_fast_static_smem();
+// The PTX version of IQ2_XXS's fast kernel (GGML_CUDA_MTOK_IQ_FAST=2, mmvq-pascal-mtok-iq2_xxs-ptx.cu): false where it
+// does not take the product (or cannot load), which then runs the CUDA C version.
+bool ggml_cuda_mtok_iq2_xxs_ptx_launch(const mtok_iq::args & p, const ggml_cuda_mm_fusion_args_device & fusion,
+                                       const dim3 grid, const int smem, const bool gate, const int ntm, cudaStream_t stream);
 
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
