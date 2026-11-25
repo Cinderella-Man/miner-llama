@@ -14558,6 +14558,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_pos(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
         }
     }
+    // Miner Llama, C1024 (GGML_CUDA_MMQ_J64_I64): the CUDA DP4A table's J=64 tile, which every product of 49 or more columns
+    // of these types takes there (upstream #31352 gave it 128 rows, the switch keeps 64): one column tile and several, rows
+    // a multiple of 128 (no row check) and not (64, 192 and 1000 rows: the row check), broadcast batches, a src1 with a
+    // nonzero mean for the zero points and mins
+    for (ggml_type type_a : {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+                             GGML_TYPE_Q8_0, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+        for (int64_t n : {49, 64, 65, 128, 512}) {
+            for (int64_t m : {64, 128, 192, 1000, 4096}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 512, {1, 1}, {1, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 64, 512, {2, 3}, {2, 1}));
+        test_cases.emplace_back(new test_mul_mat_pos(type_a, GGML_TYPE_F32, 1000, 64, 1024, {1, 1}, {1, 1}));
+    }
     // CUDA few-row MMQ: 1-3 column groups, 32-row tiles (6170 rows), K = 18 units (uneven over the warps) and 9 units (one unit per ring stage)
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                              GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
