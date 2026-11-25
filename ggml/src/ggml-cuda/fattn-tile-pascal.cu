@@ -1,6 +1,7 @@
 #include "fattn-tile-pascal.cuh"
 #include "fattn-common.cuh"
 
+#include <cmath>
 #include <cstdlib>
 #include <type_traits>
 
@@ -192,7 +193,10 @@ struct ftp_kq16 {
     }
 };
 
-__constant__ int ftp_fault_dev = 0;
+#define FTP_FAULT_SCALE_DEFAULT 1.05f
+
+__constant__ int   ftp_fault_dev       = 0;
+__constant__ float ftp_fault_scale_dev = FTP_FAULT_SCALE_DEFAULT; // the output's factor under fault 1
 
 // split (head 128): the scores are computed by lanes (16 key groups x the 2 halves of the head dimension), each with 4
 // keys x the warp's 8 columns over its half (128 FMAs per 12 float4 loads instead of 64 per 8), and lane l and l ^ 16
@@ -638,7 +642,7 @@ static __global__ void flash_attn_tile_pascal(
     for (int j = 0; j < 4; ++j) {
         float out_scale = gridDim.y == 1 ? 1.0f/KQ_sum[j] : 1.0f;
         if (fault == 1) {
-            out_scale *= 1.05f;
+            out_scale *= ftp_fault_scale_dev;
         }
 
         const int j_dst_unrolled = ((sequence*int(ne01.z) + col_Q_0 + jtok)*ne02 + head0 + hcol + j)*gridDim.y + blockIdx.y;
@@ -1019,7 +1023,7 @@ static __global__ void flash_attn_dec_pascal(
         }
         float out_scale = gridDim.y == 1 ? 1.0f/s : 1.0f;
         if (fault == 1) {
-            out_scale *= 1.05f;
+            out_scale *= ftp_fault_scale_dev;
         }
         const int j_dst_unrolled = ((sequence*int(ne01.z) + tok)*ne02 + head0 + h)*gridDim.y + blockIdx.y;
 #pragma unroll
@@ -1098,6 +1102,26 @@ static int ftp_fault() {
     return fault;
 }
 
+// the factor fault 1 multiplies the output by (GGML_CUDA_FATTN_TILE_PASCAL_FAULT_SCALE, default 1.05); a value that is
+// not a finite number gets a warning and the default
+static float ftp_fault_scale() {
+    static const float scale = [] {
+        const char * env = getenv("GGML_CUDA_FATTN_TILE_PASCAL_FAULT_SCALE");
+        if (env == nullptr) {
+            return FTP_FAULT_SCALE_DEFAULT;
+        }
+        char * end = nullptr;
+        const float v = strtof(env, &end);
+        if (end == env || *end != '\0' || !std::isfinite(v)) {
+            GGML_LOG_WARN("ftp_fault_scale: GGML_CUDA_FATTN_TILE_PASCAL_FAULT_SCALE=%s is not a number: %.2f is used\n",
+                env, (double) FTP_FAULT_SCALE_DEFAULT);
+            return FTP_FAULT_SCALE_DEFAULT;
+        }
+        return v;
+    }();
+    return scale;
+}
+
 static bool ftp_aligned(const void * p, const size_t n) {
     return (uintptr_t) p % n == 0;
 }
@@ -1173,11 +1197,23 @@ bool ggml_cuda_flash_attn_ext_tile_pascal(ggml_backend_cuda_context & ctx, ggml_
         return false;
     }
 
-    // the fault switch lives in each device's constant memory; set it once per device when it is used
+    // the fault switch and its factor live in each device's constant memory; set them once per device when used
     static bool fault_set[GGML_CUDA_MAX_DEVICES] = {false};
     if (ftp_fault() != 0 && !fault_set[ctx.device]) {
-        const int fault = ftp_fault();
-        CUDA_CHECK(cudaMemcpyToSymbol(ftp_fault_dev, &fault, sizeof(int)));
+        const int   fault = ftp_fault();
+        const float scale = ftp_fault_scale();
+        CUDA_CHECK(cudaMemcpyToSymbol(ftp_fault_dev,       &fault, sizeof(int)));
+        CUDA_CHECK(cudaMemcpyToSymbol(ftp_fault_scale_dev, &scale, sizeof(float)));
+        static bool logged_fault = false;
+        if (!logged_fault) {
+            logged_fault = true;
+            if (fault == 1) {
+                GGML_LOG_INFO("%s: GGML_CUDA_FATTN_TILE_PASCAL_FAULT=1 (tests of the tests): output x %.9g\n",
+                    __func__, (double) scale);
+            } else {
+                GGML_LOG_INFO("%s: GGML_CUDA_FATTN_TILE_PASCAL_FAULT=%d (tests of the tests)\n", __func__, fault);
+            }
+        }
         fault_set[ctx.device] = true;
     }
 

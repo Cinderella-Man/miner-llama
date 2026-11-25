@@ -24,7 +24,8 @@
 // GGML_CUDA_FATTN_TILE_PASCAL: 0 off, 1 compute capability 6.1 only (default), 2 any NVIDIA GPU (for testing).
 // GGML_CUDA_FATTN_TILE_PASCAL_MIN: fewest query tokens it takes (default 9 with F16 K/V, 3 with Q8_0 K/V).
 // GGML_CUDA_FATTN_TILE_PASCAL_FAULT (tests of the tests): 1 output x 1.05, 2 sinks dropped, 3 each block's last key
-// tile dropped.
+// tile dropped. GGML_CUDA_FATTN_TILE_PASCAL_FAULT_SCALE=<factor>: the factor of fault 1 (default 1.05); without
+// _FAULT=1 it does nothing.
 // GGML_CUDA_FATTN_DEC_PASCAL=N (off by default): Q8_0 K/V at head 256 with up to N query tokens (1-4: decode, the pipe,
 // the MTP verify) go to a decode kernel without block barriers in its key loop: warps on their own 32-key slices, Q as
 // int8, dp4a scores, V in registers. It is only reached from GGML_CUDA_FATTN_TILE_PASCAL_MIN tokens, so set _MIN=1.
