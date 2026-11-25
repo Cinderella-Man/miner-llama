@@ -4345,10 +4345,26 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
         return false;
     }
 
-    // the fused kernel handles the norm/neox rope modes only
+    // GGML_CUDA_NORM_ROPE_MROPE: unset or 0, the norm and NEOX modes only, as b12674 and every measured run (the
+    // IMROPE models, Qwen3.5/3.6, Ornith and Qwen3.8, run RMS_NORM, MUL and ROPE as three launches); 1, M-RoPE and
+    // IMROPE fused too (upstream #32500)
+    static const bool fuse_mrope = [] {
+        const char * env = getenv("GGML_CUDA_NORM_ROPE_MROPE");
+        return env != nullptr && atoi(env) == 1;
+    }();
     const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX &&
+        (!fuse_mrope || (mode != GGML_ROPE_TYPE_MROPE && mode != GGML_ROPE_TYPE_IMROPE))) {
         return false;
+    }
+
+    if (mode & GGML_ROPE_TYPE_MROPE) {
+        int sections[4];
+        memcpy(sections, (const int32_t *) rope->op_params + 11, sizeof(int) * 4);
+        const int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+        if ((sections[0] <= 0 && sections[1] <= 0 && sections[2] <= 0) || sect_dims <= 0) {
+            return false;
+        }
     }
 
     const int n_dims = ((const int32_t *) rope->op_params)[1];
@@ -4426,6 +4442,47 @@ static int ggml_cuda_try_gdn_cache_fusion(
 
     fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
     fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+
+    // rs_replay: the next 4 real nodes may store the k, v, g, beta inputs into the pending rows
+    if (gdn->src[6] != nullptr && gdn->src[3]->ne[0] == 1) {
+        int    j = node_idx + skip + 1;
+        int    skip_in = skip;
+        float * in_dst[4];
+        int64_t in_nb2[4];
+        int64_t in_nb3[4];
+        int i = 0;
+        for (; i < 4 && j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(n)) {
+                continue;
+            }
+            const ggml_tensor * in = gdn->src[1 + i];
+            const ggml_tensor * d  = n->src[1];
+            // the cpy reads the whole input, directly or through a view of the same data
+            const ggml_tensor * s0 = n->src[0];
+            const bool whole_in = s0 == in || (s0 != nullptr && s0->data == in->data && ggml_are_same_shape(s0, in) &&
+                                               ggml_are_same_stride(s0, in));
+            if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT) || !whole_in ||
+                d->type != GGML_TYPE_F32 || d->data == nullptr || !ggml_are_same_shape(d, in) ||
+                d->nb[0] != sizeof(float) || d->nb[1] != d->ne[0]*sizeof(float) || d->nb[2] != d->ne[0]*d->ne[1]*sizeof(float)) {
+                break;
+            }
+            in_dst[i] = (float *) d->data;
+            in_nb2[i] = d->nb[2] / sizeof(float);
+            in_nb3[i] = d->nb[3] / sizeof(float);
+            skip_in   = j - node_idx;
+            ++i;
+        }
+        if (i == 4) {
+            for (int c = 0; c < 4; ++c) {
+                fused_state_cpy.in_dst[c] = in_dst[c];
+                fused_state_cpy.in_nb2[c] = in_nb2[c];
+                fused_state_cpy.in_nb3[c] = in_nb3[c];
+            }
+            skip = skip_in;
+        }
+    }
+
     return skip;
 }
 
@@ -4449,6 +4506,10 @@ static int ggml_cuda_try_gdn_state_gather_fusion(
     static const bool concurrent = ggml_cuda_env_int("GGML_CUDA_GRAPH_OPT", 0) == 1;
     const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
     if (!ggml_cuda_gdn_fuse_enabled() || concurrent || gdn->op != GGML_OP_GATED_DELTA_NET) {
+        return -1;
+    }
+    // not with upstream's replay (#31669, LLAMA_RS_REPLAY=1): the in-place read is checked on the snapshot form only
+    if (gdn->src[6] != nullptr) {
         return -1;
     }
     {
