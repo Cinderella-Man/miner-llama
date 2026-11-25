@@ -38,19 +38,17 @@ static_assert(sizeof(ggml_cuda_mm_fusion_args_device) == 80, "fusion args: the P
 static_assert(offsetof(ggml_cuda_mm_fusion_args_device, gate) == 8, "fusion args: gate");
 static_assert(sizeof(ggml_glu_op) == 4 && GGML_GLU_OP_SWIGLU == 2, "fusion args: the PTX computes SWIGLU only");
 
-namespace {
-
 struct ptx_module {
     bool       tried = false;
     CUmodule   mod   = nullptr;
     CUfunction fn[3] = {}; // groups of up to 2, 4, 8 members
 };
 
-ptx_module g_mods[GGML_CUDA_MAX_DEVICES];
-std::mutex g_mutex;
+static ptx_module g_mods[GGML_CUDA_MAX_DEVICES];
+static std::mutex g_mutex;
 
 // the device's module, loaded on first use; nullptr if it could not be (the caller then runs the C version)
-const ptx_module * module_for(const int device) {
+static const ptx_module * module_for(const int device) {
     std::lock_guard<std::mutex> lock(g_mutex);
     ptx_module & m = g_mods[device];
     if (!m.tried) {
@@ -73,8 +71,6 @@ const ptx_module * module_for(const int device) {
     }
     return m.mod ? &m : nullptr;
 }
-
-} // namespace
 
 // Whether the PTX takes the product (and then launches it): the fused gate/up launch with SWIGLU, 10 super-blocks a
 // row, no shared expert, no biases or scales.
