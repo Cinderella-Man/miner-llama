@@ -584,6 +584,7 @@ static void analyze_template(const std::string & template_path) {
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     // Set log level to capture all output
     common_log_set_verbosity_thold(99);
 

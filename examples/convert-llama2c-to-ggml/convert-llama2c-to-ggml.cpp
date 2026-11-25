@@ -860,21 +860,25 @@ static bool params_parse(int argc, char ** argv, struct train_params * params) {
             params->fn_llama2c_output_model = argv[i];
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, &default_params);
+            common_log_flush(common_log_main());
             exit(0);
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             print_usage(argc, argv, &default_params);
+            common_log_flush(common_log_main());
             exit(1);
         }
     }
     if (invalid_param) {
         fprintf(stderr, "error: invalid parameter for argument: %s\n", arg.c_str());
         print_usage(argc, argv, &default_params);
+        common_log_flush(common_log_main());
         exit(1);
     }
     if (!reqd_param_found){
         fprintf(stderr, "error: please specify a llama2.c .bin file to be converted with argument --llama2c-model\n");
         print_usage(argc, argv, &default_params);
+        common_log_flush(common_log_main());
         exit(1);
     }
 
@@ -890,6 +894,7 @@ static std::string basename(const std::string &path) {
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     common_init();

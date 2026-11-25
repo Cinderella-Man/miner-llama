@@ -44,6 +44,7 @@ static void print_usage(int, char ** argv) {
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     common_params params;
 
     common_init();

@@ -1986,6 +1986,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 int llama_perplexity(int argc, char ** argv);
 
 int llama_perplexity(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;

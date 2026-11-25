@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "log.h"
 #include "ngram-cache.h"
 #include "llama.h"
 
@@ -8,6 +9,7 @@
 #include <vector>
 
 int main(int argc, char ** argv){
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;

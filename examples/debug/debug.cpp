@@ -217,6 +217,7 @@ static bool run(llama_context * ctx, const common_params & params) {
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     common_params params;
 
     common_init();

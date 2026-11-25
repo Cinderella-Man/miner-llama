@@ -53,6 +53,7 @@ static std::vector<float> get_logits(
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     common_params params;
     params.escape = false;
 

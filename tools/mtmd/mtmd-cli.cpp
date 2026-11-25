@@ -109,6 +109,7 @@ struct mtmd_cli_context {
         model = llama_init->model();
         lctx = llama_init->context();
         if (!model || !lctx) {
+            common_log_flush(common_log_main());
             exit(1);
         }
         vocab = llama_model_get_vocab(model);
@@ -128,6 +129,7 @@ struct mtmd_cli_context {
         if (!mtmd_cap.chat && !mtmd_cap.audio_stream) {
             LOG_ERR("Model does not support chat mode\n");
             LOG_ERR("Hint: for TTS models, please use llama-tts\n");
+            common_log_flush(common_log_main());
             exit(1);
         }
 
@@ -136,6 +138,7 @@ struct mtmd_cli_context {
             LOG_ERR("  For old llava models, you may need to use '--chat-template vicuna'\n");
             LOG_ERR("  For MobileVLM models, use '--chat-template deepseek'\n");
             LOG_ERR("  For Mistral Small 3.1, use '--chat-template mistral-v7'\n");
+            common_log_flush(common_log_main());
             exit(1);
         }
 
@@ -185,6 +188,7 @@ struct mtmd_cli_context {
         ctx_vision.reset(mtmd_init_from_file(mmproj_path, model, mparams));
         if (!ctx_vision.get()) {
             LOG_ERR("Failed to load vision model from %s\n", mmproj_path);
+            common_log_flush(common_log_main());
             exit(1);
         }
 
@@ -522,6 +526,7 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     ggml_time_init();

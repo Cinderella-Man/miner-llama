@@ -45,6 +45,7 @@ int main(int argc, char ** argv) {
     common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+        common_log_flush(common_log_main());
         return 1;
     }
 
@@ -65,6 +66,7 @@ int main(int argc, char ** argv) {
 
     if (model == nullptr || ctx == nullptr) {
         LOG_ERR("%s : failed to init\n", __func__);
+        common_log_flush(common_log_main());
         return 1;
     }
 
@@ -77,6 +79,7 @@ int main(int argc, char ** argv) {
 
     bool OK = run(ctx, params);
     if (!OK) {
+        common_log_flush(common_log_main());
         return 1;
     }
 
@@ -84,6 +87,9 @@ int main(int argc, char ** argv) {
     llama_perf_context_print(ctx);
 
     llama_backend_free();
+
+    // the logger is never destroyed (common_log_main), so print what is still queued before main returns
+    common_log_flush(common_log_main());
 
     return 0;
 }

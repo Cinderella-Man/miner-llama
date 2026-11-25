@@ -93,6 +93,7 @@ static void write_utf8_cstr_to_stdout(const char * str, bool & invalid_utf8) {
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;

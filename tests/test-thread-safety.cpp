@@ -19,6 +19,7 @@ int main(int argc, char ** argv) {
     common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+        common_log_flush(common_log_main());
         return 1;
     }
 
@@ -87,6 +88,7 @@ int main(int argc, char ** argv) {
 
     if (failed) {
         LOG_ERR("One or more models failed to load.\n");
+        common_log_flush(common_log_main());
         return 1;
     }
 
@@ -165,9 +167,12 @@ int main(int argc, char ** argv) {
 
     if (failed) {
         LOG_ERR("One or more threads failed.\n");
+        common_log_flush(common_log_main());
         return 1;
     }
 
     LOG_INF("All threads finished without errors.\n");
+    // the logger is never destroyed (common_log_main), so print what is still queued before main returns
+    common_log_flush(common_log_main());
     return 0;
 }

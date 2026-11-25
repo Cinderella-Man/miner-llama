@@ -16,6 +16,7 @@
 #include <vector>
 
 int main(int argc, char ** argv){
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;
@@ -65,6 +66,7 @@ int main(int argc, char ** argv){
                 ngram_cache_static = common_ngram_cache_load(params.speculative.ngram_cache.lookup_cache_static);
             } catch (std::ifstream::failure const &) {
                 LOG_ERR("failed to open static lookup cache: %s", params.speculative.ngram_cache.lookup_cache_static.c_str());
+                common_log_flush(common_log_main());
                 exit(1);
             }
         }

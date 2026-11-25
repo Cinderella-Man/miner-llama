@@ -84,6 +84,7 @@ static std::vector<llama_token> generate(llama_context * ctx, const std::vector<
 }
 
 int main(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;

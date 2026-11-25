@@ -84,6 +84,7 @@ static void sigint_handler(int signo) {
 int llama_completion(int argc, char ** argv);
 
 int llama_completion(int argc, char ** argv) {
+    common_log_flush_guard log_flush_guard;
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;
