@@ -389,13 +389,14 @@ def table_iq2xxs(k):
         k("st.shared.v4.u32 [sa+16], {cw, cw, cw, cw};")
 
 
-def body(k, nt):
-    """The rows of the block for groups of exactly nt members (mtok_iq2xxs_fast::rows<true, nt>)."""
+def row_start(k, nt, unit=16):
+    """A body's start, shared by every type: BODY<nt>, the members' output offsets, the row-block loop, the rows of the
+    lane pair, kappa (the word of its first unit-byte unit at which the warp's segments start), the accumulators and
+    the iteration's activation pointers."""
     b32 = lambda *n: k.r(".b32", *n)
     b64 = lambda *n: k.r(".b64", *n)
     f32 = lambda *n: k.r(".f32", *n)
     prd = lambda *n: k.r(".pred", *n)
-    b16 = lambda *n: k.r(".b16", *n)
     L = f"N{nt}_"
     k.label(f"BODY{nt}")
     k.c(f"groups of {nt} member(s): member j's output offset dc<j>")
@@ -422,9 +423,9 @@ def body(k, nt):
     k("mul.wide.u32 ro64, rowc, row_bytes;")
     k("add.u64 rw0, xu, ro64;")
     k("add.u64 rw1, xg, ro64;")
-    k.c("kappa: the word of its first 16-byte unit at which the warp's segments start (lane 0's row)")
+    k.c(f"kappa: the word of its first {unit}-byte unit at which the warp's segments start (lane 0's row)")
     k("cvt.u32.u64 t0, rw0;")
-    k("bfe.u32 t0, t0, 2, 2;")
+    k(f"bfe.u32 t0, t0, 2, {(unit // 4).bit_length() - 1};")
     k("shfl.sync.idx.b32 kap0, t0, 0, 31, -1;")
     for j in range(nt):
         for m in range(2):
@@ -442,39 +443,107 @@ def body(k, nt):
         b32(f"au{j}", f"ad{j}")
         k(f"mad.lo.u32 au{j}, act_tok, {j}, au;")
         k(f"mad.lo.u32 ad{j}, act_tok, {j}, ad;")
-    k.c("both matrices' segments: lane sl loads the 5 aligned 16-byte units from (segment & ~15) + 64 sl")
-    k("mul.lo.u32 sego, itr, 132;")
+
+
+def segments(k, nt, sb, unit, nunits, unit_off, nwords):
+    """Both matrices' row segments into registers, shared by every type: lane sl loads nunits aligned unit-byte units
+    (16 or 8) from (segment & ~(unit - 1)) + unit_off sl into u<m>_*, a warp-uniform branch on kappa (unit / 4 cases)
+    picks the nwords words after each super-block's d (w<m>_k = bytes 2 + 4k .. 5 + 4k) and the word holding d (dw<m>);
+    then the members' sums are zeroed."""
+    b32 = lambda *n: k.r(".b32", *n)
+    f32 = lambda *n: k.r(".f32", *n)
+    L = f"N{nt}_"
+    per = unit // 4  # words per unit
+    k.c(f"both matrices' segments: lane sl loads the {nunits} aligned {unit}-byte units from (segment & ~{unit - 1})"
+        f" + {unit_off} sl")
+    k(f"mul.lo.u32 sego, itr, {2 * sb};")
     k("cvt.u64.u32 w64, sego;")
     for m, rw in ((0, "rw0"), (1, "rw1")):
         k(f"add.u64 seg, {rw}, w64;")
-        k("and.b64 seg, seg, -16;")
+        k(f"and.b64 seg, seg, -{unit};")
         k("add.u64 seg, seg, sl64;")
-        for u in range(5):
-            regs = [f"u{m}_{4 * u + q}" for q in range(4)]
+        for u in range(nunits):
+            regs = [f"u{m}_{per * u + q}" for q in range(per)]
             b32(*regs)
-            k(f"ld.global.nc.v4.u32 {{{', '.join(regs)}}}, [seg+{16 * u}];")
+            k(f"ld.global.nc.v{per}.u32 {{{', '.join(regs)}}}, [seg+{unit * u}];")
     k.c("the words of each super-block after its d, by kappa (warp-uniform): w<m>_k = bytes 2 + 4k .. 5 + 4k")
     k("add.u32 kap, kap0, itr;")
-    k("and.b32 kap, kap, 3;")
-    for kv in range(3):
+    k(f"and.b32 kap, kap, {per - 1};")
+    for kv in range(per - 1):
         k(f"setp.eq.u32 p0, kap, {kv};")
         k(f"@p0 bra.uni {L}KAPPA{kv};")
-    for kv in (3, 0, 1, 2):
-        if kv != 3:
+    order = [per - 1] + list(range(per - 1))
+    for kv in order:
+        if kv != per - 1:
             k.label(f"{L}KAPPA{kv}")
         for m in range(2):
-            for w in range(16):
+            for w in range(nwords):
                 b32(f"w{m}_{w}")
                 k(f"prmt.b32 w{m}_{w}, u{m}_{kv + w}, u{m}_{kv + w + 1}, sel;")
             b32(f"dw{m}")
             k(f"mov.b32 dw{m}, u{m}_{kv};")
-        if kv != 2:
+        if kv != order[-1]:
             k(f"bra.uni {L}WORDS;")
     k.label(f"{L}WORDS")
     for j in range(nt):
         for m in range(2):
             f32(f"sf{j}_{m}")
             k(f"mov.f32 sf{j}_{m}, 0f00000000;")
+
+
+def row_end(k, nt):
+    """A body's end, shared by every type: each matrix's super-block sums times its d, the iteration loop, the row's two
+    lanes summed, up * SiLU(gate) stored, the row-block loop."""
+    b32 = lambda *n: k.r(".b32", *n)
+    f32 = lambda *n: k.r(".f32", *n)
+    L = f"N{nt}_"
+    k.c("the super-block's d: lane 0's in the low half of dw, lane 1's in the high half")
+    b32("dsh")
+    f32("fd")
+    for m in range(2):
+        k(f"shr.b32 t0, dw{m}, 16;")
+        k(f"selp.b32 dsh, t0, dw{m}, psl;")
+        k("mov.b32 {h0, h1}, dsh;")
+        k("cvt.f32.f16 fd, h0;")
+        k("mul.ftz.f32 fd, fd, 0f3E000000;")
+        for j in range(nt):
+            k(f"fma.rn.ftz.f32 acc{j}_{m}, fd, sf{j}_{m}, acc{j}_{m};")
+    k("add.u32 itr, itr, 1;")
+    k(f"setp.lt.u32 p0, itr, {NITER};")
+    k(f"@p0 bra.uni {L}ITER;")
+    k.c("the row's two lanes summed, then up * SiLU(gate) (ggml_cuda_op_silu_single under -use_fast_math)")
+    b32("rt0", "rt1")
+    f32("fs", "fu", "fg", "fe")
+    for j in range(nt):
+        for m in range(2):
+            k(f"mov.b32 rt0, acc{j}_{m};")
+            k("shfl.sync.bfly.b32 rt1, rt0, 1, 31, -1;")
+            k("mov.b32 fs, rt1;")
+            k(f"add.ftz.f32 acc{j}_{m}, acc{j}_{m}, fs;")
+    k("setp.eq.u32 p0, sl, 0;")
+    k("setp.lt.u32 pst, row0, nrows;")
+    k("and.pred pst, pst, p0;")
+    for j in range(nt):
+        k(f"mul.ftz.f32 fe, acc{j}_1, 0fBFB8AA3B;")
+        k("ex2.approx.ftz.f32 fe, fe;")
+        k("add.ftz.f32 fe, fe, 0f3F800000;")
+        k(f"div.approx.ftz.f32 fg, acc{j}_1, fe;")
+        k(f"mul.ftz.f32 fu, acc{j}_0, fg;")
+        k(f"add.u32 t0, dc{j}, row0;")
+        k("mul.wide.u32 o64, t0, 4;")
+        k("add.u64 a64, dstp, o64;")
+        k("@pst st.global.f32 [a64], fu;")
+    k("add.u32 rbi, rbi, 1;")
+    k(f"bra.uni {L}ROWBLOCK;")
+    k.blank()
+
+
+def body(k, nt):
+    """The rows of the block for groups of exactly nt members (mtok_iq2xxs_fast::rows<true, nt>)."""
+    b32 = lambda *n: k.r(".b32", *n)
+    f32 = lambda *n: k.r(".f32", *n)
+    row_start(k, nt)
+    segments(k, nt, 66, 16, 5, 64, 16)
     b32("s7", "t6", "x", "pc", "sg", "eo", "ea", "cw2", "sv", "sh", "ia")
     b32(*[f"q{m}_{n}" for m in range(2) for n in range(8)])
     b32(*[f"ua{n}" for n in range(4)], *[f"ub{n}" for n in range(4)])
@@ -521,45 +590,7 @@ def body(k, nt):
                 k("mov.b32 fi, ia;")
                 k(f"fma.rn.ftz.f32 fp, fl{m}, fi, nc{m};     // (float) (ls * isum), exactly")
                 k(f"fma.rn.ftz.f32 sf{j}_{m}, fa, fp, sf{j}_{m};")
-    k.c("the super-block's d: lane 0's in the low half of dw, lane 1's in the high half")
-    b32("dsh")
-    f32("fd")
-    for m in range(2):
-        k(f"shr.b32 t0, dw{m}, 16;")
-        k(f"selp.b32 dsh, t0, dw{m}, psl;")
-        k("mov.b32 {h0, h1}, dsh;")
-        k("cvt.f32.f16 fd, h0;")
-        k("mul.ftz.f32 fd, fd, 0f3E000000;")
-        for j in range(nt):
-            k(f"fma.rn.ftz.f32 acc{j}_{m}, fd, sf{j}_{m}, acc{j}_{m};")
-    k("add.u32 itr, itr, 1;")
-    k(f"setp.lt.u32 p0, itr, {NITER};")
-    k(f"@p0 bra.uni {L}ITER;")
-    k.c("the row's two lanes summed, then up * SiLU(gate) (ggml_cuda_op_silu_single under -use_fast_math)")
-    b32("rt0", "rt1")
-    f32("fs", "fu", "fg", "fe")
-    for j in range(nt):
-        for m in range(2):
-            k(f"mov.b32 rt0, acc{j}_{m};")
-            k("shfl.sync.bfly.b32 rt1, rt0, 1, 31, -1;")
-            k("mov.b32 fs, rt1;")
-            k(f"add.ftz.f32 acc{j}_{m}, acc{j}_{m}, fs;")
-    k("setp.eq.u32 p0, sl, 0;")
-    k("setp.lt.u32 pst, row0, nrows;")
-    k("and.pred pst, pst, p0;")
-    for j in range(nt):
-        k(f"mul.ftz.f32 fe, acc{j}_1, 0fBFB8AA3B;")
-        k("ex2.approx.ftz.f32 fe, fe;")
-        k("add.ftz.f32 fe, fe, 0f3F800000;")
-        k(f"div.approx.ftz.f32 fg, acc{j}_1, fe;")
-        k(f"mul.ftz.f32 fu, acc{j}_0, fg;")
-        k(f"add.u32 t0, dc{j}, row0;")
-        k("mul.wide.u32 o64, t0, 4;")
-        k("add.u64 a64, dstp, o64;")
-        k("@pst st.global.f32 [a64], fu;")
-    k("add.u32 rbi, rbi, 1;")
-    k(f"bra.uni {L}ROWBLOCK;")
-    k.blank()
+    row_end(k, nt)
 
 
 def main():

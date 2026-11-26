@@ -83,92 +83,75 @@ def consts(k):
     k("mov.b32 KEXP, 0x4B000000;  // the exponent of 2^23: a byte b under it is the float 2^23 + b")
 
 
+def scale_bytes(k, m, sw):
+    """Four blocks' scales (sw: a byte per block, the low nibble for weights 0-15) as bytes 2 s + 1 of e0_<m> and e1_<m>
+    (IQ2_S and IQ2_XS)."""
+    k(f"shl.b32 ts, {sw}, 1;")
+    k(f"lop3.b32 e0_{m}, ts, K1E, K01, 0xEA;  // ((sw << 1) & 0x1E1E1E1E) | 0x01010101: 2 ls0 + 1")
+    k(f"shr.b32 ts, {sw}, 3;")
+    k(f"lop3.b32 e1_{m}, ts, K1E, K01, 0xEA;  // ((sw >> 3) & 0x1E1E1E1E) | 0x01010101: 2 ls1 + 1")
+
+
+def scale_floats(k, m, b):
+    """Block b's two scales as floats fl0_<m>, fl1_<m> from byte b of e0_<m>, e1_<m>, and nc1_<m> = -fl1 * 1.5 * 2^23
+    (IQ2_S and IQ2_XS)."""
+    if I2F_SCALES:
+        k(f"bfe.u32 ts, e0_{m}, {8 * b}, 8;")
+        k(f"cvt.rn.f32.u32 fl0_{m}, ts;           // 2 ls0 + 1")
+        k(f"bfe.u32 ts, e1_{m}, {8 * b}, 8;")
+        k(f"cvt.rn.f32.u32 fl1_{m}, ts;           // 2 ls1 + 1")
+    else:
+        k(f"prmt.b32 ts, e0_{m}, KEXP, 0x{0x7440 | b:04x};")
+        k(f"mov.b32 fl0_{m}, ts;")
+        k(f"add.ftz.f32 fl0_{m}, fl0_{m}, 0fCB000000;  // 2 ls0 + 1")
+        k(f"prmt.b32 ts, e1_{m}, KEXP, 0x{0x7440 | b:04x};")
+        k(f"mov.b32 fl1_{m}, ts;")
+        k(f"add.ftz.f32 fl1_{m}, fl1_{m}, 0fCB000000;  // 2 ls1 + 1")
+    k(f"mul.ftz.f32 nc1_{m}, fl1_{m}, 0fCB400000;  // -(2 ls1 + 1) * 1.5 * 2^23")
+
+
+def values(k, m, l):
+    """Group l's eight int8 weights q<m>_<2l>, q<m>_<2l+1> from its code word (the table word at ea) and its sign
+    nibbles sn."""
+    k("ld.shared.u32 cw, [ea];")
+    k("or.b32 sv, cw, sn;")
+    k(f"prmt.b32 q{m}_{2 * l}, LP, LN, sv;")
+    k("shr.b32 sh, sv, 16;")
+    k(f"prmt.b32 q{m}_{2 * l + 1}, LP, LN, sh;")
+
+
+def sums(k, nt, ib):
+    """Block ib times every member: two DP4A chains per matrix (weights 0-15 and 16-31, each started at 1.5 * 2^23),
+    (float) (ls0 * i0 + ls1 * i1) exactly, times the member's activation scale into sf<j>_<m> (IQ2_S and IQ2_XS)."""
+    for j in range(nt):
+        aj = "au" if j == 0 else f"au{j}"
+        dj = "ad" if j == 0 else f"ad{j}"
+        k(f"ld.shared.v4.u32 {{ua0, ua1, ua2, ua3}}, [{aj}+{32 * ib}];")
+        k(f"ld.shared.v4.u32 {{ub0, ub1, ub2, ub3}}, [{aj}+{32 * ib + 16}];")
+        k(f"ld.shared.f32 fa, [{dj}+{4 * ib}];")
+        for m in range(2):
+            k(f"dp4a.s32.s32 ia, q{m}_0, ua0, DBASE;")
+            k(f"dp4a.s32.s32 ia, q{m}_1, ua1, ia;")
+            k(f"dp4a.s32.s32 ia, q{m}_2, ua2, ia;")
+            k(f"dp4a.s32.s32 ia, q{m}_3, ua3, ia;")
+            k(f"dp4a.s32.s32 ib1, q{m}_4, ub0, DBASE;")
+            k(f"dp4a.s32.s32 ib1, q{m}_5, ub1, ib1;")
+            k(f"dp4a.s32.s32 ib1, q{m}_6, ub2, ib1;")
+            k(f"dp4a.s32.s32 ib1, q{m}_7, ub3, ib1;")
+            k("mov.b32 fi, ib1;")
+            k(f"fma.rn.ftz.f32 fp, fl1_{m}, fi, nc1_{m};     // ls1 * i1, exactly")
+            k("mov.b32 fi, ia;")
+            k("add.ftz.f32 fi, fi, 0fCB400000;              // i0, exactly")
+            k(f"fma.rn.ftz.f32 fr, fl0_{m}, fi, fp;         // (float) (ls0 * i0 + ls1 * i1), exactly")
+            k(f"fma.rn.ftz.f32 sf{j}_{m}, fa, fr, sf{j}_{m};")
+
+
 def body(k, nt):
     """The rows of the block for groups of exactly nt members (mtok_iq2s_fast::rows<true, nt>)."""
     b32 = lambda *n: k.r(".b32", *n)
-    b64 = lambda *n: k.r(".b64", *n)
     f32 = lambda *n: k.r(".f32", *n)
-    prd = lambda *n: k.r(".pred", *n)
-    b16 = lambda *n: k.r(".b16", *n)
-    L = f"N{nt}_"
-    k.label(f"BODY{nt}")
-    k.c(f"groups of {nt} member(s): member j's output offset dc<j>")
-    for j in range(nt):
-        b32(f"dc{j}")
-        k(f"shfl.sync.idx.b32 dc{j}, doff, {j}, 31, -1;")
-    b32("rbi", "rblk", "row0", "rowc", "kap0", "kap", "itr", "cs", "au", "ad", "sego")
-    b64("rw0", "rw1", "ro64", "seg")
-    prd("p0", "pst")
-    k("mov.u32 rbi, 0;")
-    k.label(L + "ROWBLOCK")
-    k("setp.ge.u32 p0, rbi, rb;")
-    k("@p0 bra.uni DONE;")
-    k("add.u32 rblk, rbx, rbi;")
-    k("setp.ge.u32 p0, rblk, nrowblocks;")
-    k("@p0 bra.uni DONE;")
-    k.c("rows 4 apart: warp w takes rows w, w + 4, ..., w + 60 of the row block; lane pair grp row w + 4 grp")
-    k("shl.b32 row0, rblk, 6;")
-    k("add.u32 row0, row0, warp;")
-    k("shl.b32 t0, grp, 2;")
-    k("add.u32 row0, row0, t0;")
-    k("add.u32 t0, nrows, -1;")
-    k("min.u32 rowc, row0, t0;")
-    k("mul.wide.u32 ro64, rowc, row_bytes;")
-    k("add.u64 rw0, xu, ro64;")
-    k("add.u64 rw1, xg, ro64;")
-    k.c("kappa: the word of its first 16-byte unit at which the warp's segments start (lane 0's row)")
-    k("cvt.u32.u64 t0, rw0;")
-    k("bfe.u32 t0, t0, 2, 2;")
-    k("shfl.sync.idx.b32 kap0, t0, 0, 31, -1;")
-    for j in range(nt):
-        for m in range(2):
-            f32(f"acc{j}_{m}")
-            k(f"mov.f32 acc{j}_{m}, 0f00000000;")
-    k("mov.u32 itr, 0;")
-    k.label(L + "ITER")
-    k.c("the lane's super-block c = 2 it + sl: its activations au (member 0) and scales ad")
-    k("shl.b32 cs, itr, 1;")
-    k("add.u32 cs, cs, sl;")
-    k(f"mad.lo.u32 au, cs, {ACT_RUN}, act;")
-    k("shl.b32 t0, cs, 5;")
-    k("add.u32 ad, ad0, t0;")
-    for j in range(1, nt):
-        b32(f"au{j}", f"ad{j}")
-        k(f"mad.lo.u32 au{j}, act_tok, {j}, au;")
-        k(f"mad.lo.u32 ad{j}, act_tok, {j}, ad;")
-    k.c("both matrices' segments: lane sl loads the 6 aligned 16-byte units from (segment & ~15) + 80 sl")
-    k(f"mul.lo.u32 sego, itr, {2 * SB};")
-    k("cvt.u64.u32 w64, sego;")
-    for m, rw in ((0, "rw0"), (1, "rw1")):
-        k(f"add.u64 seg, {rw}, w64;")
-        k("and.b64 seg, seg, -16;")
-        k("add.u64 seg, seg, sl64;")
-        for u in range(6):
-            regs = [f"u{m}_{4 * u + q}" for q in range(4)]
-            b32(*regs)
-            k(f"ld.global.nc.v4.u32 {{{', '.join(regs)}}}, [seg+{16 * u}];")
-    k.c("the words of each super-block after its d, by kappa (warp-uniform): w<m>_k = bytes 2 + 4k .. 5 + 4k")
-    k("add.u32 kap, kap0, itr;")
-    k("and.b32 kap, kap, 3;")
-    for kv in range(3):
-        k(f"setp.eq.u32 p0, kap, {kv};")
-        k(f"@p0 bra.uni {L}KAPPA{kv};")
-    for kv in (3, 0, 1, 2):
-        if kv != 3:
-            k.label(f"{L}KAPPA{kv}")
-        for m in range(2):
-            for w in range(20):
-                b32(f"w{m}_{w}")
-                k(f"prmt.b32 w{m}_{w}, u{m}_{kv + w}, u{m}_{kv + w + 1}, sel;")
-            b32(f"dw{m}")
-            k(f"mov.b32 dw{m}, u{m}_{kv};")
-        if kv != 2:
-            k(f"bra.uni {L}WORDS;")
-    k.label(f"{L}WORDS")
-    for j in range(nt):
-        for m in range(2):
-            f32(f"sf{j}_{m}")
-            k(f"mov.f32 sf{j}_{m}, 0f00000000;")
+    base.row_start(k, nt)
+    base.segments(k, nt, SB, 16, 6, 80, 20)
     b32("z", "z2", "x", "sn", "px", "ix", "ea", "cw", "sv", "sh", "ia", "ib1", "ts")
     b32(*[f"q{m}_{n}" for m in range(2) for n in range(8)])
     b32(*[f"ua{n}" for n in range(4)], *[f"ub{n}" for n in range(4)])
@@ -180,10 +163,7 @@ def body(k, nt):
             qw, sw = f"w{m}_{16 + h}", f"w{m}_{18 + h}"
             for l in range(1, 4):
                 k(f"shr.b32 qh{m}_{l}, {qw}, {2 * l};")
-            k(f"shl.b32 ts, {sw}, 1;")
-            k(f"lop3.b32 e0_{m}, ts, K1E, K01, 0xEA;  // ((sw << 1) & 0x1E1E1E1E) | 0x01010101: 2 ls0 + 1")
-            k(f"shr.b32 ts, {sw}, 3;")
-            k(f"lop3.b32 e1_{m}, ts, K1E, K01, 0xEA;  // ((sw >> 3) & 0x1E1E1E1E) | 0x01010101: 2 ls1 + 1")
+            scale_bytes(k, m, sw)
         for b in range(4):
             ib = 4 * h + b
             k.c(f"block {ib}: weights {32 * ib}..{32 * ib + 31}")
@@ -204,84 +184,10 @@ def body(k, nt):
                         k("and.b32 ix, px, 0x3FF;            // the 10-bit grid index")
                         k("shl.b32 ea, ix, 4;")
                         k("add.u32 ea, tabl, ea;")
-                    k("ld.shared.u32 cw, [ea];")
-                    k("or.b32 sv, cw, sn;")
-                    k(f"prmt.b32 q{m}_{2 * l}, LP, LN, sv;")
-                    k("shr.b32 sh, sv, 16;")
-                    k(f"prmt.b32 q{m}_{2 * l + 1}, LP, LN, sh;")
-                if I2F_SCALES:
-                    k(f"bfe.u32 ts, e0_{m}, {8 * b}, 8;")
-                    k(f"cvt.rn.f32.u32 fl0_{m}, ts;           // 2 ls0 + 1")
-                    k(f"bfe.u32 ts, e1_{m}, {8 * b}, 8;")
-                    k(f"cvt.rn.f32.u32 fl1_{m}, ts;           // 2 ls1 + 1")
-                else:
-                    k(f"prmt.b32 ts, e0_{m}, KEXP, 0x{0x7440 | b:04x};")
-                    k(f"mov.b32 fl0_{m}, ts;")
-                    k(f"add.ftz.f32 fl0_{m}, fl0_{m}, 0fCB000000;  // 2 ls0 + 1")
-                    k(f"prmt.b32 ts, e1_{m}, KEXP, 0x{0x7440 | b:04x};")
-                    k(f"mov.b32 fl1_{m}, ts;")
-                    k(f"add.ftz.f32 fl1_{m}, fl1_{m}, 0fCB000000;  // 2 ls1 + 1")
-                k(f"mul.ftz.f32 nc1_{m}, fl1_{m}, 0fCB400000;  // -(2 ls1 + 1) * 1.5 * 2^23")
-            for j in range(nt):
-                aj = "au" if j == 0 else f"au{j}"
-                dj = "ad" if j == 0 else f"ad{j}"
-                k(f"ld.shared.v4.u32 {{ua0, ua1, ua2, ua3}}, [{aj}+{32 * ib}];")
-                k(f"ld.shared.v4.u32 {{ub0, ub1, ub2, ub3}}, [{aj}+{32 * ib + 16}];")
-                k(f"ld.shared.f32 fa, [{dj}+{4 * ib}];")
-                for m in range(2):
-                    k(f"dp4a.s32.s32 ia, q{m}_0, ua0, DBASE;")
-                    k(f"dp4a.s32.s32 ia, q{m}_1, ua1, ia;")
-                    k(f"dp4a.s32.s32 ia, q{m}_2, ua2, ia;")
-                    k(f"dp4a.s32.s32 ia, q{m}_3, ua3, ia;")
-                    k(f"dp4a.s32.s32 ib1, q{m}_4, ub0, DBASE;")
-                    k(f"dp4a.s32.s32 ib1, q{m}_5, ub1, ib1;")
-                    k(f"dp4a.s32.s32 ib1, q{m}_6, ub2, ib1;")
-                    k(f"dp4a.s32.s32 ib1, q{m}_7, ub3, ib1;")
-                    k("mov.b32 fi, ib1;")
-                    k(f"fma.rn.ftz.f32 fp, fl1_{m}, fi, nc1_{m};     // ls1 * i1, exactly")
-                    k("mov.b32 fi, ia;")
-                    k("add.ftz.f32 fi, fi, 0fCB400000;              // i0, exactly")
-                    k(f"fma.rn.ftz.f32 fr, fl0_{m}, fi, fp;         // (float) (ls0 * i0 + ls1 * i1), exactly")
-                    k(f"fma.rn.ftz.f32 sf{j}_{m}, fa, fr, sf{j}_{m};")
-    k.c("the super-block's d: lane 0's in the low half of dw, lane 1's in the high half")
-    b32("dsh")
-    f32("fd")
-    for m in range(2):
-        k(f"shr.b32 t0, dw{m}, 16;")
-        k(f"selp.b32 dsh, t0, dw{m}, psl;")
-        k("mov.b32 {h0, h1}, dsh;")
-        k("cvt.f32.f16 fd, h0;")
-        k("mul.ftz.f32 fd, fd, 0f3E000000;")
-        for j in range(nt):
-            k(f"fma.rn.ftz.f32 acc{j}_{m}, fd, sf{j}_{m}, acc{j}_{m};")
-    k("add.u32 itr, itr, 1;")
-    k(f"setp.lt.u32 p0, itr, {NITER};")
-    k(f"@p0 bra.uni {L}ITER;")
-    k.c("the row's two lanes summed, then up * SiLU(gate) (ggml_cuda_op_silu_single under -use_fast_math)")
-    b32("rt0", "rt1")
-    f32("fs", "fu", "fg", "fe")
-    for j in range(nt):
-        for m in range(2):
-            k(f"mov.b32 rt0, acc{j}_{m};")
-            k("shfl.sync.bfly.b32 rt1, rt0, 1, 31, -1;")
-            k("mov.b32 fs, rt1;")
-            k(f"add.ftz.f32 acc{j}_{m}, acc{j}_{m}, fs;")
-    k("setp.eq.u32 p0, sl, 0;")
-    k("setp.lt.u32 pst, row0, nrows;")
-    k("and.pred pst, pst, p0;")
-    for j in range(nt):
-        k(f"mul.ftz.f32 fe, acc{j}_1, 0fBFB8AA3B;")
-        k("ex2.approx.ftz.f32 fe, fe;")
-        k("add.ftz.f32 fe, fe, 0f3F800000;")
-        k(f"div.approx.ftz.f32 fg, acc{j}_1, fe;")
-        k(f"mul.ftz.f32 fu, acc{j}_0, fg;")
-        k(f"add.u32 t0, dc{j}, row0;")
-        k("mul.wide.u32 o64, t0, 4;")
-        k("add.u64 a64, dstp, o64;")
-        k("@pst st.global.f32 [a64], fu;")
-    k("add.u32 rbi, rbi, 1;")
-    k(f"bra.uni {L}ROWBLOCK;")
-    k.blank()
+                    values(k, m, l)
+                scale_floats(k, m, b)
+            sums(k, nt, ib)
+    base.row_end(k, nt)
 
 
 class IQ2S:
