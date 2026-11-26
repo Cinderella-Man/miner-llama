@@ -590,9 +590,9 @@ static bool mtok_iq_skipped(const ggml_type type) {
 }
 
 // GGML_CUDA_MTOK_IQ_FAST (C1138): 0 (default) the kernels of mmvq-pascal-mtok-iq.cuh for every type; 1 the fast kernels
-// in CUDA C of IQ2_XXS, IQ2_XS and IQ2_S (mmvq-pascal-mtok-<type>-fast.cu) where their shapes allow (rows of 2 lanes:
-// 256 n weights with n = 2 mod 4; 16-byte-aligned matrices whose rows are a multiple of 4 bytes); 2 the hand-written PTX
-// of the same kernels where it covers the product, else as 1. Read once.
+// in CUDA C of IQ2_XXS, IQ2_XS, IQ2_S and IQ1_M (mmvq-pascal-mtok-<type>-fast.cu) where their shapes allow (rows of 2
+// lanes: 256 n weights with n = 2 mod 4; 16-byte-aligned matrices whose rows are a multiple of 4 bytes); 2 the
+// hand-written PTX of the same kernels where it covers the product, else as 1. Read once.
 static int mtok_iq_fast_mode() {
     static const int mode = [] {
         const char * env = getenv("GGML_CUDA_MTOK_IQ_FAST");
@@ -707,12 +707,15 @@ static bool mtok_iq_run(
     const dim3 grid((unsigned) ((nrowblocks + rb - 1) / rb), (unsigned) (ne + (fusion.shared_up ? 1 : 0)),
                     (unsigned) nsamples_dst);
 
-    // The fast kernels of IQ2_XXS, IQ2_XS and IQ2_S (C1138): rows of 2 lanes, every matrix 16-byte aligned and ending at
-    // a 16-byte boundary (their lanes load the aligned 16-byte units around their super-blocks, IQ2_XS's the 8-byte
-    // ones), rows a multiple of 4 bytes (a warp's rows, 4 apart, then start at the same word of a unit)
-    const bool fast_type = type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S;
+    // The fast kernels of IQ2_XXS, IQ2_XS, IQ2_S and IQ1_M (C1138): rows of 2 lanes, every matrix 16-byte aligned and
+    // ending at a 16-byte boundary (their lanes load the aligned 16-byte units around their super-blocks, IQ2_XS's and
+    // IQ1_M's the 8-byte ones), rows a multiple of 4 bytes (a warp's rows, 4 apart, then start at the same word of a
+    // unit; IQ1_M's rows of 2 lanes are multiples of 112 bytes, so its super-blocks start on 8-byte boundaries)
+    const bool fast_type = type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S ||
+                           type == GGML_TYPE_IQ1_M;
     const int  fast_smem = type == GGML_TYPE_IQ2_XXS ? ggml_cuda_mtok_iq2_xxs_fast_static_smem() :
                            type == GGML_TYPE_IQ2_XS  ? ggml_cuda_mtok_iq2_xs_fast_static_smem()  :
+                           type == GGML_TYPE_IQ1_M   ? ggml_cuda_mtok_iq1_m_fast_static_smem()   :
                                                        ggml_cuda_mtok_iq2_s_fast_static_smem();
     if (fast_type && mtok_iq_fast_mode() > 0 && lpr_log2 == 1 && row_bytes % 4 == 0 &&
             (nrows_x * row_bytes) % 16 == 0 && mtok_aligned(vx, 16) && mtok_aligned(fusion.gate, 16) &&
@@ -738,6 +741,8 @@ static bool mtok_iq_run(
             ggml_cuda_mtok_iq_fast_launch_iq2_s(pf, ff, grid, smem, gate, ntm, stream);
         } else if (type == GGML_TYPE_IQ2_XS) {
             ggml_cuda_mtok_iq_fast_launch_iq2_xs(pf, ff, grid, smem, gate, ntm, stream);
+        } else if (type == GGML_TYPE_IQ1_M) {
+            ggml_cuda_mtok_iq_fast_launch_iq1_m(pf, ff, grid, smem, gate, ntm, stream);
         } else {
             ggml_cuda_mtok_iq_fast_launch_iq2_xxs(pf, ff, grid, smem, gate, ntm, stream);
         }
