@@ -4102,6 +4102,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
                 prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
                 memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
                 memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
+                prop.node_src_type[j] = cgraph->nodes[i]->src[j]->type;
             }
         }
 

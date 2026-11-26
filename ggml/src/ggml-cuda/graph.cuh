@@ -97,6 +97,9 @@ struct ggml_cuda_graph {
         void *   node_src_data_ptrs[GGML_MAX_SRC];
         int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+        // a source of another type at the same address with the same shape and strides (F16 and BF16, Q4_0 and
+        // IQ4_NL) needs other kernels, so the type is a property too
+        ggml_type node_src_type[GGML_MAX_SRC];
     };
     std::vector<node_properties> node_props;
 
