@@ -9,7 +9,7 @@ code table from ggml-common.h. The float operations are the CUDA C kernel's, in 
 them under -use_fast_math (.ftz, ex2.approx and div.approx for SiLU), so the results are bit-identical to it and to the
 old kernel. Run: python3 -I gen_mtok_iq2_xxs.py > mtok-iq2_xxs.ptx (from this folder).
 
-Parameters (byte offsets, checked by static_asserts in mmvq-pascal-mtok-iq2_xxs-ptx.cu): mtok_iq::args (168 bytes) and
+Parameters (byte offsets, checked by static_asserts in mmvq-pascal-mtok-iq-ptx.cu): mtok_iq::args (168 bytes) and
 ggml_cuda_mm_fusion_args_device (80 bytes; the gate matrix at 8).
 """
 import os
@@ -66,9 +66,30 @@ class K:
         self.lines.append("")
 
 
-def entry(ntm):
+class IQ2XXS:
+    """What an entry point of this type differs in (gen_mtok_iq2_s.py brings its own: the generator's other parts are
+    shared)."""
+    prefix = "iq2xxs"    # names: mtok_<prefix>_fast_ptx_ntm<N>, mtok_<prefix>_codes, mtok_<prefix>_dyn
+    copies = 8           # copies of the code table, interleaved by word
+    tab_words = 2048     # the shared code table's words
+    unit_off = 64        # bytes from lane 0's first 16-byte unit to lane 1's
+
+    @staticmethod
+    def table(k):
+        table_iq2xxs(k)
+
+    @staticmethod
+    def consts(k):
+        pass
+
+    @staticmethod
+    def body(k, nt):
+        body(k, nt)
+
+
+def entry(ntm, kt=IQ2XXS):
     k = K()
-    name = f"mtok_iq2xxs_fast_ptx_ntm{ntm}"
+    name = f"mtok_{kt.prefix}_fast_ptx_ntm{ntm}"
     b32 = lambda *n: k.r(".b32", *n)
     b64 = lambda *n: k.r(".b64", *n)
     f32 = lambda *n: k.r(".f32", *n)
@@ -210,20 +231,7 @@ def entry(ntm):
     k.label("MEMBER_DONE")
     k.blank()
 
-    k.c("the code table: entry e's eight codes (0, 1, 2 for 8, 25, 43) as nibbles, 8 copies interleaved by word")
-    b32("tabb", "e", "cw", "sa")
-    b64("cods")
-    k("mov.u32 tabb, tab;")
-    k("mov.u64 cods, mtok_iq2xxs_codes;")
-    for add in (0, 128):
-        k(f"add.u32 e, tid, {add};")
-        k("mul.wide.u32 o64, e, 4;")
-        k("add.u64 a64, cods, o64;")
-        k("ld.global.nc.u32 cw, [a64];")
-        k("shl.b32 sa, e, 5;")
-        k("add.u32 sa, sa, tabb;")
-        k("st.shared.v4.u32 [sa], {cw, cw, cw, cw};")
-        k("st.shared.v4.u32 [sa+16], {cw, cw, cw, cw};")
+    kt.table(k)
     k.c("the members' activations: each group of 8 int8 values as (0, 1, 4, 5), (2, 3, 6, 7); thread q < 80 stages")
     k.c("Q8_1 block q of each member: 256 values and 16 bytes of padding per super-block, the FP32 scales after them")
     b32("act", "jm", "yj", "aj", "drel", "srel", "pa0", "pa1", "pa2", "pa3")
@@ -231,7 +239,7 @@ def entry(ntm):
     b16("h0", "h1")
     f32("fsc")
     prd("pq")
-    k("mov.u32 act, mtok_iq2xxs_dyn;")
+    k(f"mov.u32 act, mtok_{kt.prefix}_dyn;")
     k(f"setp.lt.u32 pq, tid, {8 * NCHUNK};")
     k("shr.b32 t0, tid, 3;")
     k("and.b32 t1, tid, 7;")
@@ -286,18 +294,19 @@ def entry(ntm):
     k("shr.b32 grp, lane, 1;")
     k("setp.ne.u32 psl, sl, 0;")
     k("selp.b32 sel, 0x7654, 0x5432, psl;")
-    k("and.b32 t0, lane, 7;")
+    k(f"and.b32 t0, lane, {kt.copies - 1};")
     k("shl.b32 t0, t0, 2;")
     k("add.u32 tabl, tabb, t0;")
     k(f"add.u32 ad0, act, {SCALES};")
     k("mul.lo.u32 rbx, bx, rb;")
-    k("mul.wide.u32 sl64, sl, 64;")
+    k(f"mul.wide.u32 sl64, sl, {kt.unit_off};")
     k("mov.b32 LP, 0x002b1908;    // bytes 8, 25, 43, 0: the grid values by code")
     k("mov.b32 LN, 0x00d5e7f8;    // -8, -25, -43, 0")
     k("mov.b32 LS, 0x44400400;    // two sign bits (index b0 + 2 b1) -> bit 2 of two nibbles")
     k("mov.b32 K3333, 0x3333;")
     k("mov.b32 ZERO, 0;")
     k("mov.b32 DBASE, 0x4B400000; // the float 1.5 * 2^23: a DP4A chain started there is that float + its sum")
+    kt.consts(k)
     k.blank()
     for nt in range(1, ntm):
         k(f"setp.eq.u32 p0, nt, {nt};")
@@ -306,7 +315,7 @@ def entry(ntm):
     k.blank()
 
     for nt in range(1, ntm + 1):
-        body(k, nt)
+        kt.body(k, nt)
 
     k.label("SKIPPED")
     k.c("a skipped slot (id -1): zeros in its rows of the output")
@@ -353,11 +362,31 @@ def entry(ntm):
         names = by_type.get(t, [])
         for i in range(0, len(names), 12):
             out.append(f"    .reg {t} " + ", ".join(names[i:i + 12]) + ";")
-    out.append("    .shared .align 16 .b32 tab[2048];")
+    out.append(f"    .shared .align 16 .b32 tab[{kt.tab_words}];")
     out.append("")
     out += k.lines
     out.append("}")
     return "\n".join(out)
+
+
+def table_iq2xxs(k):
+    """The code table in shared memory, from the global table mtok_iq2xxs_codes (256 entries, 8 copies)."""
+    b32 = lambda *n: k.r(".b32", *n)
+    b64 = lambda *n: k.r(".b64", *n)
+    k.c("the code table: entry e's eight codes (0, 1, 2 for 8, 25, 43) as nibbles, 8 copies interleaved by word")
+    b32("tabb", "e", "cw", "sa")
+    b64("cods")
+    k("mov.u32 tabb, tab;")
+    k("mov.u64 cods, mtok_iq2xxs_codes;")
+    for add in (0, 128):
+        k(f"add.u32 e, tid, {add};")
+        k("mul.wide.u32 o64, e, 4;")
+        k("add.u64 a64, cods, o64;")
+        k("ld.global.nc.u32 cw, [a64];")
+        k("shl.b32 sa, e, 5;")
+        k("add.u32 sa, sa, tabb;")
+        k("st.shared.v4.u32 [sa], {cw, cw, cw, cw};")
+        k("st.shared.v4.u32 [sa+16], {cw, cw, cw, cw};")
 
 
 def body(k, nt):
@@ -538,7 +567,7 @@ def main():
     print("//")
     print("// mtok-iq2_xxs.ptx: IQ2_XXS's fast multi-token expert kernel (C1138) in hand-written PTX, written by")
     print("// gen_mtok_iq2_xxs.py (do not edit; edit the script). See mmvq-pascal-mtok-iq2_xxs-fast.cu for the method")
-    print("// and mmvq-pascal-mtok-iq2_xxs-ptx.cu for how it is loaded and which products it takes.")
+    print("// and mmvq-pascal-mtok-iq-ptx.cu for how it is loaded and which products it takes.")
     print("//")
     print(".version 7.0")
     print(".target sm_61")

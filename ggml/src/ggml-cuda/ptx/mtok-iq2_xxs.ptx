@@ -1,7 +1,7 @@
 //
 // mtok-iq2_xxs.ptx: IQ2_XXS's fast multi-token expert kernel (C1138) in hand-written PTX, written by
 // gen_mtok_iq2_xxs.py (do not edit; edit the script). See mmvq-pascal-mtok-iq2_xxs-fast.cu for the method
-// and mmvq-pascal-mtok-iq2_xxs-ptx.cu for how it is loaded and which products it takes.
+// and mmvq-pascal-mtok-iq-ptx.cu for how it is loaded and which products it takes.
 //
 .version 7.0
 .target sm_61

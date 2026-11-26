@@ -730,14 +730,14 @@ static bool mtok_iq_run(
             ff.gate = vx;
             std::swap(ff.shared_up, ff.shared_gate);
         }
+        if (mtok_iq_fast_mode() == 2 && ggml_cuda_mtok_iq_ptx_launch(type, pf, ff, grid, smem, gate, ntm, stream)) {
+            return true;
+        }
         if (type == GGML_TYPE_IQ2_S) {
             ggml_cuda_mtok_iq_fast_launch_iq2_s(pf, ff, grid, smem, gate, ntm, stream);
-            return true;
+        } else {
+            ggml_cuda_mtok_iq_fast_launch_iq2_xxs(pf, ff, grid, smem, gate, ntm, stream);
         }
-        if (mtok_iq_fast_mode() == 2 && ggml_cuda_mtok_iq2_xxs_ptx_launch(pf, ff, grid, smem, gate, ntm, stream)) {
-            return true;
-        }
-        ggml_cuda_mtok_iq_fast_launch_iq2_xxs(pf, ff, grid, smem, gate, ntm, stream);
         return true;
     }
 
