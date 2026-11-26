@@ -330,6 +330,9 @@ llama_build(test-hop-cast.cpp LINK llama)
 # the mailbox hop (GGML_CUDA_HOP_MAILBOX): bytes exact through every ring setting, on two or three CUDA cards
 llama_build(test-hop-mailbox.cpp LINK ggml)
 
+# the CUDA graph cache when only a source's type changes (F16 and BF16, Q4_0 and IQ4_NL), on a CUDA card (C1157)
+llama_build(test-cuda-graph-src-types.cpp LINK ggml)
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
 llama_build_and_test(test-jinja.cpp  LABEL behavior)
 llama_test(test-jinja  NAME test-jinja-py  ARGS -py  LABEL "python behavior")
