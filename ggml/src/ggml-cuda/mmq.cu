@@ -50,6 +50,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_IQ1_S:
             mul_mat_q_case<GGML_TYPE_IQ1_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
+        case GGML_TYPE_IQ1_M:
+            mul_mat_q_case<GGML_TYPE_IQ1_M, GGML_PREC_Q8>(ctx, args, stream);
+            break;
         case GGML_TYPE_IQ2_XXS:
             mul_mat_q_case<GGML_TYPE_IQ2_XXS, GGML_PREC_Q8>(ctx, args, stream);
             break;
@@ -527,6 +530,24 @@ static void ggml_cuda_mul_mat_q_impl(
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
 
+// GGML_CUDA_MMQ_IQ1_M (C1179, Q1914): IQ1_M's products of more tokens than its vector kernel takes run on MMQ, on the tile
+// and dot product of IQ2_XS (ggml_cuda_mmq_load_tiles_iq1_m: each weight as the int8 8g +- 1, exact, with the scale
+// d*(2s+1)/8 per 16 weights). Without it MUL_MAT_ID takes ggml_cuda_mul_mat_id's generic path for IQ1_M (the ids to the
+// host, two stream synchronizations, one product per expert) and ggml_cuda_mul_mat_id_needs_sync turns CUDA graphs off.
+// 0 (default) off; 1 compute capability 6.1 only; 2 any NVIDIA GPU (for tests; Turing and newer take the MMA tile).
+static bool ggml_cuda_mmq_iq1_m(const int cc) {
+    static const int mode = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_IQ1_M");
+        const int m = env != nullptr ? atoi(env) : 0;
+        if (m != 0) {
+            GGML_LOG_INFO("%s: GGML_CUDA_MMQ_IQ1_M=%d: IQ1_M prompt products on MMQ (%s)\n", __func__, m,
+                          m == 2 ? "any NVIDIA GPU" : "compute 6.1 only");
+        }
+        return m;
+    }();
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && (mode == 2 || (mode == 1 && cc == GGML_CUDA_CC_DP4A));
+}
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
@@ -565,6 +586,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
             mmq_supported = true;
+            break;
+        case GGML_TYPE_IQ1_M:
+            mmq_supported = ggml_cuda_mmq_iq1_m(cc);
             break;
         default:
             mmq_supported = false;

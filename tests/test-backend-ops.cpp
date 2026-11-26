@@ -15552,6 +15552,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 1024, 10, false, 128, n, 512));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,   GGML_TYPE_F32, 1024, 10, false, 256, n, 128));
     }
+    // Miner Llama, C1179 (GGML_CUDA_MMQ_IQ1_M): IQ1_M's prompt products on MMQ, 9 to 512 columns. MUL_MAT: one column tile
+    // and several, rows a multiple of 128 (no row check) and not (the row check), broadcast batches. MUL_MAT_ID: the
+    // Qwen3.8-Flash-Next routed gate/up (2560 -> 640, 10 of 32 and of 512 experts), src1 broadcast and not, a row count
+    // that is no multiple of 128, and the gate/up pair with SWIGLU (which MMQ runs as two products for IQ1_M).
+    for (int64_t n : {9, 16, 17, 32, 48, 63, 64, 65, 128, 129, 256, 512}) {
+        for (int64_t m : {64, 128, 1000}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ1_M, GGML_TYPE_F32, m, n, 2560, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ1_M, GGML_TYPE_F32, 256, n, 512, {2, 3}, {2, 1}));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ1_M, GGML_TYPE_F32, 32, 10, true,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ1_M, GGML_TYPE_F32, 32, 10, false, 640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ1_M, GGML_TYPE_F32, 32, 10, false, 1000, n, 1024));
+        test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_IQ1_M, GGML_GLU_OP_SWIGLU, n, 640, 2560, true, 32, 10, true));
+    }
+    for (int64_t n : {9, 64, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ1_M, GGML_TYPE_F32, 512, 10, false, 640, n, 2560));
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
     // multiple blocks per row: exercises the block-stride loop and the
