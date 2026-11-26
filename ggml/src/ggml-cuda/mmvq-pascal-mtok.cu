@@ -590,9 +590,9 @@ static bool mtok_iq_skipped(const ggml_type type) {
 }
 
 // GGML_CUDA_MTOK_IQ_FAST (C1138): 0 (default) the kernels of mmvq-pascal-mtok-iq.cuh for every type; 1 the fast kernels
-// in CUDA C of IQ2_XXS and IQ2_S (mmvq-pascal-mtok-<type>-fast.cu) where their shapes allow (rows of 2 lanes: 256 n
-// weights with n = 2 mod 4; 16-byte-aligned matrices whose rows are a multiple of 4 bytes); 2 the hand-written PTX of
-// the same kernels where it covers the product, else as 1. Read once.
+// in CUDA C of IQ2_XXS, IQ2_XS and IQ2_S (mmvq-pascal-mtok-<type>-fast.cu) where their shapes allow (rows of 2 lanes:
+// 256 n weights with n = 2 mod 4; 16-byte-aligned matrices whose rows are a multiple of 4 bytes); 2 the hand-written PTX
+// of the same kernels where it covers the product, else as 1. Read once.
 static int mtok_iq_fast_mode() {
     static const int mode = [] {
         const char * env = getenv("GGML_CUDA_MTOK_IQ_FAST");
@@ -707,16 +707,17 @@ static bool mtok_iq_run(
     const dim3 grid((unsigned) ((nrowblocks + rb - 1) / rb), (unsigned) (ne + (fusion.shared_up ? 1 : 0)),
                     (unsigned) nsamples_dst);
 
-    // The fast kernels of IQ2_XXS and IQ2_S (C1138): rows of 2 lanes, every matrix 16-byte aligned and ending at a 16-byte
-    // boundary (their lanes load the aligned 16-byte units around their super-blocks), rows a multiple of 4 bytes (a
-    // warp's rows, 4 apart, then start at the same word of a unit)
-    const bool fast_type = type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S;
+    // The fast kernels of IQ2_XXS, IQ2_XS and IQ2_S (C1138): rows of 2 lanes, every matrix 16-byte aligned and ending at
+    // a 16-byte boundary (their lanes load the aligned 16-byte units around their super-blocks, IQ2_XS's the 8-byte
+    // ones), rows a multiple of 4 bytes (a warp's rows, 4 apart, then start at the same word of a unit)
+    const bool fast_type = type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S;
+    const int  fast_smem = type == GGML_TYPE_IQ2_XXS ? ggml_cuda_mtok_iq2_xxs_fast_static_smem() :
+                           type == GGML_TYPE_IQ2_XS  ? ggml_cuda_mtok_iq2_xs_fast_static_smem()  :
+                                                       ggml_cuda_mtok_iq2_s_fast_static_smem();
     if (fast_type && mtok_iq_fast_mode() > 0 && lpr_log2 == 1 && row_bytes % 4 == 0 &&
             (nrows_x * row_bytes) % 16 == 0 && mtok_aligned(vx, 16) && mtok_aligned(fusion.gate, 16) &&
             mtok_aligned(fusion.shared_up, 16) && mtok_aligned(fusion.shared_gate, 16) &&
-            (stride_channel_x * bs) % 16 == 0 && (stride_sample_x * bs) % 16 == 0 &&
-            smem + (type == GGML_TYPE_IQ2_XXS ? ggml_cuda_mtok_iq2_xxs_fast_static_smem() :
-                                                ggml_cuda_mtok_iq2_s_fast_static_smem()) <= 48 * 1024) {
+            (stride_channel_x * bs) % 16 == 0 && (stride_sample_x * bs) % 16 == 0 && smem + fast_smem <= 48 * 1024) {
         // GGML_CUDA_MTOK_IQ_FAST_FAULT=1, a test fault: the fast kernels take the up and gate matrices the wrong way
         // round, so that a check comparing them with the old kernel must see the gate/up products differ
         static const bool fault = [] {
@@ -735,6 +736,8 @@ static bool mtok_iq_run(
         }
         if (type == GGML_TYPE_IQ2_S) {
             ggml_cuda_mtok_iq_fast_launch_iq2_s(pf, ff, grid, smem, gate, ntm, stream);
+        } else if (type == GGML_TYPE_IQ2_XS) {
+            ggml_cuda_mtok_iq_fast_launch_iq2_xs(pf, ff, grid, smem, gate, ntm, stream);
         } else {
             ggml_cuda_mtok_iq_fast_launch_iq2_xxs(pf, ff, grid, smem, gate, ntm, stream);
         }
