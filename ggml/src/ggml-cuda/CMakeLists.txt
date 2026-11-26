@@ -154,7 +154,7 @@ if (CUDAToolkit_FOUND)
     # the driver library, so builds with GGML_CUDA_NO_VMM leave them out (GGML_CUDA_NO_PTX_KERNELS) and their switches
     # fall back to the CUDA C kernels.
     if (NOT GGML_CUDA_NO_VMM)
-        foreach (kernel mtok-iq2_xxs mtok-iq2_s mtok-iq2_xs)
+        foreach (kernel mtok-iq2_xxs mtok-iq2_s mtok-iq2_xs mtok-iq1_m)
             string(REPLACE "-" "_" sym "ggml_cuda_ptx_${kernel}")
             set(src ${CMAKE_CURRENT_SOURCE_DIR}/ptx/${kernel}.ptx)
             set(out ${CMAKE_CURRENT_BINARY_DIR}/ptx/${kernel})

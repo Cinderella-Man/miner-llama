@@ -73,6 +73,9 @@ class IQ2XXS:
     copies = 8           # copies of the code table, interleaved by word
     tab_words = 2048     # the shared code table's words
     unit_off = 64        # bytes from lane 0's first 16-byte unit to lane 1's
+    # optional (gen_mtok_iq1_m.py sets them; the defaults are the IQ2 types'): stage_sel, stage_doc (the activations'
+    # order within each group of 8), lut (the value registers LP, LN and their comments), word_pick (False: no choice
+    # of words by alignment, so no sel, tabl, psl, LS or K3333)
 
     @staticmethod
     def table(k):
@@ -232,7 +235,9 @@ def entry(ntm, kt=IQ2XXS):
     k.blank()
 
     kt.table(k)
-    k.c("the members' activations: each group of 8 int8 values as (0, 1, 4, 5), (2, 3, 6, 7); thread q < 80 stages")
+    s0, s1 = getattr(kt, "stage_sel", ("0x5410", "0x7632"))
+    k.c(f"the members' activations: each group of 8 int8 values as {getattr(kt, 'stage_doc', '(0, 1, 4, 5), (2, 3, 6, 7)')};"
+        " thread q < 80 stages")
     k.c("Q8_1 block q of each member: 256 values and 16 bytes of padding per super-block, the FP32 scales after them")
     b32("act", "jm", "yj", "aj", "drel", "srel", "pa0", "pa1", "pa2", "pa3")
     b32(*[f"y{n}" for n in range(9)])
@@ -260,15 +265,15 @@ def entry(ntm, kt=IQ2XXS):
     for n in range(9):
         k(f"@pq ld.global.nc.u32 y{n}, [a64+{4 * n}];")
     k("add.u32 sa, aj, drel;")
-    k("prmt.b32 pa0, y1, y2, 0x5410;")
-    k("prmt.b32 pa1, y1, y2, 0x7632;")
-    k("prmt.b32 pa2, y3, y4, 0x5410;")
-    k("prmt.b32 pa3, y3, y4, 0x7632;")
+    k(f"prmt.b32 pa0, y1, y2, {s0};")
+    k(f"prmt.b32 pa1, y1, y2, {s1};")
+    k(f"prmt.b32 pa2, y3, y4, {s0};")
+    k(f"prmt.b32 pa3, y3, y4, {s1};")
     k("@pq st.shared.v4.u32 [sa], {pa0, pa1, pa2, pa3};")
-    k("prmt.b32 pa0, y5, y6, 0x5410;")
-    k("prmt.b32 pa1, y5, y6, 0x7632;")
-    k("prmt.b32 pa2, y7, y8, 0x5410;")
-    k("prmt.b32 pa3, y7, y8, 0x7632;")
+    k(f"prmt.b32 pa0, y5, y6, {s0};")
+    k(f"prmt.b32 pa1, y5, y6, {s1};")
+    k(f"prmt.b32 pa2, y7, y8, {s0};")
+    k(f"prmt.b32 pa3, y7, y8, {s1};")
     k("@pq st.shared.v4.u32 [sa+16], {pa0, pa1, pa2, pa3};")
     k("mov.b32 {h0, h1}, y0;")
     k("cvt.f32.f16 fsc, h0;")
@@ -288,22 +293,30 @@ def entry(ntm, kt=IQ2XXS):
     k("mad.lo.u64 xo, w64, chbx, xo;")
     k("add.u64 xu, vx, xo;")
     k("add.u64 xg, gatep, xo;")
-    b32("sl", "grp", "sel", "tabl", "ad0", "rbx", "LP", "LN", "LS", "K3333", "ZERO", "DBASE")
-    prd("psl")
+    pick = getattr(kt, "word_pick", True)
+    if pick:
+        b32("sl", "grp", "sel", "tabl", "ad0", "rbx", "LP", "LN", "LS", "K3333", "ZERO", "DBASE")
+        prd("psl")
+    else:
+        b32("sl", "grp", "ad0", "rbx", "LP", "LN", "ZERO", "DBASE")
     k("and.b32 sl, lane, 1;")
     k("shr.b32 grp, lane, 1;")
-    k("setp.ne.u32 psl, sl, 0;")
-    k("selp.b32 sel, 0x7654, 0x5432, psl;")
-    k(f"and.b32 t0, lane, {kt.copies - 1};")
-    k("shl.b32 t0, t0, 2;")
-    k("add.u32 tabl, tabb, t0;")
+    if pick:
+        k("setp.ne.u32 psl, sl, 0;")
+        k("selp.b32 sel, 0x7654, 0x5432, psl;")
+        k(f"and.b32 t0, lane, {kt.copies - 1};")
+        k("shl.b32 t0, t0, 2;")
+        k("add.u32 tabl, tabb, t0;")
     k(f"add.u32 ad0, act, {SCALES};")
     k("mul.lo.u32 rbx, bx, rb;")
     k(f"mul.wide.u32 sl64, sl, {kt.unit_off};")
-    k("mov.b32 LP, 0x002b1908;    // bytes 8, 25, 43, 0: the grid values by code")
-    k("mov.b32 LN, 0x00d5e7f8;    // -8, -25, -43, 0")
-    k("mov.b32 LS, 0x44400400;    // two sign bits (index b0 + 2 b1) -> bit 2 of two nibbles")
-    k("mov.b32 K3333, 0x3333;")
+    lp, ln = getattr(kt, "lut", (("0x002b1908", "bytes 8, 25, 43, 0: the grid values by code"),
+                                 ("0x00d5e7f8", "-8, -25, -43, 0")))
+    k(f"mov.b32 LP, {lp[0]};    // {lp[1]}")
+    k(f"mov.b32 LN, {ln[0]};    // {ln[1]}")
+    if pick:
+        k("mov.b32 LS, 0x44400400;    // two sign bits (index b0 + 2 b1) -> bit 2 of two nibbles")
+        k("mov.b32 K3333, 0x3333;")
     k("mov.b32 ZERO, 0;")
     k("mov.b32 DBASE, 0x4B400000; // the float 1.5 * 2^23: a DP4A chain started there is that float + its sum")
     kt.consts(k)
@@ -389,10 +402,10 @@ def table_iq2xxs(k):
         k("st.shared.v4.u32 [sa+16], {cw, cw, cw, cw};")
 
 
-def row_start(k, nt, unit=16):
+def row_start(k, nt, unit=16, kappa=True):
     """A body's start, shared by every type: BODY<nt>, the members' output offsets, the row-block loop, the rows of the
-    lane pair, kappa (the word of its first unit-byte unit at which the warp's segments start), the accumulators and
-    the iteration's activation pointers."""
+    lane pair, kappa (the word of its first unit-byte unit at which the warp's segments start; kappa=False: none, for
+    a type whose super-blocks start on unit boundaries), the accumulators and the iteration's activation pointers."""
     b32 = lambda *n: k.r(".b32", *n)
     b64 = lambda *n: k.r(".b64", *n)
     f32 = lambda *n: k.r(".f32", *n)
@@ -403,7 +416,8 @@ def row_start(k, nt, unit=16):
     for j in range(nt):
         b32(f"dc{j}")
         k(f"shfl.sync.idx.b32 dc{j}, doff, {j}, 31, -1;")
-    b32("rbi", "rblk", "row0", "rowc", "kap0", "kap", "itr", "cs", "au", "ad", "sego")
+    b32(*[n for n in ("rbi", "rblk", "row0", "rowc", "kap0", "kap", "itr", "cs", "au", "ad", "sego")
+          if kappa or not n.startswith("kap")])
     b64("rw0", "rw1", "ro64", "seg")
     prd("p0", "pst")
     k("mov.u32 rbi, 0;")
@@ -423,10 +437,11 @@ def row_start(k, nt, unit=16):
     k("mul.wide.u32 ro64, rowc, row_bytes;")
     k("add.u64 rw0, xu, ro64;")
     k("add.u64 rw1, xg, ro64;")
-    k.c(f"kappa: the word of its first {unit}-byte unit at which the warp's segments start (lane 0's row)")
-    k("cvt.u32.u64 t0, rw0;")
-    k(f"bfe.u32 t0, t0, 2, {(unit // 4).bit_length() - 1};")
-    k("shfl.sync.idx.b32 kap0, t0, 0, 31, -1;")
+    if kappa:
+        k.c(f"kappa: the word of its first {unit}-byte unit at which the warp's segments start (lane 0's row)")
+        k("cvt.u32.u64 t0, rw0;")
+        k(f"bfe.u32 t0, t0, 2, {(unit // 4).bit_length() - 1};")
+        k("shfl.sync.idx.b32 kap0, t0, 0, 31, -1;")
     for j in range(nt):
         for m in range(2):
             f32(f"acc{j}_{m}")
@@ -445,15 +460,34 @@ def row_start(k, nt, unit=16):
         k(f"mad.lo.u32 ad{j}, act_tok, {j}, ad;")
 
 
-def segments(k, nt, sb, unit, nunits, unit_off, nwords):
+def segments(k, nt, sb, unit, nunits, unit_off, nwords, direct=False):
     """Both matrices' row segments into registers, shared by every type: lane sl loads nunits aligned unit-byte units
     (16 or 8) from (segment & ~(unit - 1)) + unit_off sl into u<m>_*, a warp-uniform branch on kappa (unit / 4 cases)
     picks the nwords words after each super-block's d (w<m>_k = bytes 2 + 4k .. 5 + 4k) and the word holding d (dw<m>);
-    then the members' sums are zeroed."""
+    then the members' sums are zeroed. direct=True (a type whose super-blocks start on unit boundaries and hold no d in
+    front, IQ1_M): lane sl loads its super-block's nunits units from segment + unit_off sl straight into w<m>_k = bytes
+    4k .. 4k + 3, with no choice of words."""
     b32 = lambda *n: k.r(".b32", *n)
     f32 = lambda *n: k.r(".f32", *n)
     L = f"N{nt}_"
     per = unit // 4  # words per unit
+    if direct:
+        k.c(f"both matrices' super-blocks: lane sl loads its {nunits} aligned {unit}-byte units from segment + {unit_off} sl,"
+            " w<m>_k = bytes 4k .. 4k + 3")
+        k(f"mul.lo.u32 sego, itr, {2 * sb};")
+        k("cvt.u64.u32 w64, sego;")
+        for m, rw in ((0, "rw0"), (1, "rw1")):
+            k(f"add.u64 seg, {rw}, w64;")
+            k("add.u64 seg, seg, sl64;")
+            for u in range(nunits):
+                regs = [f"w{m}_{per * u + q}" for q in range(per)]
+                b32(*regs)
+                k(f"ld.global.nc.v{per}.u32 {{{', '.join(regs)}}}, [seg+{unit * u}];")
+        for j in range(nt):
+            for m in range(2):
+                f32(f"sf{j}_{m}")
+                k(f"mov.f32 sf{j}_{m}, 0f00000000;")
+        return
     k.c(f"both matrices' segments: lane sl loads the {nunits} aligned {unit}-byte units from (segment & ~{unit - 1})"
         f" + {unit_off} sl")
     k(f"mul.lo.u32 sego, itr, {2 * sb};")
@@ -491,21 +525,26 @@ def segments(k, nt, sb, unit, nunits, unit_off, nwords):
             k(f"mov.f32 sf{j}_{m}, 0f00000000;")
 
 
-def row_end(k, nt):
+def row_end(k, nt, dscale=None):
     """A body's end, shared by every type: each matrix's super-block sums times its d, the iteration loop, the row's two
-    lanes summed, up * SiLU(gate) stored, the row-block loop."""
+    lanes summed, up * SiLU(gate) stored, the row-block loop. dscale(k, m), if given, writes matrix m's super-block
+    factor (0.125 d) into fd instead of reading d from dw<m>."""
     b32 = lambda *n: k.r(".b32", *n)
     f32 = lambda *n: k.r(".f32", *n)
     L = f"N{nt}_"
-    k.c("the super-block's d: lane 0's in the low half of dw, lane 1's in the high half")
+    if dscale is None:
+        k.c("the super-block's d: lane 0's in the low half of dw, lane 1's in the high half")
     b32("dsh")
     f32("fd")
     for m in range(2):
-        k(f"shr.b32 t0, dw{m}, 16;")
-        k(f"selp.b32 dsh, t0, dw{m}, psl;")
-        k("mov.b32 {h0, h1}, dsh;")
-        k("cvt.f32.f16 fd, h0;")
-        k("mul.ftz.f32 fd, fd, 0f3E000000;")
+        if dscale is None:
+            k(f"shr.b32 t0, dw{m}, 16;")
+            k(f"selp.b32 dsh, t0, dw{m}, psl;")
+            k("mov.b32 {h0, h1}, dsh;")
+            k("cvt.f32.f16 fd, h0;")
+            k("mul.ftz.f32 fd, fd, 0f3E000000;")
+        else:
+            dscale(k, m)
         for j in range(nt):
             k(f"fma.rn.ftz.f32 acc{j}_{m}, fd, sf{j}_{m}, acc{j}_{m};")
     k("add.u32 itr, itr, 1;")

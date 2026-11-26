@@ -511,8 +511,8 @@ int ggml_cuda_mtok_iq2_xxs_fast_static_smem();
 int ggml_cuda_mtok_iq2_xs_fast_static_smem();
 int ggml_cuda_mtok_iq2_s_fast_static_smem();
 int ggml_cuda_mtok_iq1_m_fast_static_smem();
-// The PTX versions of the fast kernels (GGML_CUDA_MTOK_IQ_FAST=2, mmvq-pascal-mtok-iq-ptx.cu; IQ2_XXS, IQ2_S and
-// IQ2_XS): false where none takes the product (or it cannot load), which then runs the CUDA C version.
+// The PTX versions of the fast kernels (GGML_CUDA_MTOK_IQ_FAST=2, mmvq-pascal-mtok-iq-ptx.cu; IQ2_XXS, IQ2_S, IQ2_XS
+// and IQ1_M): false where none takes the product (or it cannot load), which then runs the CUDA C version.
 bool ggml_cuda_mtok_iq_ptx_launch(ggml_type type, const mtok_iq::args & p, const ggml_cuda_mm_fusion_args_device & fusion,
                                   const dim3 grid, const int smem, const bool gate, const int ntm, cudaStream_t stream);
 
