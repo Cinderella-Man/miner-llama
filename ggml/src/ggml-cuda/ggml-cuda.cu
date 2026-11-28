@@ -84,6 +84,7 @@
 #include "ggml-cuda/top-k-mask.cuh"
 #include "ggml-cuda/moe-persistent.cuh"
 #include "ggml-cuda/hop-mailbox.cuh"
+#include "ggml-cuda/hop-timing.cuh"
 #include "ggml-cuda/keepalive.cuh"
 #include "ggml-cuda/keepalive-trace.h"
 #include "ggml-cuda/graph-force.h"
@@ -1114,9 +1115,16 @@ static ggml_cuda_hop_ring * ggml_cuda_hop_ring_get(ggml_backend_cuda_context * c
     r->slot_size   = (size_t) ggml_cuda_hop_env("GGML_CUDA_HOP_SLOT_KB", 256, 4, 65536) * 1024;
     r->stream_mode = ggml_cuda_hop_env("GGML_CUDA_HOP_STREAM",  1,   0,     2);
 
+    // GGML_CUDA_HOP_WC (2026-11-28, Q1946): bit 0 allocates the ring's slots write-combined. The host never reads them
+    // (both legs are the cards' copies), and write-combined memory is not snooped, which the runtime reference says can
+    // speed transfers over PCIe on some systems. Bit 1 does the same for the mailbox's slots and gate buffers
+    // (hop-mailbox.cu). Default 0: as before
+    const bool wc = (ggml_cuda_hop_env("GGML_CUDA_HOP_WC", 0, 0, 3) & 1) != 0;
+
     ggml_cuda_set_device(r->dev_dst);
     ggml_cuda_keepalive_quiesce();
-    CUDA_CHECK(cudaHostAlloc((void **) &r->host, (size_t) r->n_slots * r->slot_size, cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc((void **) &r->host, (size_t) r->n_slots * r->slot_size,
+            cudaHostAllocPortable | (wc ? cudaHostAllocWriteCombined : 0)));
     r->drained.resize(r->n_slots);
     for (auto & e : r->drained) {
         CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
@@ -1128,9 +1136,9 @@ static ggml_cuda_hop_ring * ggml_cuda_hop_ring_get(ggml_backend_cuda_context * c
         CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     }
 
-    GGML_LOG_INFO("%s: card hop %s -> %s staged through %d pinned slots of %zu KiB, %d chunks, copy stream mode %d\n",
-            __func__, ctx_src->name.c_str(), ctx_dst->name.c_str(), r->n_slots, r->slot_size / 1024, r->n_chunks,
-            r->stream_mode);
+    GGML_LOG_INFO("%s: card hop %s -> %s staged through %d pinned%s slots of %zu KiB, %d chunks, copy stream mode %d\n",
+            __func__, ctx_src->name.c_str(), ctx_dst->name.c_str(), r->n_slots, wc ? " write-combined" : "",
+            r->slot_size / 1024, r->n_chunks, r->stream_mode);
     return r;
 }
 
@@ -1346,6 +1354,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
     ggml_cuda_keepalive_quiesce();
+    ggml_cuda_hop_timing_report(); // GGML_CUDA_HOP_TIMING: once, at the first context freed; nothing when off
 
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         if (hop_mailboxes[i] != nullptr) {
@@ -3745,17 +3754,23 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
             ggml_cuda_keepalive_outside_dev(cuda_ctx_src->device, GGML_CUDA_KEEPALIVE_OUT_SEND, ggml_nbytes(dst));
             ggml_cuda_keepalive_outside_dev(cuda_ctx_dst->device, GGML_CUDA_KEEPALIVE_OUT_RECV, ggml_nbytes(dst));
         }
+        // GGML_CUDA_HOP_TIMING (hop-timing.cuh): a stamp on each side of a hop between two cards; -1 and nothing
+        // enqueued when off
+        const int hop_t = src_physical == dst_physical ? -1 :
+            ggml_cuda_hop_timing_begin(cuda_ctx_src->device, cuda_ctx_src->stream(), cuda_ctx_dst->device, ggml_nbytes(dst));
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else if (ggml_cuda_hop_mailbox_on(cuda_ctx_dst, cuda_ctx_src->device, src_physical, dst_physical) &&
                    ggml_cuda_hop_mailbox_copy(cuda_ctx_src, cuda_ctx_dst, (char *) dst->data, (const char *) src->data, ggml_nbytes(dst))) {
             // GGML_CUDA_HOP_MAILBOX: a kernel on each card through this boundary's mailbox; the destination's stream is
             // ordered after it. Copies it does not take fall through to the staged hop or the peer copy
+            ggml_cuda_hop_timing_end(hop_t, cuda_ctx_dst->device, cuda_ctx_dst->stream(), 2);
             return true;
         } else if (ggml_cuda_hop_staged_on(cuda_ctx_dst, cuda_ctx_src->device, src_physical, dst_physical)) {
             // GGML_CUDA_HOP_STAGED: through this boundary's pinned ring; the destination's stream is ordered after it
             ggml_cuda_hop_ring * ring = ggml_cuda_hop_ring_get(cuda_ctx_src, cuda_ctx_dst);
             ggml_cuda_hop_copy(cuda_ctx_src, cuda_ctx_dst, *ring, (char *) dst->data, (const char *) src->data, ggml_nbytes(dst));
+            ggml_cuda_hop_timing_end(hop_t, cuda_ctx_dst->device, cuda_ctx_dst->stream(), 1);
             return true;
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
@@ -3775,6 +3790,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 
         // wait on dst stream for the copy to complete
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
+        ggml_cuda_hop_timing_end(hop_t, cuda_ctx_dst->device, cuda_ctx_dst->stream(), 0);
     } else {
         // src and dst are on the same backend
         ggml_cuda_keepalive_outside_dev(cuda_ctx_src->device, GGML_CUDA_KEEPALIVE_OUT_COPY, ggml_nbytes(dst));

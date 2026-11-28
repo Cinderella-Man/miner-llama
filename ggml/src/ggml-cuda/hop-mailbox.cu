@@ -53,6 +53,10 @@ struct ggml_cuda_hop_mailbox {
     bool        gate_used[4]    = {};
     int64_t n_gated = 0, n_gate_too_big = 0;
 
+    // GGML_CUDA_HOP_WC bit 1 (2026-11-28, Q1946): the slots and gate buffers write-combined (the host never reads them;
+    // the words stay as they are, since the host reads the timeout line)
+    bool wc = false;
+
     unsigned * timeout_line() const { return words + (size_t) 2*n_slots*HOP_MB_LINE; }
 };
 
@@ -266,11 +270,13 @@ static ggml_cuda_hop_mailbox * hop_mb_get(ggml_backend_cuda_context * ctx_src, g
         mb->n_slots &= mb->n_slots - 1; // a power of two: the slot is the sequence number's low bits
     }
 
+    mb->wc = (hop_mb_env("GGML_CUDA_HOP_WC", 0, 0, 3) & 2) != 0;
+    const unsigned int data_flags = cudaHostAllocPortable | cudaHostAllocMapped | (mb->wc ? cudaHostAllocWriteCombined : 0);
+
     const size_t n_words = (size_t) (2*mb->n_slots + 1) * HOP_MB_LINE;
     ggml_cuda_set_device(mb->dev_dst);
     ggml_cuda_keepalive_quiesce();
-    CUDA_CHECK(cudaHostAlloc((void **) &mb->ring, (size_t) mb->n_slots * mb->slot_size,
-            cudaHostAllocPortable | cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostAlloc((void **) &mb->ring, (size_t) mb->n_slots * mb->slot_size, data_flags));
     CUDA_CHECK(cudaHostAlloc((void **) &mb->words, n_words * sizeof(unsigned), cudaHostAllocPortable | cudaHostAllocMapped));
     memset(mb->words, 0, n_words * sizeof(unsigned));
     CUDA_CHECK(cudaHostGetDevicePointer((void **) &mb->ring_dst,  mb->ring,  0));
@@ -282,10 +288,10 @@ static ggml_cuda_hop_mailbox * hop_mb_get(ggml_backend_cuda_context * ctx_src, g
     CUDA_CHECK(cudaHostGetDevicePointer((void **) &mb->words_src, mb->words, 0));
     mb->poll_src = (long long) poll_us * hop_mb_clock_khz() / 1000;
 
-    GGML_LOG_INFO("%s: card hop %s -> %s by mailbox: %d slots of %zu KiB in mapped host memory, %d chunks, %d threads, "
+    GGML_LOG_INFO("%s: card hop %s -> %s by mailbox: %d slots of %zu KiB in mapped%s host memory, %d chunks, %d threads, "
             "polls at most %d us apart, copy stream mode %d%s\n", __func__, ctx_src->name.c_str(), ctx_dst->name.c_str(),
-            mb->n_slots, mb->slot_size / 1024, mb->n_chunks, mb->threads, poll_us, mb->stream_mode,
-            mb->max_bytes ? (", hops up to " + std::to_string(mb->max_bytes / 1024) + " KiB").c_str() : "");
+            mb->n_slots, mb->slot_size / 1024, mb->wc ? " write-combined" : "", mb->n_chunks, mb->threads, poll_us,
+            mb->stream_mode, mb->max_bytes ? (", hops up to " + std::to_string(mb->max_bytes / 1024) + " KiB").c_str() : "");
     return mb;
 }
 
@@ -307,7 +313,7 @@ static bool hop_mb_gated_copy(ggml_cuda_hop_mailbox * mb, ggml_backend_cuda_cont
         ggml_cuda_set_device(mb->dev_dst);
         ggml_cuda_keepalive_quiesce();
         CUDA_CHECK(cudaHostAlloc((void **) &mb->gate_host, HOP_MB_GATE_BUFS * mb->gate_size,
-                cudaHostAllocPortable | cudaHostAllocMapped));
+                cudaHostAllocPortable | cudaHostAllocMapped | (mb->wc ? cudaHostAllocWriteCombined : 0)));
         CUDA_CHECK(cudaHostGetDevicePointer((void **) &mb->gate_dst, mb->gate_host, 0));
         for (int b = 0; b < HOP_MB_GATE_BUFS; ++b) {
             CUDA_CHECK(cudaEventCreateWithFlags(&mb->gate_read[b], cudaEventDisableTiming));
