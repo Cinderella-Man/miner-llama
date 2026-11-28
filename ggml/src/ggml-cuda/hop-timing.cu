@@ -9,8 +9,10 @@
 #include <initializer_list>
 #include <map>
 #include <mutex>
+#include <string>
 #include <time.h>
 #include <tuple>
+#include <unistd.h>
 #include <vector>
 
 // GGML_CUDA_HOP_TIMING: see hop-timing.cuh
@@ -125,7 +127,7 @@ static void hop_t_calibrate(hop_timing_state & st, int dev) {
     st.cal_at[dev] = now_ns();
     st.n_cal[dev]++;
     if (st.n_cal[dev] == 1) {
-        GGML_LOG_INFO("%s: CUDA%d's clock related to the host's to within %lld ns\n", __func__, dev, best_err);
+        GGML_LOG_WARN("%s: CUDA%d's clock related to the host's to within %lld ns\n", __func__, dev, best_err);
     }
 #else
     GGML_UNUSED_VARS(st, dev);
@@ -178,17 +180,23 @@ int ggml_cuda_hop_timing_begin(int dev_src, cudaStream_t stream_src, int dev_dst
         CUDA_CHECK(cudaHostAlloc((void **) &st.recs, HOP_T_N * sizeof(hop_rec), cudaHostAllocPortable | cudaHostAllocMapped));
         CUDA_CHECK(cudaHostAlloc((void **) &st.cal_word, 64, cudaHostAllocPortable | cudaHostAllocMapped));
         memset((void *) st.recs, 0, HOP_T_N * sizeof(hop_rec));
-        const char * f = getenv("GGML_CUDA_HOP_TIMING_FILE");
-        if (f != nullptr && *f != '\0') {
-            st.out = fopen(f, "w");
+        // the file's name: a "%p" in it becomes the process id, so repeated server starts with one setting keep their files
+        std::string path;
+        if (const char * f = getenv("GGML_CUDA_HOP_TIMING_FILE"); f != nullptr && *f != '\0') {
+            path = f;
+            const size_t at = path.find("%p");
+            if (at != std::string::npos) {
+                path.replace(at, 2, std::to_string((long) getpid()));
+            }
+            st.out = fopen(path.c_str(), "w");
             if (st.out != nullptr) {
                 fprintf(st.out, "src,dst,bytes,path,host_ns,src_done_ns,dst_go_ns\n");
             } else {
-                GGML_LOG_WARN("%s: cannot open %s\n", __func__, f);
+                GGML_LOG_WARN("%s: cannot open %s\n", __func__, path.c_str());
             }
         }
-        GGML_LOG_INFO("%s: timing every card hop (a stamp kernel on each side, %d records)%s%s\n", __func__, HOP_T_N,
-                st.out ? ", every hop to " : "", st.out ? f : "");
+        GGML_LOG_WARN("%s: timing every card hop (a stamp kernel on each side, %d records)%s%s\n", __func__, HOP_T_N,
+                st.out ? ", every hop to " : "", st.out ? path.c_str() : "");
         ggml_cuda_set_device(cur);
     }
     if (dev_src < 0 || dev_src >= GGML_CUDA_MAX_DEVICES || dev_dst < 0 || dev_dst >= GGML_CUDA_MAX_DEVICES ||
@@ -270,7 +278,7 @@ void ggml_cuda_hop_timing_report(void) {
     for (unsigned long long s = first; s < st.seq; ++s) {
         hop_t_take(st, st.recs[s % HOP_T_N]);
     }
-    GGML_LOG_INFO("%s: %llu card hops timed, %llu without both stamps; per boundary, size class and path: count, hop "
+    GGML_LOG_WARN("%s: %llu card hops timed, %llu without both stamps; per boundary, size class and path: count, hop "
             "(source done -> destination go) median / p10 / p90 us, host ahead (enqueue -> source done) median us\n",
             __func__, st.n_done, st.n_incomplete);
     for (auto & kv : st.agg) {
@@ -279,13 +287,13 @@ void ggml_cuda_hop_timing_report(void) {
         std::sort(h.begin(), h.end());
         std::sort(l.begin(), l.end());
         auto q = [](const std::vector<float> & v, double p) { return v[std::min(v.size() - 1, (size_t) (p * (v.size() - 1) + 0.5))]; };
-        GGML_LOG_INFO("%s:   CUDA%d -> CUDA%d %-12s %-9s n %7zu  hop %8.1f / %8.1f / %8.1f  host ahead %9.1f\n", __func__,
+        GGML_LOG_WARN("%s:   CUDA%d -> CUDA%d %-12s %-9s n %7zu  hop %8.1f / %8.1f / %8.1f  host ahead %9.1f\n", __func__,
                 std::get<0>(kv.first), std::get<1>(kv.first), class_name(std::get<2>(kv.first)),
                 path_name(std::get<3>(kv.first)), h.size(), q(h, 0.5), q(h, 0.1), q(h, 0.9), q(l, 0.5));
     }
     for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
         if (st.n_cal[d] != 0) {
-            GGML_LOG_INFO("%s:   CUDA%d: %d calibrations, the last to within %lld ns\n", __func__, d, st.n_cal[d], st.err[d]);
+            GGML_LOG_WARN("%s:   CUDA%d: %d calibrations, the last to within %lld ns\n", __func__, d, st.n_cal[d], st.err[d]);
         }
     }
     if (st.out != nullptr) {

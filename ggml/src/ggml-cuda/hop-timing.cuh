@@ -18,9 +18,11 @@
 // enqueued it (near the launch latency: the card waited for the host).
 // Records are kept in a ring of 16,384 and summarised 8,192 hops after they were made (long complete by then), per
 // boundary, per size class (decode <= 16 KiB, verify <= 64 KiB, short prompt <= 1 MiB, prompt) and per path (the
-// driver's peer copy, the staged ring, the mailbox); the summary is logged when the first CUDA context is freed.
+// driver's peer copy, the staged ring, the mailbox); the summary is logged when the first CUDA context is freed,
+// at warning level, so that a server's default log keeps it.
 //   GGML_CUDA_HOP_TIMING       0 (default): off, nothing is enqueued; 1: on
-//   GGML_CUDA_HOP_TIMING_FILE  a CSV of every hop (src, dst, bytes, path, host ns at enqueue, S and D in host ns)
+//   GGML_CUDA_HOP_TIMING_FILE  a CSV of every hop (src, dst, bytes, path, host ns at enqueue, S and D in host ns);
+//                              a "%p" in the name becomes the process id
 // Cost when on: two one-thread kernel launches per hop on the host's submit thread, their few microseconds on each
 // card's stream, and the calibrations' host polls (~0.3 ms per card every 5 s): measure it as its own arm.
 
