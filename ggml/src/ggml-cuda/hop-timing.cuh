@@ -28,8 +28,8 @@
 
 // returns the hop's record, or -1 when off; call before enqueuing the hop, with each side's current stream
 int  ggml_cuda_hop_timing_begin(int dev_src, cudaStream_t stream_src, int dev_dst, size_t nbytes);
-// path: 0 the driver's peer copy, 1 the staged ring, 2 the mailbox (with its gate); call once the destination's
-// stream is ordered after the hop
+// path: 0 the driver's peer copy, 1 the staged ring, 2 the mailbox (with its gate), 3 NCCL; call once the
+// destination's stream is ordered after the hop
 void ggml_cuda_hop_timing_end(int rec, int dev_dst, cudaStream_t stream_dst, int path);
 // logs the summary (and closes the file) once; called from a CUDA context's destructor
 void ggml_cuda_hop_timing_report(void);

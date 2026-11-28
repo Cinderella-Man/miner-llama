@@ -76,8 +76,8 @@ static const char * class_name(int c) {
 }
 
 static const char * path_name(int p) {
-    static const char * names[3] = {"peer-copy", "staged", "mailbox"};
-    return p >= 0 && p < 3 ? names[p] : "?";
+    static const char * names[4] = {"peer-copy", "staged", "mailbox", "nccl"};
+    return p >= 0 && p < 4 ? names[p] : "?";
 }
 
 } // namespace

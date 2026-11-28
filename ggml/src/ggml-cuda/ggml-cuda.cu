@@ -85,6 +85,7 @@
 #include "ggml-cuda/moe-persistent.cuh"
 #include "ggml-cuda/hop-mailbox.cuh"
 #include "ggml-cuda/hop-timing.cuh"
+#include "ggml-cuda/hop-nccl.cuh"
 #include "ggml-cuda/keepalive.cuh"
 #include "ggml-cuda/keepalive-trace.h"
 #include "ggml-cuda/graph-force.h"
@@ -1355,6 +1356,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
     ggml_cuda_keepalive_quiesce();
     ggml_cuda_hop_timing_report(); // GGML_CUDA_HOP_TIMING: once, at the first context freed; nothing when off
+    ggml_cuda_hop_nccl_report();   // GGML_CUDA_HOP_NCCL: the same
 
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         if (hop_mailboxes[i] != nullptr) {
@@ -3760,6 +3762,13 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
             ggml_cuda_hop_timing_begin(cuda_ctx_src->device, cuda_ctx_src->stream(), cuda_ctx_dst->device, ggml_nbytes(dst));
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+        } else if (ggml_cuda_hop_nccl_takes(src_physical, dst_physical) &&
+                   ggml_cuda_hop_nccl_copy(src_physical, cuda_ctx_src->stream(), dst_physical, cuda_ctx_dst->stream(),
+                           dst->data, src->data, ggml_nbytes(dst))) {
+            // GGML_CUDA_HOP_NCCL (hop-nccl.cuh): NCCL's send and receive; the receive runs on the destination's stream.
+            // Copies it does not take fall through to the mailbox, the staged hop or the peer copy
+            ggml_cuda_hop_timing_end(hop_t, cuda_ctx_dst->device, cuda_ctx_dst->stream(), 3);
+            return true;
         } else if (ggml_cuda_hop_mailbox_on(cuda_ctx_dst, cuda_ctx_src->device, src_physical, dst_physical) &&
                    ggml_cuda_hop_mailbox_copy(cuda_ctx_src, cuda_ctx_dst, (char *) dst->data, (const char *) src->data, ggml_nbytes(dst))) {
             // GGML_CUDA_HOP_MAILBOX: a kernel on each card through this boundary's mailbox; the destination's stream is
