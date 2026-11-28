@@ -3762,7 +3762,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
             ggml_cuda_hop_timing_begin(cuda_ctx_src->device, cuda_ctx_src->stream(), cuda_ctx_dst->device, ggml_nbytes(dst));
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
-        } else if (ggml_cuda_hop_nccl_takes(src_physical, dst_physical) &&
+        } else if (ggml_cuda_hop_nccl_takes(src_physical, dst_physical, ggml_nbytes(dst)) &&
                    ggml_cuda_hop_nccl_copy(src_physical, cuda_ctx_src->stream(), dst_physical, cuda_ctx_dst->stream(),
                            dst->data, src->data, ggml_nbytes(dst))) {
             // GGML_CUDA_HOP_NCCL (hop-nccl.cuh): NCCL's send and receive; the receive runs on the destination's stream.

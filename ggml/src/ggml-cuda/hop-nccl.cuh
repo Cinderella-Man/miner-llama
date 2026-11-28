@@ -14,11 +14,13 @@
 //   GGML_CUDA_HOP_NCCL   0 (default): off; 1: copies between cards without peer access; 2: every copy between two
 //                        physical cards (for checks on boards that have peer access). It takes precedence over the
 //                        mailbox and the staged ring for the copies it takes.
+//   GGML_CUDA_HOP_NCCL_MAX_KB  hops larger than this take the other paths (default 0: no limit), e.g. 64 for decode
+//                        and verify passes only, leaving prompt micro-batches to the staged ring
 // Only in a build with NCCL (GGML_USE_NCCL: -DGGML_CUDA_NCCL=ON with NCCL found); in other builds the switch is read,
 // logged once and ignored. NCCL's own variables (NCCL_BUFFSIZE, NCCL_MAX_NCHANNELS, NCCL_DEBUG ...) apply as usual.
 
-// whether the switch asks for this pair (the physical devices); reads the switch once
-bool ggml_cuda_hop_nccl_takes(int src_physical, int dst_physical);
+// whether the switch asks for this pair (the physical devices) and size; reads the switches once
+bool ggml_cuda_hop_nccl_takes(int src_physical, int dst_physical, size_t nbytes);
 // enqueues the send on stream_src (on src_physical) and the receive on stream_dst (on dst_physical) as one group;
 // returns false, having enqueued nothing, when the build has no NCCL or the communicators could not be made
 bool ggml_cuda_hop_nccl_copy(int src_physical, cudaStream_t stream_src, int dst_physical, cudaStream_t stream_dst,

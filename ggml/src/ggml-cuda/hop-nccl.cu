@@ -22,6 +22,7 @@ struct hop_nccl_state {
     bool       ok         = false;
     bool       reported   = false;
     int        n_dev      = 0;
+    size_t     max_bytes  = 0;   // GGML_CUDA_HOP_NCCL_MAX_KB, 0: no limit
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t> comms;
 #endif
@@ -40,6 +41,8 @@ static int hop_nccl_mode(hop_nccl_state & st) {
     if (st.mode < 0) {
         const char * e = getenv("GGML_CUDA_HOP_NCCL");
         st.mode = e != nullptr ? std::min(std::max(atoi(e), 0), 2) : 0;
+        const char * m = getenv("GGML_CUDA_HOP_NCCL_MAX_KB");
+        st.max_bytes = m != nullptr ? (size_t) std::min(std::max(atoi(m), 0), 1 << 22) * 1024 : 0;
 #ifndef GGML_USE_NCCL
         if (st.mode != 0) {
             GGML_LOG_WARN("%s: GGML_CUDA_HOP_NCCL=%d ignored: this build has no NCCL (-DGGML_CUDA_NCCL=ON)\n", __func__, st.mode);
@@ -50,7 +53,7 @@ static int hop_nccl_mode(hop_nccl_state & st) {
     return st.mode;
 }
 
-bool ggml_cuda_hop_nccl_takes(int src_physical, int dst_physical) {
+bool ggml_cuda_hop_nccl_takes(int src_physical, int dst_physical, size_t nbytes) {
     hop_nccl_state & st = hop_n();
     if (st.mode == 0) {
         return false;
@@ -58,7 +61,8 @@ bool ggml_cuda_hop_nccl_takes(int src_physical, int dst_physical) {
     std::lock_guard<std::mutex> lock(st.mu);
     const int mode = hop_nccl_mode(st);
     if (mode == 0 || src_physical < 0 || dst_physical < 0 || src_physical >= GGML_CUDA_MAX_DEVICES ||
-            dst_physical >= GGML_CUDA_MAX_DEVICES || src_physical == dst_physical) {
+            dst_physical >= GGML_CUDA_MAX_DEVICES || src_physical == dst_physical ||
+            (st.max_bytes != 0 && nbytes > st.max_bytes)) {
         return false;
     }
     if (mode == 2) {
