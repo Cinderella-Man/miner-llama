@@ -55,27 +55,27 @@ struct hop_timing_state {
     std::map<std::tuple<int, int, int, int>, hop_key_vals> agg;  // src, dst, size class, path
 };
 
-hop_timing_state & hop_t() {
+static hop_timing_state & hop_t() {
     static hop_timing_state st;
     return st;
 }
 
-long long now_ns() {
+static long long now_ns() {
     timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (long long) t.tv_sec * 1000000000ll + t.tv_nsec;
 }
 
-int size_class(unsigned int bytes) {
+static int size_class(unsigned int bytes) {
     return bytes <= 16384u ? 0 : bytes <= 65536u ? 1 : bytes <= (1u << 20) ? 2 : 3;
 }
 
-const char * class_name(int c) {
+static const char * class_name(int c) {
     static const char * names[4] = {"decode", "verify", "short-prompt", "prompt"};
     return names[c];
 }
 
-const char * path_name(int p) {
+static const char * path_name(int p) {
     static const char * names[3] = {"peer-copy", "staged", "mailbox"};
     return p >= 0 && p < 3 ? names[p] : "?";
 }
